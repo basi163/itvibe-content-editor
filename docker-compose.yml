@@ -1,0 +1,12 @@
+services:
+  editor:
+    build: .
+    container_name: itvibe-content-editor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - editor_data:/app/data
+
+volumes:
+  editor_data:
