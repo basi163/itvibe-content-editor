@@ -19,6 +19,10 @@ from aiogram.types import (
     ChatShared,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputRichMessage,
+    InputRichMessageMedia,
     KeyboardButton,
     KeyboardButtonRequestChat,
     LinkPreviewOptions,
@@ -385,6 +389,7 @@ class EditorBot:
             int(editor_chat_id),
             draft,
             rendered.html,
+            rendered.rich_html,
             rendered.char_count,
             preview_url,
         )
@@ -404,10 +409,50 @@ class EditorBot:
         rendered = render_post(post, sources, self.settings.max_post_chars)
         old_message_id = int(draft["editor_message_id"])
         old_media_message_id = draft.get("editor_media_message_id")
+        media = self._selected_media(draft)
+        file_value = await self._media_input(media)
+        if file_value:
+            try:
+                edited = await self.bot.edit_message_text(
+                    text=None,
+                    chat_id=int(draft["editor_chat_id"]),
+                    message_id=old_message_id,
+                    parse_mode=None,
+                    link_preview_options=None,
+                    rich_message=self._rich_message(
+                        rendered.rich_html,
+                        file_value,
+                        str(media.get("type") or "photo"),
+                    ),
+                    reply_markup=self._draft_keyboard(draft_id),
+                )
+                if isinstance(edited, Message):
+                    if old_media_message_id and int(old_media_message_id) != old_message_id:
+                        try:
+                            await self.bot.delete_message(
+                                chat_id=draft["editor_chat_id"],
+                                message_id=int(old_media_message_id),
+                            )
+                        except TelegramBadRequest:
+                            logger.warning(
+                                "Could not remove legacy media message for draft %s",
+                                draft_id,
+                            )
+                    await self.repository.update_draft(
+                        draft_id,
+                        editor_media_message_id=None,
+                    )
+                    return
+            except TelegramBadRequest:
+                logger.info(
+                    "In-place rich edit failed for draft %s; replacing the message",
+                    draft_id,
+                )
         message, media_message_id = await self._send_editor_message(
             int(draft["editor_chat_id"]),
             draft,
             rendered.html,
+            rendered.rich_html,
             rendered.char_count,
             self._preview_url(draft),
         )
@@ -434,6 +479,7 @@ class EditorBot:
         chat_id: int,
         draft: dict[str, Any],
         text: str,
+        rich_html: str,
         char_count: int,
         preview_url: str | None,
     ) -> tuple[Message, int | None]:
@@ -441,38 +487,39 @@ class EditorBot:
         file_value = await self._media_input(media)
         if file_value:
             try:
-                if char_count > 1024:
-                    if media and media.get("type") == "video":
-                        media_message = await self.bot.send_video(chat_id, video=file_value)
-                    else:
-                        media_message = await self.bot.send_photo(chat_id, photo=file_value)
-                    text_message = await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_markup=self._draft_keyboard(int(draft["id"])),
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    )
-                    return text_message, media_message.message_id
-                if media.get("type") == "video":
-                    message = await self.bot.send_video(
-                        chat_id,
-                        video=file_value,
-                        caption=text,
-                        reply_markup=self._draft_keyboard(int(draft["id"])),
-                    )
-                else:
-                    message = await self.bot.send_photo(
-                        chat_id,
-                        photo=file_value,
-                        caption=text,
-                        reply_markup=self._draft_keyboard(int(draft["id"])),
-                    )
+                message = await self.bot.send_rich_message(
+                    chat_id=chat_id,
+                    rich_message=self._rich_message(
+                        rich_html,
+                        file_value,
+                        str(media.get("type") or "photo"),
+                    ),
+                    reply_markup=self._draft_keyboard(int(draft["id"])),
+                )
                 return message, None
             except TelegramBadRequest:
                 logger.warning(
-                    "Media delivery failed for draft %s, using link preview",
+                    "Rich media delivery failed for draft %s",
                     draft["id"],
                 )
+                if char_count <= 1024:
+                    if media.get("type") == "video":
+                        message = await self.bot.send_video(
+                            chat_id,
+                            video=file_value,
+                            caption=text,
+                            reply_markup=self._draft_keyboard(int(draft["id"])),
+                        )
+                    else:
+                        message = await self.bot.send_photo(
+                            chat_id,
+                            photo=file_value,
+                            caption=text,
+                            reply_markup=self._draft_keyboard(int(draft["id"])),
+                        )
+                    return message, None
+                if not preview_url:
+                    raise
         message = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
@@ -508,44 +555,47 @@ class EditorBot:
             return
 
         try:
-            media_sent: Message | None = None
-            if rendered.char_count <= 1024:
-                if media.get("type") == "video" and file_value:
-                    sent = await self.bot.send_video(
-                        int(target_chat_id),
-                        video=file_value,
-                        caption=rendered.html,
-                    )
-                elif file_value:
-                    sent = await self.bot.send_photo(
-                        int(target_chat_id),
-                        photo=file_value,
-                        caption=rendered.html,
-                    )
-            else:
-                if media.get("type") == "video":
-                    media_sent = await self.bot.send_video(int(target_chat_id), video=file_value)
-                else:
-                    media_sent = await self.bot.send_photo(int(target_chat_id), photo=file_value)
-                sent = await self.bot.send_message(
-                    int(target_chat_id),
-                    rendered.html,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                )
-        except TelegramBadRequest:
-            logger.warning("Media publication failed for draft %s", draft_id)
-            await self.bot.send_message(
-                owner_id,
-                "Публикация остановлена. Telegram не принял изображение.",
+            sent = await self.bot.send_rich_message(
+                chat_id=int(target_chat_id),
+                rich_message=self._rich_message(
+                    rendered.rich_html,
+                    file_value,
+                    str(media.get("type") or "photo"),
+                ),
             )
-            return
+        except TelegramBadRequest:
+            if rendered.char_count <= 1024:
+                try:
+                    if media.get("type") == "video":
+                        sent = await self.bot.send_video(
+                            int(target_chat_id),
+                            video=file_value,
+                            caption=rendered.html,
+                        )
+                    else:
+                        sent = await self.bot.send_photo(
+                            int(target_chat_id),
+                            photo=file_value,
+                            caption=rendered.html,
+                        )
+                except TelegramBadRequest:
+                    sent = None
+            else:
+                sent = None
+            if sent is None:
+                logger.warning("Rich media publication failed for draft %s", draft_id)
+                await self.bot.send_message(
+                    owner_id,
+                    "Публикация остановлена. Telegram не принял единый пост с изображением.",
+                )
+                return
 
         await self.repository.update_draft(
             draft_id,
             status="published",
             target_chat_id=int(target_chat_id),
             target_message_id=sent.message_id,
-            target_media_message_id=media_sent.message_id if media_sent else None,
+            target_media_message_id=None,
         )
         if draft["editor_chat_id"] and draft["editor_message_id"]:
             await self.bot.edit_message_reply_markup(
@@ -637,6 +687,24 @@ class EditorBot:
             return None
         content, filename = downloaded
         return BufferedInputFile(content, filename=filename)
+
+    @staticmethod
+    def _rich_message(
+        rich_html: str,
+        file_value: str | BufferedInputFile,
+        media_type: str,
+    ) -> InputRichMessage:
+        media_id = "cover"
+        if media_type == "video":
+            tag = f'<video src="tg://video?id={media_id}"></video>'
+            input_media = InputMediaVideo(media=file_value, parse_mode=None)
+        else:
+            tag = f'<img src="tg://photo?id={media_id}"/>'
+            input_media = InputMediaPhoto(media=file_value, parse_mode=None)
+        return InputRichMessage(
+            html=f"{tag}{rich_html}",
+            media=[InputRichMessageMedia(id=media_id, media=input_media)],
+        )
 
     @staticmethod
     def _preview_options(url: str | None) -> LinkPreviewOptions:

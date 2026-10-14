@@ -27,6 +27,8 @@ def test_render_valid_post_with_contextual_link() -> None:
     rendered = render_post(post, SOURCES, 2000)
 
     assert rendered.html.startswith("<b>Новая архитектура")
+    assert rendered.rich_html.startswith("<h2>Новая архитектура")
+    assert "<p>Разработчики описали" in rendered.rich_html
     assert '<a href="https://example.com/research">официальной публикации</a>' in rendered.html
     assert "https://" not in rendered.visible_text
 

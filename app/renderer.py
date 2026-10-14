@@ -32,6 +32,7 @@ BANNED_PHRASES = (
 @dataclass
 class RenderedPost:
     html: str
+    rich_html: str
     visible_text: str
     char_count: int
 
@@ -64,6 +65,15 @@ def _body_to_html(body: str, sources: list[SourceDocument]) -> str:
         position = match.end()
     result.append(html.escape(body[position:]))
     return "".join(result)
+
+
+def _body_to_rich_html(body: str, sources: list[SourceDocument]) -> str:
+    paragraphs = re.split(r"\n\s*\n", body.strip())
+    blocks: list[str] = []
+    for paragraph in paragraphs:
+        content = _body_to_html(paragraph, sources).replace("\n", "<br>")
+        blocks.append(f"<p>{content}</p>")
+    return "".join(blocks)
 
 
 def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
@@ -111,8 +121,10 @@ def render_post(
 
     title = html.escape(post.title.strip())
     body = _body_to_html(post.body.strip(), sources)
+    rich_body = _body_to_rich_html(post.body, sources)
     hashtags = " ".join(html.escape(tag.strip()) for tag in post.hashtags)
     rendered = f"<b>{title}</b>\n\n{body}\n\n{hashtags}"
+    rich_rendered = f"<h2>{title}</h2>{rich_body}<p>{hashtags}</p>"
     visible = HTML_TAG_RE.sub("", rendered)
     visible = html.unescape(visible)
-    return RenderedPost(rendered, visible, len(visible))
+    return RenderedPost(rendered, rich_rendered, visible, len(visible))
