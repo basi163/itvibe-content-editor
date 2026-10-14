@@ -151,25 +151,28 @@ class QwenClient:
         sources: list[SourceDocument],
         errors: list[str],
     ) -> GeneratedPost:
-        payload = {
-            "post": post.to_dict(),
-            "errors": errors,
-            "maximum_visible_characters": self.max_post_chars,
-            "allowed_sources": _source_payload(sources, per_source_chars=3000),
-        }
-        data = await self._completion(
-            model=self.writer_model,
-            system=REPAIR_SYSTEM_PROMPT,
-            user=json.dumps(payload, ensure_ascii=False),
-            temperature=0.2,
-            max_tokens=2600,
-        )
-        repaired = GeneratedPost(
-            title=str(data.get("title", "")).strip(),
-            body=str(data.get("body", "")).strip(),
-            hashtags=[str(tag).strip() for tag in data.get("hashtags", [])],
-        )
-        remaining = validate_post(repaired, self.max_post_chars)
-        if remaining:
-            raise ValueError("Post failed validation after repair: " + "; ".join(remaining))
-        return repaired
+        current = post
+        remaining = errors
+        for _ in range(3):
+            payload = {
+                "post": current.to_dict(),
+                "errors": remaining,
+                "maximum_visible_characters": self.max_post_chars,
+                "allowed_sources": _source_payload(sources, per_source_chars=3000),
+            }
+            data = await self._completion(
+                model=self.writer_model,
+                system=REPAIR_SYSTEM_PROMPT,
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=0.15,
+                max_tokens=2600,
+            )
+            current = GeneratedPost(
+                title=str(data.get("title", "")).strip(),
+                body=str(data.get("body", "")).strip(),
+                hashtags=[str(tag).strip() for tag in data.get("hashtags", [])],
+            )
+            remaining = validate_post(current, self.max_post_chars)
+            if not remaining:
+                return current
+        raise ValueError("Post failed validation after repair: " + "; ".join(remaining))
