@@ -3,7 +3,6 @@ import pytest
 from app.models import GeneratedPost, SourceDocument
 from app.renderer import render_post, validate_post
 
-
 SOURCES = [
     SourceDocument(
         url="https://example.com/research",

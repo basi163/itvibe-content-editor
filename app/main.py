@@ -13,7 +13,6 @@ from app.models import StoryCandidate
 from app.pipeline import ContentPipeline
 from app.rss import FeedEntry, SolidotFeed
 
-
 logger = logging.getLogger(__name__)
 
 

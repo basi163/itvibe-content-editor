@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -24,14 +25,12 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from aiogram.client.default import DefaultBotProperties
 
 from app.config import Settings
 from app.db import Repository
 from app.models import GeneratedPost, SourceDocument, StoryCandidate
 from app.pipeline import ContentPipeline
 from app.renderer import EMOJI_RE, render_post, validate_post
-
 
 logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)

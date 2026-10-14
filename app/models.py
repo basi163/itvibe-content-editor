@@ -18,7 +18,7 @@ class SourceDocument:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "SourceDocument":
+    def from_dict(cls, value: dict[str, Any]) -> SourceDocument:
         return cls(**value)
 
 
@@ -36,7 +36,7 @@ class StoryCandidate:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "StoryCandidate":
+    def from_dict(cls, value: dict[str, Any]) -> StoryCandidate:
         return cls(**value)
 
 
@@ -54,7 +54,7 @@ class TriageDecision:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "TriageDecision":
+    def from_dict(cls, value: dict[str, Any]) -> TriageDecision:
         return cls(**value)
 
 
@@ -68,5 +68,5 @@ class GeneratedPost:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "GeneratedPost":
+    def from_dict(cls, value: dict[str, Any]) -> GeneratedPost:
         return cls(**value)

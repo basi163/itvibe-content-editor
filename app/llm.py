@@ -10,7 +10,6 @@ from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDeci
 from app.prompts import REPAIR_SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT
 from app.renderer import validate_post
 
-
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 
@@ -25,7 +24,7 @@ def _parse_json(content: str) -> dict[str, Any]:
             raise
         value = json.loads(cleaned[start : end + 1])
     if not isinstance(value, dict):
-        raise ValueError("Model returned a non-object JSON value")
+        raise TypeError("Model returned a non-object JSON value")
     return value
 
 

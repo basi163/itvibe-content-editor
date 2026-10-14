@@ -11,7 +11,6 @@ from bs4 import BeautifulSoup
 
 from app.models import SourceDocument
 
-
 TRACKING_PREFIXES = ("utm_", "fbclid", "gclid", "yclid", "mc_")
 
 

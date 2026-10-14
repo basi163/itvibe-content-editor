@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 
 from app.models import GeneratedPost, SourceDocument
 
-
 SOURCE_MARKER_RE = re.compile(r"\[\[source:(\d+)\|([^\]]+)]]", re.IGNORECASE)
 TAG_RE = re.compile(r"^#[\wА-Яа-яЁё]+$", re.UNICODE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")

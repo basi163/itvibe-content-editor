@@ -31,7 +31,7 @@ class Settings:
     target_chat_id: int | None
 
     @classmethod
-    def load(cls) -> "Settings":
+    def load(cls) -> Settings:
         load_dotenv()
         settings = cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),

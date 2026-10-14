@@ -16,7 +16,7 @@ FROM base AS test
 USER root
 RUN pip install '.[dev]'
 COPY tests ./tests
-RUN pytest -q && ruff check .
+RUN pytest -q && ruff check app tests
 
 FROM base AS runtime
 

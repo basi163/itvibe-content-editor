@@ -12,7 +12,6 @@ from app.llm import QwenClient
 from app.models import SourceDocument, StoryCandidate, TriageDecision
 from app.renderer import render_post
 
-
 logger = logging.getLogger(__name__)
 DraftDelivery = Callable[[int], Awaitable[None]]
 
