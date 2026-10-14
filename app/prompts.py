@@ -64,6 +64,10 @@ WRITER_SYSTEM_PROMPT = """
 """.strip()
 
 
+def render_writer_system_prompt(max_chars: int) -> str:
+    return WRITER_SYSTEM_PROMPT.replace("{max_chars}", str(max_chars))
+
+
 REPAIR_SYSTEM_PROMPT = """
 Исправь готовый пост по списку ошибок. Смысл и подтвержденные факты должны сохраниться.
 Не добавляй сведения, которых нет в источниках. Верни только JSON с полями title, body,

@@ -7,7 +7,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
-from app.prompts import REPAIR_SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT
+from app.prompts import REPAIR_SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT, render_writer_system_prompt
 from app.renderer import validate_post
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
@@ -116,7 +116,7 @@ class QwenClient:
         sources: list[SourceDocument],
         triage: TriageDecision,
     ) -> GeneratedPost:
-        system = WRITER_SYSTEM_PROMPT.format(max_chars=self.max_post_chars)
+        system = render_writer_system_prompt(self.max_post_chars)
         payload = {
             "candidate": candidate.to_dict(),
             "editorial_decision": triage.to_dict(),

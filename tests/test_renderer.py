@@ -1,6 +1,7 @@
 import pytest
 
 from app.models import GeneratedPost, SourceDocument
+from app.prompts import render_writer_system_prompt
 from app.renderer import render_post, validate_post
 
 SOURCES = [
@@ -27,6 +28,13 @@ def test_render_valid_post_with_contextual_link() -> None:
     assert rendered.html.startswith("<b>Новая архитектура")
     assert '<a href="https://example.com/research">официальной публикации</a>' in rendered.html
     assert "https://" not in rendered.visible_text
+
+
+def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
+    prompt = render_writer_system_prompt(2000)
+
+    assert "{max_chars}" not in prompt
+    assert '"title": ""' in prompt
 
 
 @pytest.mark.parametrize(
