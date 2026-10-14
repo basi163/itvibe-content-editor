@@ -14,6 +14,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
     ChatShared,
     InlineKeyboardButton,
@@ -380,7 +381,7 @@ class EditorBot:
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
         rendered = render_post(post, sources, self.settings.max_post_chars)
         preview_url = self._preview_url(draft)
-        message = await self._send_editor_message(
+        message, media_message_id = await self._send_editor_message(
             int(editor_chat_id),
             draft,
             rendered.html,
@@ -391,6 +392,7 @@ class EditorBot:
             draft_id,
             editor_chat_id=int(editor_chat_id),
             editor_message_id=message.message_id,
+            editor_media_message_id=media_message_id,
         )
 
     async def refresh_draft(self, draft_id: int) -> None:
@@ -400,19 +402,30 @@ class EditorBot:
         sources = [SourceDocument.from_dict(item) for item in draft["sources"]]
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
         rendered = render_post(post, sources, self.settings.max_post_chars)
-        message = await self._send_editor_message(
+        old_message_id = int(draft["editor_message_id"])
+        old_media_message_id = draft.get("editor_media_message_id")
+        message, media_message_id = await self._send_editor_message(
             int(draft["editor_chat_id"]),
             draft,
             rendered.html,
             rendered.char_count,
             self._preview_url(draft),
         )
-        await self.repository.update_draft(draft_id, editor_message_id=message.message_id)
+        await self.repository.update_draft(
+            draft_id,
+            editor_message_id=message.message_id,
+            editor_media_message_id=media_message_id,
+        )
         try:
             await self.bot.delete_message(
                 chat_id=draft["editor_chat_id"],
-                message_id=draft["editor_message_id"],
+                message_id=old_message_id,
             )
+            if old_media_message_id and int(old_media_message_id) != old_message_id:
+                await self.bot.delete_message(
+                    chat_id=draft["editor_chat_id"],
+                    message_id=int(old_media_message_id),
+                )
         except TelegramBadRequest:
             logger.warning("Could not remove previous editor message for draft %s", draft_id)
 
@@ -423,35 +436,50 @@ class EditorBot:
         text: str,
         char_count: int,
         preview_url: str | None,
-    ) -> Message:
+    ) -> tuple[Message, int | None]:
         media = self._selected_media(draft)
-        file_value = media and (media.get("telegram_file_id") or media.get("image_url"))
-        if char_count <= 1024 and file_value:
+        file_value = await self._media_input(media)
+        if file_value:
             try:
+                if char_count > 1024:
+                    if media and media.get("type") == "video":
+                        media_message = await self.bot.send_video(chat_id, video=file_value)
+                    else:
+                        media_message = await self.bot.send_photo(chat_id, photo=file_value)
+                    text_message = await self.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=self._draft_keyboard(int(draft["id"])),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+                    return text_message, media_message.message_id
                 if media.get("type") == "video":
-                    return await self.bot.send_video(
+                    message = await self.bot.send_video(
                         chat_id,
                         video=file_value,
                         caption=text,
                         reply_markup=self._draft_keyboard(int(draft["id"])),
                     )
-                return await self.bot.send_photo(
-                    chat_id,
-                    photo=file_value,
-                    caption=text,
-                    reply_markup=self._draft_keyboard(int(draft["id"])),
-                )
+                else:
+                    message = await self.bot.send_photo(
+                        chat_id,
+                        photo=file_value,
+                        caption=text,
+                        reply_markup=self._draft_keyboard(int(draft["id"])),
+                    )
+                return message, None
             except TelegramBadRequest:
                 logger.warning(
                     "Media delivery failed for draft %s, using link preview",
                     draft["id"],
                 )
-        return await self.bot.send_message(
+        message = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_markup=self._draft_keyboard(int(draft["id"])),
             link_preview_options=self._preview_options(preview_url),
         )
+        return message, None
 
     async def publish_draft(self, draft_id: int, owner_id: int) -> None:
         draft = await self.repository.get_draft(draft_id)
@@ -468,22 +496,20 @@ class EditorBot:
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
         rendered = render_post(post, sources, self.settings.max_post_chars)
         media = self._selected_media(draft)
-        preview_url = self._preview_url(draft)
-        attachment = media and (media.get("telegram_file_id") or media.get("image_url"))
-        if rendered.char_count <= 1024 and not attachment and not preview_url:
+        if not media:
             await self.bot.send_message(owner_id, "Публикация остановлена. У материала нет изображения.")
             return
-        if rendered.char_count > 1024 and not preview_url:
+        file_value = await self._media_input(media)
+        if not file_value:
             await self.bot.send_message(
                 owner_id,
-                "Публикация остановлена. Для длинного поста не найдено подходящее превью.",
+                "Публикация остановлена. Не удалось скачать изображение.",
             )
             return
 
-        sent: Message
         try:
-            if rendered.char_count <= 1024 and media:
-                file_value = media.get("telegram_file_id") or media.get("image_url")
+            media_sent: Message | None = None
+            if rendered.char_count <= 1024:
                 if media.get("type") == "video" and file_value:
                     sent = await self.bot.send_video(
                         int(target_chat_id),
@@ -496,31 +522,30 @@ class EditorBot:
                         photo=file_value,
                         caption=rendered.html,
                     )
-                else:
-                    sent = await self.bot.send_message(
-                        int(target_chat_id),
-                        rendered.html,
-                        link_preview_options=self._preview_options(preview_url),
-                    )
             else:
+                if media.get("type") == "video":
+                    media_sent = await self.bot.send_video(int(target_chat_id), video=file_value)
+                else:
+                    media_sent = await self.bot.send_photo(int(target_chat_id), photo=file_value)
                 sent = await self.bot.send_message(
                     int(target_chat_id),
                     rendered.html,
-                    link_preview_options=self._preview_options(preview_url),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
         except TelegramBadRequest:
-            logger.warning("Media publication failed for draft %s, using link preview", draft_id)
-            sent = await self.bot.send_message(
-                int(target_chat_id),
-                rendered.html,
-                link_preview_options=self._preview_options(preview_url),
+            logger.warning("Media publication failed for draft %s", draft_id)
+            await self.bot.send_message(
+                owner_id,
+                "Публикация остановлена. Telegram не принял изображение.",
             )
+            return
 
         await self.repository.update_draft(
             draft_id,
             status="published",
             target_chat_id=int(target_chat_id),
             target_message_id=sent.message_id,
+            target_media_message_id=media_sent.message_id if media_sent else None,
         )
         if draft["editor_chat_id"] and draft["editor_message_id"]:
             await self.bot.edit_message_reply_markup(
@@ -532,7 +557,12 @@ class EditorBot:
 
     async def _send_sources(self, user_id: int, draft: dict[str, Any]) -> None:
         lines = [f"Источники черновика #{draft['id']}\n"]
-        for index, source in enumerate(draft["sources"][:12]):
+        linkable_sources = [
+            (index, source)
+            for index, source in enumerate(draft["sources"])
+            if source.get("linkable")
+        ]
+        for index, source in linkable_sources[:12]:
             title = html.escape(source.get("title") or source.get("publisher") or "Без названия")
             url = html.escape(source.get("url") or "")
             marker = "Основной" if index == draft["triage"].get("primary_source_index") else str(index)
@@ -540,6 +570,8 @@ class EditorBot:
                 lines.append(f"{marker}  <a href=\"{url}\">{title}</a>")
             else:
                 lines.append(f"{marker}  {title}")
+        if not linkable_sources:
+            lines.append("Официальные первоисточники не найдены.")
         text = "\n".join(lines)
         await self.bot.send_message(user_id, text[:4000], link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -576,11 +608,35 @@ class EditorBot:
     def _preview_url(self, draft: dict[str, Any]) -> str | None:
         media = self._selected_media(draft)
         if media and str(media.get("page_url", "")).startswith("http"):
-            return str(media["page_url"])
+            source_index = media.get("source_index")
+            if (
+                isinstance(source_index, int)
+                and source_index < len(draft["sources"])
+                and draft["sources"][source_index].get("linkable")
+            ):
+                return str(media["page_url"])
         for source in draft["sources"]:
-            if source.get("og_image") and str(source.get("url", "")).startswith("http"):
+            if (
+                source.get("linkable")
+                and source.get("og_image")
+                and str(source.get("url", "")).startswith("http")
+            ):
                 return str(source["url"])
         return None
+
+    async def _media_input(self, media: dict[str, Any] | None) -> str | BufferedInputFile | None:
+        if not media:
+            return None
+        if media.get("telegram_file_id"):
+            return str(media["telegram_file_id"])
+        image_url = str(media.get("image_url") or "")
+        if not image_url:
+            return None
+        downloaded = await self.pipeline.extractor.download_image(image_url)
+        if not downloaded:
+            return None
+        content, filename = downloaded
+        return BufferedInputFile(content, filename=filename)
 
     @staticmethod
     def _preview_options(url: str | None) -> LinkPreviewOptions:

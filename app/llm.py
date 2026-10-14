@@ -37,6 +37,7 @@ def _source_payload(sources: list[SourceDocument], per_source_chars: int = 12_00
             "publisher": source.publisher,
             "text": source.text[:per_source_chars],
             "has_preview_image": bool(source.og_image),
+            "linkable": source.linkable,
             "error": source.error,
         }
         for index, source in enumerate(sources)
@@ -104,6 +105,11 @@ class QwenClient:
             category=str(data.get("category", "")).strip(),
             reason=str(data.get("reason", "")).strip(),
             primary_source_index=max(0, int(data.get("primary_source_index", 0))),
+            linkable_source_indices=[
+                int(item)
+                for item in data.get("linkable_source_indices", [])
+                if str(item).lstrip("-").isdigit()
+            ],
             facts=[str(item).strip() for item in data.get("facts", []) if str(item).strip()],
             uncertainties=[
                 str(item).strip() for item in data.get("uncertainties", []) if str(item).strip()

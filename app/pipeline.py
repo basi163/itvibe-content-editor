@@ -7,7 +7,7 @@ from typing import Any
 
 from app.config import Settings
 from app.db import Repository
-from app.extractor import ArticleExtractor
+from app.extractor import ArticleExtractor, is_known_secondary_url, is_solidot_url
 from app.llm import QwenClient
 from app.models import SourceDocument, StoryCandidate, TriageDecision
 from app.renderer import render_post
@@ -60,10 +60,17 @@ class ContentPipeline:
 
     async def _process(self, candidate: StoryCandidate) -> int | None:
         sources = await self.extractor.collect_sources(candidate.urls)
+        if candidate.origin_type == "solidot_rss":
+            sources = [source for source in sources if not is_solidot_url(source.url)]
         if not sources:
             sources = [
                 SourceDocument(
-                    url=candidate.origin_ref if candidate.origin_ref.startswith("http") else "",
+                    url=(
+                        candidate.origin_ref
+                        if candidate.origin_ref.startswith("http")
+                        and not is_solidot_url(candidate.origin_ref)
+                        else ""
+                    ),
                     title=candidate.title,
                     text=candidate.text,
                     publisher=candidate.origin_type,
@@ -79,6 +86,17 @@ class ContentPipeline:
                 candidate.title,
             )
             return None
+
+        requested_linkable = set(triage.linkable_source_indices)
+        for index, source in enumerate(sources):
+            source.linkable = (
+                index in requested_linkable
+                and not is_solidot_url(source.url)
+                and not is_known_secondary_url(source.url)
+            )
+        triage.linkable_source_indices = [
+            index for index, source in enumerate(sources) if source.linkable
+        ]
 
         post = await self.llm.generate(candidate, sources, triage)
         render_post(post, sources, self.settings.max_post_chars)
@@ -135,10 +153,14 @@ class ContentPipeline:
                     "image_url": None,
                 }
             )
-        ordered = list(range(len(sources)))
-        if 0 <= triage.primary_source_index < len(sources):
-            ordered.remove(triage.primary_source_index)
-            ordered.insert(0, triage.primary_source_index)
+        ordered = sorted(
+            range(len(sources)),
+            key=lambda index: (
+                0 if is_known_secondary_url(sources[index].url) else 1,
+                0 if index == triage.primary_source_index else 1,
+                index,
+            ),
+        )
         for index in ordered:
             source = sources[index]
             if not source.og_image:

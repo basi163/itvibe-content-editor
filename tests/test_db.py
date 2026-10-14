@@ -27,6 +27,8 @@ async def test_draft_round_trip(tmp_path: Path) -> None:
     assert draft is not None
     assert draft["title"] == "Заголовок"
     assert draft["hashtags"] == ["#ИИ", "#наука", "#технологии"]
+    assert draft["editor_media_message_id"] is None
+    assert draft["target_media_message_id"] is None
 
 
 @pytest.mark.asyncio

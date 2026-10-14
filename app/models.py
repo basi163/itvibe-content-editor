@@ -13,6 +13,7 @@ class SourceDocument:
     og_image: str | None = None
     links: list[str] = field(default_factory=list)
     error: str | None = None
+    linkable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -47,6 +48,7 @@ class TriageDecision:
     category: str
     reason: str
     primary_source_index: int = 0
+    linkable_source_indices: list[int] = field(default_factory=list)
     facts: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
 

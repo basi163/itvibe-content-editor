@@ -10,6 +10,7 @@ from app.models import GeneratedPost, SourceDocument
 SOURCE_MARKER_RE = re.compile(r"\[\[source:(\d+)\|([^\]]+)]]", re.IGNORECASE)
 TAG_RE = re.compile(r"^#[\wА-Яа-яЁё]+$", re.UNICODE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+RAW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 EMOJI_RE = re.compile(
     "["
     "\U0001F1E0-\U0001F1FF"
@@ -51,7 +52,11 @@ def _body_to_html(body: str, sources: list[SourceDocument]) -> str:
         result.append(html.escape(body[position : match.start()]))
         index = int(match.group(1))
         anchor = html.escape(match.group(2).strip())
-        if 0 <= index < len(sources) and _safe_url(sources[index].url):
+        if (
+            0 <= index < len(sources)
+            and sources[index].linkable
+            and _safe_url(sources[index].url)
+        ):
             url = html.escape(sources[index].url, quote=True)
             result.append(f'<a href="{url}">{anchor}</a>')
         else:
@@ -90,6 +95,8 @@ def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
         errors.append(f"Текст длиннее лимита на {len(visible) - max_chars} знаков")
     if post.body.count("[[source:") > 3:
         errors.append("Использовано больше трех ссылок")
+    if RAW_URL_RE.search(visible):
+        errors.append("В видимом тексте есть URL")
     return errors
 
 

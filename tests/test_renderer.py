@@ -9,6 +9,7 @@ SOURCES = [
         url="https://example.com/research",
         title="Research",
         text="Verified source",
+        linkable=True,
     )
 ]
 
@@ -35,6 +36,31 @@ def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
 
     assert "{max_chars}" not in prompt
     assert '"title": ""' in prompt
+
+
+def test_renderer_does_not_link_non_primary_source() -> None:
+    sources = [SourceDocument(url="https://www.solidot.org/story?sid=1", linkable=False)]
+    post = GeneratedPost(
+        "Заголовок",
+        "Подробности описаны в [[source:0|материале]].",
+        ["#ИИ", "#наука", "#технологии"],
+    )
+
+    rendered = render_post(post, sources, 2000)
+
+    assert "solidot" not in rendered.html.casefold()
+    assert "<a href=" not in rendered.html
+    assert "в материале" in rendered.visible_text
+
+
+def test_validation_rejects_visible_url() -> None:
+    post = GeneratedPost(
+        "Заголовок",
+        "Ссылка https://www.solidot.org/story?sid=1",
+        ["#ИИ", "#наука", "#технологии"],
+    )
+
+    assert any("URL" in error for error in validate_post(post, 2000))
 
 
 @pytest.mark.parametrize(

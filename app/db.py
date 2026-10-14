@@ -83,8 +83,10 @@ class Repository:
                     status TEXT NOT NULL,
                     editor_chat_id INTEGER,
                     editor_message_id INTEGER,
+                    editor_media_message_id INTEGER,
                     target_chat_id INTEGER,
                     target_message_id INTEGER,
+                    target_media_message_id INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -98,6 +100,11 @@ class Repository:
                 );
                 """
             )
+            cursor = await db.execute("PRAGMA table_info(drafts)")
+            columns = {str(row[1]) for row in await cursor.fetchall()}
+            for column in ("editor_media_message_id", "target_media_message_id"):
+                if column not in columns:
+                    await db.execute(f"ALTER TABLE drafts ADD COLUMN {column} INTEGER")
             await db.commit()
 
     async def get_setting(self, key: str) -> str | None:
@@ -264,8 +271,10 @@ class Repository:
             "status",
             "editor_chat_id",
             "editor_message_id",
+            "editor_media_message_id",
             "target_chat_id",
             "target_message_id",
+            "target_media_message_id",
         }
         unknown = set(fields) - allowed
         if unknown:
