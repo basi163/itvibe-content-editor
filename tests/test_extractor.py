@@ -30,4 +30,6 @@ def test_extract_bare_article_url() -> None:
 def test_source_classification_blocks_solidot_and_known_media() -> None:
     assert is_solidot_url("https://www.solidot.org/story?sid=1")
     assert is_known_secondary_url("https://www.zdnet.com/business/story/")
+    assert is_known_secondary_url("https://lwn.net/Articles/123456/")
+    assert is_known_secondary_url("https://www.neowin.net/news/example/")
     assert not is_known_secondary_url("https://www.adviescollegeicttoetsing.nl/documenten/1")

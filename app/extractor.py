@@ -22,6 +22,8 @@ SECONDARY_SOURCE_HOSTS = {
     "cnn.com",
     "engadget.com",
     "forbes.com",
+    "lwn.net",
+    "neowin.net",
     "reuters.com",
     "techcrunch.com",
     "techradar.com",

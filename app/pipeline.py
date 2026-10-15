@@ -101,6 +101,9 @@ class ContentPipeline:
         post = await self.llm.generate(candidate, sources, triage)
         render_post(post, sources, self.settings.max_post_chars)
         media = self._media_candidates(candidate, sources, triage)
+        if not media:
+            logger.info("Story skipped because no usable image was discovered: %s", candidate.title)
+            return None
         material = {
             "candidate": candidate.to_dict(),
             "sources": [source.to_dict() for source in sources],

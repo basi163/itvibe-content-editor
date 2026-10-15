@@ -520,6 +520,8 @@ class EditorBot:
                     return message, None
                 if not preview_url:
                     raise
+        if not preview_url:
+            raise RuntimeError(f"Draft {draft['id']} has neither downloadable media nor preview")
         message = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
