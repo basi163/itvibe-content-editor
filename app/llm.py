@@ -7,7 +7,12 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
-from app.prompts import REPAIR_SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT, render_writer_system_prompt
+from app.prompts import (
+    IMAGE_SEARCH_PROMPT,
+    REPAIR_SYSTEM_PROMPT,
+    TRIAGE_SYSTEM_PROMPT,
+    render_writer_system_prompt,
+)
 from app.renderer import validate_post
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
@@ -144,6 +149,69 @@ class QwenClient:
         if errors:
             post = await self.repair(post, sources, errors)
         return post
+
+    async def search_images(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+    ) -> list[dict[str, str | int]]:
+        context = {
+            "post_title": post.title,
+            "post_body": post.body,
+            "original_title": candidate.title,
+            "category": triage.category,
+            "verified_facts": triage.facts,
+            "source_titles": [source.title for source in sources if source.title],
+        }
+        response = await self.client.responses.create(
+            model=self.writer_model,
+            input=(
+                f"{IMAGE_SEARCH_PROMPT}\n\n"
+                f"Контекст поста\n{json.dumps(context, ensure_ascii=False)}"
+            ),
+            tools=[{"type": "web_search_image"}],
+            max_output_tokens=200,
+        )
+
+        images: list[dict[str, str | int]] = []
+        for item in response.output:
+            if getattr(item, "type", "") != "web_search_image_call":
+                continue
+            output = getattr(item, "output", None)
+            if not output:
+                continue
+            parsed = json.loads(output)
+            if not isinstance(parsed, list):
+                continue
+            for image in parsed:
+                if not isinstance(image, dict):
+                    continue
+                url = str(image.get("url", "")).strip()
+                if not url.startswith(("http://", "https://")):
+                    continue
+                images.append(
+                    {
+                        "index": int(image.get("index", len(images) + 1)),
+                        "title": str(image.get("title", "")).strip(),
+                        "url": url,
+                    }
+                )
+
+        if not images:
+            return []
+
+        try:
+            selection = _parse_json(response.output_text)
+            selected_index = int(selection.get("selected_index", images[0]["index"]))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            selected_index = int(images[0]["index"])
+
+        return sorted(
+            images,
+            key=lambda image: (0 if int(image["index"]) == selected_index else 1),
+        )
 
     async def repair(
         self,

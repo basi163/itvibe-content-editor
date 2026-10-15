@@ -7,9 +7,14 @@ from typing import Any
 
 from app.config import Settings
 from app.db import Repository
-from app.extractor import ArticleExtractor, is_known_secondary_url, is_solidot_url
+from app.extractor import (
+    ArticleExtractor,
+    is_known_secondary_url,
+    is_solidot_url,
+    normalize_url,
+)
 from app.llm import QwenClient
-from app.models import SourceDocument, StoryCandidate, TriageDecision
+from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
 from app.renderer import render_post
 
 logger = logging.getLogger(__name__)
@@ -102,6 +107,8 @@ class ContentPipeline:
         render_post(post, sources, self.settings.max_post_chars)
         media = self._media_candidates(candidate, sources, triage)
         if not media:
+            media = await self._contextual_media(candidate, sources, triage, post)
+        if not media:
             logger.info("Story skipped because no usable image was discovered: %s", candidate.title)
             return None
         material = {
@@ -122,6 +129,41 @@ class ContentPipeline:
         if self.deliver:
             await self.deliver(draft_id)
         return draft_id
+
+    async def _contextual_media(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+    ) -> list[dict[str, Any]]:
+        try:
+            search_results = await self.llm.search_images(candidate, sources, triage, post)
+        except Exception:
+            logger.exception("Contextual image search failed for: %s", candidate.title)
+            return []
+
+        checked: set[str] = set()
+        for result in search_results[:10]:
+            image_url = normalize_url(str(result.get("url") or ""))
+            if not image_url or image_url in checked:
+                continue
+            checked.add(image_url)
+            downloaded = await self.extractor.download_image(image_url)
+            if not downloaded or len(downloaded[0]) < 15_000:
+                continue
+            logger.info("Contextual illustration selected for: %s", candidate.title)
+            return [
+                {
+                    "type": "photo",
+                    "telegram_file_id": None,
+                    "page_url": image_url,
+                    "image_url": image_url,
+                    "provider": "qwen_web_search_image",
+                    "search_title": str(result.get("title") or ""),
+                }
+            ]
+        return []
 
     async def regenerate(self, draft_id: int) -> bool:
         draft = await self.repository.get_draft(draft_id)

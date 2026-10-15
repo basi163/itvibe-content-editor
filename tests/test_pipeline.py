@@ -38,6 +38,9 @@ async def test_story_without_image_is_not_created() -> None:
                 )
             ]
 
+        async def download_image(self, url: str) -> None:
+            return None
+
     class Llm:
         async def triage(
             self,
@@ -58,6 +61,15 @@ async def test_story_without_image_is_not_created() -> None:
                 ["#ИИ", "#наука", "#технологии"],
             )
 
+        async def search_images(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+            post: GeneratedPost,
+        ) -> list[dict[str, object]]:
+            return []
+
     class Repository:
         async def create_draft(self, **kwargs: object) -> int:
             raise AssertionError("A draft without an image must not be created")
@@ -77,3 +89,67 @@ async def test_story_without_image_is_not_created() -> None:
     )
 
     assert await pipeline._process(candidate) is None
+
+
+@pytest.mark.asyncio
+async def test_story_uses_contextual_image_when_sources_have_none() -> None:
+    image_url = "https://images.example/context.jpg"
+
+    class Extractor:
+        async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:
+            return [SourceDocument(url="https://example.org/story", title="Official")]
+
+        async def download_image(self, url: str) -> tuple[bytes, str] | None:
+            assert url == image_url
+            return b"x" * 20_000, "preview.jpg"
+
+    class Llm:
+        async def triage(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+        ) -> TriageDecision:
+            return TriageDecision(True, 0.9, "technology", "relevant")
+
+        async def generate(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+        ) -> GeneratedPost:
+            return GeneratedPost(
+                "Заголовок",
+                "Проверенный текст",
+                ["#ИИ", "#наука", "#тех"],
+            )
+
+        async def search_images(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+            post: GeneratedPost,
+        ) -> list[dict[str, object]]:
+            return [{"index": 2, "title": "Context", "url": image_url}]
+
+    class Repository:
+        created: dict[str, object] | None = None
+
+        async def create_draft(self, **kwargs: object) -> int:
+            self.created = kwargs
+            return 42
+
+    repository = Repository()
+    pipeline = ContentPipeline(
+        settings=SimpleNamespace(relevance_threshold=0.72, max_post_chars=2000),
+        repository=repository,
+        extractor=Extractor(),
+        llm=Llm(),
+    )
+    candidate = StoryCandidate("manual", "https://example.org/story", "Story", "Text")
+
+    assert await pipeline._process(candidate) == 42
+    assert repository.created is not None
+    media = repository.created["media"]
+    assert isinstance(media, list)
+    assert media[0]["provider"] == "qwen_web_search_image"
