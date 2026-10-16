@@ -86,8 +86,9 @@ class ContentPipeline:
         triage = await self.llm.triage(candidate, sources)
         if not triage.relevant or triage.score < self.settings.relevance_threshold:
             logger.info(
-                "Story rejected with score %.2f: %s",
+                "Story rejected with score %.2f (%s): %s",
                 triage.score,
+                triage.reason or "no reason supplied",
                 candidate.title,
             )
             return None
