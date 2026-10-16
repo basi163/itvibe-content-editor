@@ -12,6 +12,38 @@ def _optional_int(name: str) -> int | None:
     return int(value) if value else None
 
 
+def _clock_minutes(value: str) -> int:
+    try:
+        hour_text, minute_text = value.strip().split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"Invalid clock time: {value!r}") from error
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise RuntimeError(f"Invalid clock time: {value!r}")
+    return hour * 60 + minute
+
+
+def _active_windows(name: str, default: str) -> tuple[tuple[int, int], ...]:
+    raw_value = os.getenv(name, default).strip()
+    windows: list[tuple[int, int]] = []
+    for raw_window in raw_value.split(","):
+        try:
+            start_text, end_text = raw_window.strip().split("-", 1)
+        except ValueError as error:
+            raise RuntimeError(
+                f"{name} must contain comma-separated HH:MM-HH:MM windows"
+            ) from error
+        start = _clock_minutes(start_text)
+        end = _clock_minutes(end_text)
+        if start == end:
+            raise RuntimeError(f"{name} windows cannot start and end at the same time")
+        windows.append((start, end))
+    if not windows:
+        raise RuntimeError(f"{name} must contain at least one time window")
+    return tuple(windows)
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -22,6 +54,9 @@ class Settings:
     database_path: Path
     solidot_rss_url: str
     rss_poll_interval_seconds: int
+    rss_offpeak_poll_interval_seconds: int
+    rss_active_windows: tuple[tuple[int, int], ...]
+    rss_schedule_utc_offset_hours: int
     rss_bootstrap_items: int
     max_post_chars: int
     relevance_threshold: float
@@ -44,6 +79,15 @@ class Settings:
                 "SOLIDOT_RSS_URL", "https://www.solidot.org/index.rss"
             ).strip(),
             rss_poll_interval_seconds=int(os.getenv("RSS_POLL_INTERVAL_SECONDS", "120")),
+            rss_offpeak_poll_interval_seconds=int(
+                os.getenv("RSS_OFFPEAK_POLL_INTERVAL_SECONDS", "1800")
+            ),
+            rss_active_windows=_active_windows(
+                "RSS_ACTIVE_WINDOWS", "07:30-15:30,18:00-22:30"
+            ),
+            rss_schedule_utc_offset_hours=int(
+                os.getenv("RSS_SCHEDULE_UTC_OFFSET_HOURS", "4")
+            ),
             rss_bootstrap_items=int(os.getenv("RSS_BOOTSTRAP_ITEMS", "1")),
             max_post_chars=int(os.getenv("MAX_POST_CHARS", "2000")),
             relevance_threshold=float(os.getenv("RELEVANCE_THRESHOLD", "0.72")),
@@ -70,3 +114,12 @@ class Settings:
             raise RuntimeError("MAX_POST_CHARS must be between 512 and 4096")
         if not 0 <= self.relevance_threshold <= 1:
             raise RuntimeError("RELEVANCE_THRESHOLD must be between 0 and 1")
+        if self.rss_poll_interval_seconds < 30:
+            raise RuntimeError("RSS_POLL_INTERVAL_SECONDS must be at least 30")
+        if self.rss_offpeak_poll_interval_seconds < self.rss_poll_interval_seconds:
+            raise RuntimeError(
+                "RSS_OFFPEAK_POLL_INTERVAL_SECONDS must not be shorter than "
+                "RSS_POLL_INTERVAL_SECONDS"
+            )
+        if not -12 <= self.rss_schedule_utc_offset_hours <= 14:
+            raise RuntimeError("RSS_SCHEDULE_UTC_OFFSET_HOURS must be between -12 and 14")

@@ -206,7 +206,10 @@ class EditorBot:
         await message.answer(
             f"Лимит поста  {self.settings.max_post_chars}\n"
             f"Порог релевантности  {self.settings.relevance_threshold:.2f}\n"
-            f"Проверка RSS  каждые {self.settings.rss_poll_interval_seconds} секунд\n"
+            "Проверка RSS  адаптивно\n"
+            f"В активные часы  каждые {self.settings.rss_poll_interval_seconds} секунд\n"
+            "Вне активных часов  каждые "
+            f"{self.settings.rss_offpeak_poll_interval_seconds} секунд\n"
             f"Модель отбора  <code>{html.escape(self.settings.triage_model)}</code>\n"
             f"Модель текста  <code>{html.escape(self.settings.writer_model)}</code>"
         )

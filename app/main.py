@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import UTC, datetime, timedelta, timezone
 
 from app.bot import EditorBot
 from app.config import Settings
@@ -14,6 +15,36 @@ from app.pipeline import ContentPipeline
 from app.rss import FeedEntry, SolidotFeed
 
 logger = logging.getLogger(__name__)
+
+
+def rss_poll_delay_seconds(settings: Settings, now: datetime | None = None) -> int:
+    """Return the active/off-peak delay, without sleeping past an active-window start."""
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    local = current.astimezone(
+        timezone(timedelta(hours=settings.rss_schedule_utc_offset_hours))
+    )
+    minute_of_day = local.hour * 60 + local.minute
+
+    for start, end in settings.rss_active_windows:
+        is_active = (
+            start <= minute_of_day < end
+            if start < end
+            else minute_of_day >= start or minute_of_day < end
+        )
+        if is_active:
+            return settings.rss_poll_interval_seconds
+
+    seconds_of_day = minute_of_day * 60 + local.second
+    seconds_until_start = min(
+        ((start * 60 - seconds_of_day) % (24 * 60 * 60)) or 24 * 60 * 60
+        for start, _ in settings.rss_active_windows
+    )
+    return max(
+        1,
+        min(settings.rss_offpeak_poll_interval_seconds, seconds_until_start),
+    )
 
 
 async def _store_and_process(
@@ -47,6 +78,7 @@ async def rss_worker(
     stop_event: asyncio.Event,
 ) -> None:
     feed = SolidotFeed(settings.solidot_rss_url, settings.http_timeout_seconds)
+    previous_delay: int | None = None
     while not stop_event.is_set():
         try:
             entries = await feed.fetch()
@@ -74,10 +106,14 @@ async def rss_worker(
         except Exception:
             logger.exception("Solidot RSS polling failed")
 
+        delay = rss_poll_delay_seconds(settings)
+        if delay != previous_delay:
+            logger.info("Next Solidot RSS check in %s seconds", delay)
+            previous_delay = delay
         try:
             await asyncio.wait_for(
                 stop_event.wait(),
-                timeout=settings.rss_poll_interval_seconds,
+                timeout=delay,
             )
         except TimeoutError:
             pass
