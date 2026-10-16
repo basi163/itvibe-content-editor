@@ -27,10 +27,24 @@ def test_render_valid_post_with_contextual_link() -> None:
     rendered = render_post(post, SOURCES, 2000)
 
     assert rendered.html.startswith("<b>Новая архитектура")
-    assert rendered.rich_html.startswith("<h2>Новая архитектура")
+    assert rendered.rich_html.startswith("<p><b>Новая архитектура")
     assert "<p>Разработчики описали" in rendered.rich_html
     assert '<a href="https://example.com/research">официальной публикации</a>' in rendered.html
     assert "https://" not in rendered.visible_text
+
+
+def test_renderer_adds_exactly_one_blank_line_between_paragraphs() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body="Первый абзац.\nВторой абзац.\n\n\nТретий абзац.",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+    )
+
+    rendered = render_post(post, SOURCES, 2000)
+
+    assert "Первый абзац.\n\nВторой абзац.\n\nТретий абзац." in rendered.html
+    assert "<p>Первый абзац.</p><p><br></p><p>Второй абзац.</p>" in rendered.rich_html
+    assert "<h2>" not in rendered.rich_html
 
 
 def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:

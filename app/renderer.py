@@ -46,6 +46,12 @@ def visible_body(body: str) -> str:
     return SOURCE_MARKER_RE.sub(lambda match: match.group(2), body)
 
 
+def normalize_body_spacing(body: str) -> str:
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    paragraphs = [part.strip() for part in re.split(r"\n+", normalized) if part.strip()]
+    return "\n\n".join(paragraphs)
+
+
 def _body_to_html(body: str, sources: list[SourceDocument]) -> str:
     result: list[str] = []
     position = 0
@@ -68,18 +74,18 @@ def _body_to_html(body: str, sources: list[SourceDocument]) -> str:
 
 
 def _body_to_rich_html(body: str, sources: list[SourceDocument]) -> str:
-    paragraphs = re.split(r"\n\s*\n", body.strip())
+    paragraphs = normalize_body_spacing(body).split("\n\n")
     blocks: list[str] = []
     for paragraph in paragraphs:
-        content = _body_to_html(paragraph, sources).replace("\n", "<br>")
+        content = _body_to_html(paragraph, sources)
         blocks.append(f"<p>{content}</p>")
-    return "".join(blocks)
+    return "<p><br></p>".join(blocks)
 
 
 def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
     errors: list[str] = []
     title = post.title.strip()
-    body = visible_body(post.body).strip()
+    body = visible_body(normalize_body_spacing(post.body))
     hashtags = [tag.strip() for tag in post.hashtags]
     visible = f"{title}\n\n{body}\n\n{' '.join(hashtags)}"
     lowered = visible.casefold()
@@ -120,11 +126,15 @@ def render_post(
         raise ValueError("; ".join(errors))
 
     title = html.escape(post.title.strip())
-    body = _body_to_html(post.body.strip(), sources)
-    rich_body = _body_to_rich_html(post.body, sources)
+    normalized_body = normalize_body_spacing(post.body)
+    body = _body_to_html(normalized_body, sources)
+    rich_body = _body_to_rich_html(normalized_body, sources)
     hashtags = " ".join(html.escape(tag.strip()) for tag in post.hashtags)
     rendered = f"<b>{title}</b>\n\n{body}\n\n{hashtags}"
-    rich_rendered = f"<h2>{title}</h2>{rich_body}<p>{hashtags}</p>"
+    spacer = "<p><br></p>"
+    rich_rendered = (
+        f"<p><b>{title}</b></p>{spacer}{rich_body}{spacer}<p>{hashtags}</p>"
+    )
     visible = HTML_TAG_RE.sub("", rendered)
     visible = html.unescape(visible)
     return RenderedPost(rendered, rich_rendered, visible, len(visible))
