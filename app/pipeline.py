@@ -194,6 +194,88 @@ class ContentPipeline:
         )
         return True
 
+    async def regenerate_component(self, draft_id: int, component: str) -> bool:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft:
+            return False
+        candidate = StoryCandidate.from_dict(draft["material"]["candidate"])
+        sources = [SourceDocument.from_dict(item) for item in draft["material"]["sources"]]
+        triage = TriageDecision.from_dict(draft["triage"])
+        current = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
+        post = await self.llm.regenerate_component(
+            component,
+            candidate,
+            sources,
+            triage,
+            current,
+        )
+        render_post(post, sources, self.settings.max_post_chars)
+        if component == "title":
+            await self.repository.update_draft(draft_id, title=post.title)
+        elif component == "hashtags":
+            await self.repository.update_draft(
+                draft_id,
+                hashtags_json=_json(post.hashtags),
+            )
+        else:
+            raise ValueError(f"Unsupported post component: {component}")
+        return True
+
+    async def regenerate_media(self, draft_id: int) -> bool:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft:
+            return False
+
+        media = list(draft["media"])
+        if len(media) > 1:
+            next_index = (int(draft["preview_index"]) + 1) % len(media)
+            await self.repository.update_draft(draft_id, preview_index=next_index)
+            return True
+
+        candidate = StoryCandidate.from_dict(draft["material"]["candidate"])
+        sources = [SourceDocument.from_dict(item) for item in draft["material"]["sources"]]
+        triage = TriageDecision.from_dict(draft["triage"])
+        post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
+        existing_urls = {
+            normalize_url(str(item.get("image_url") or ""))
+            for item in media
+            if item.get("image_url")
+        }
+        try:
+            search_results = await self.llm.search_images(
+                candidate,
+                sources,
+                triage,
+                post,
+                excluded_urls=sorted(existing_urls),
+            )
+        except Exception:
+            logger.exception("Alternative image search failed for draft %s", draft_id)
+            return False
+
+        for result in search_results[:10]:
+            image_url = normalize_url(str(result.get("url") or ""))
+            if not image_url or image_url in existing_urls:
+                continue
+            downloaded = await self.extractor.download_image(image_url)
+            if not downloaded or len(downloaded[0]) < 15_000:
+                continue
+            alternative = {
+                "type": "photo",
+                "telegram_file_id": None,
+                "page_url": image_url,
+                "image_url": image_url,
+                "provider": "qwen_web_search_image",
+                "search_title": str(result.get("title") or ""),
+            }
+            await self.repository.update_draft(
+                draft_id,
+                media_json=_json([alternative, *media]),
+                preview_index=0,
+            )
+            return True
+        return False
+
     @staticmethod
     def _media_candidates(
         candidate: StoryCandidate,

@@ -72,3 +72,25 @@ async def test_failed_feed_item_can_be_marked_for_retry(tmp_path: Path) -> None:
     assert state["attempt_count"] == 2
     assert state["status"] == "processing"
     assert state["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_manual_edits_can_be_cleared(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    draft_id = await repository.create_draft(
+        origin_type="test",
+        origin_ref="test",
+        title="Заголовок",
+        body="Текст",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+        sources=[],
+        media=[],
+        material={},
+        triage={},
+    )
+    await repository.set_pending_action(100, "title", draft_id)
+
+    await repository.clear_pending_actions()
+
+    assert await repository.pop_pending_action(100) is None

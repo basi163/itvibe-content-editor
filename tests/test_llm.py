@@ -110,3 +110,73 @@ async def test_image_search_places_model_selection_first() -> None:
 
     assert images[0]["index"] == 7
     assert images[0]["url"] == "https://images.example/7.jpg"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_changes_only_title() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        return {"title": "Новый взгляд на технологию"}
+
+    client._completion = completion  # type: ignore[method-assign]
+    original = GeneratedPost(
+        "Старый заголовок",
+        "Проверенный текст",
+        ["#ИИ", "#наука", "#технологии"],
+    )
+    try:
+        changed = await client.regenerate_component(
+            "title",
+            StoryCandidate("solidot_rss", "", "Original", ""),
+            [SourceDocument(url="https://example.org", title="Official")],
+            TriageDecision(True, 0.9, "technology", "relevant"),
+            original,
+        )
+    finally:
+        await client.client.close()
+
+    assert changed.title == "Новый взгляд на технологию"
+    assert changed.body == original.body
+    assert changed.hashtags == original.hashtags
+
+
+@pytest.mark.asyncio
+async def test_regenerate_hashtags_changes_only_hashtags() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        return {"hashtags": ["космос", "#Марс", "#JAXA"]}
+
+    client._completion = completion  # type: ignore[method-assign]
+    original = GeneratedPost(
+        "Марсианская миссия",
+        "Проверенный текст",
+        ["#технологии", "#наука", "#новости"],
+    )
+    try:
+        changed = await client.regenerate_component(
+            "hashtags",
+            StoryCandidate("solidot_rss", "", "Original", ""),
+            [SourceDocument(url="https://example.org", title="Official")],
+            TriageDecision(True, 0.9, "space", "relevant"),
+            original,
+        )
+    finally:
+        await client.client.close()
+
+    assert changed.title == original.title
+    assert changed.body == original.body
+    assert changed.hashtags == ["#космос", "#Марс", "#JAXA"]

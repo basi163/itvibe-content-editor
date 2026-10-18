@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
 from app.prompts import (
+    COMPONENT_REWRITE_SYSTEM_PROMPT,
     IMAGE_SEARCH_PROMPT,
     REPAIR_SYSTEM_PROMPT,
     TRIAGE_SYSTEM_PROMPT,
@@ -161,6 +162,7 @@ class QwenClient:
         sources: list[SourceDocument],
         triage: TriageDecision,
         post: GeneratedPost,
+        excluded_urls: list[str] | None = None,
     ) -> list[dict[str, str | int]]:
         context = {
             "post_title": post.title,
@@ -169,6 +171,7 @@ class QwenClient:
             "category": triage.category,
             "verified_facts": triage.facts,
             "source_titles": [source.title for source in sources if source.title],
+            "do_not_use_image_urls": excluded_urls or [],
         }
         response = await self.client.responses.create(
             model=self.writer_model,
@@ -216,6 +219,70 @@ class QwenClient:
         return sorted(
             images,
             key=lambda image: (0 if int(image["index"]) == selected_index else 1),
+        )
+
+    async def regenerate_component(
+        self,
+        component: str,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+    ) -> GeneratedPost:
+        if component not in {"title", "hashtags"}:
+            raise ValueError(f"Unsupported post component: {component}")
+
+        remaining: list[str] = []
+        for _ in range(3):
+            payload = {
+                "component": component,
+                "current_post": post.to_dict(),
+                "candidate": candidate.to_dict(),
+                "editorial_decision": triage.to_dict(),
+                "sources": _source_payload(sources, per_source_chars=3000),
+                "previous_errors": remaining,
+                "maximum_visible_characters": self.max_post_chars,
+            }
+            data = await self._completion(
+                model=self.writer_model,
+                system=COMPONENT_REWRITE_SYSTEM_PROMPT,
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=0.7,
+                max_tokens=500,
+            )
+            if component == "title":
+                proposal = GeneratedPost(
+                    title=str(data.get("title", "")).strip(),
+                    body=post.body,
+                    hashtags=post.hashtags,
+                )
+            else:
+                raw_hashtags = data.get("hashtags", [])
+                if not isinstance(raw_hashtags, list):
+                    raw_hashtags = []
+                proposal = GeneratedPost(
+                    title=post.title,
+                    body=post.body,
+                    hashtags=[str(tag).strip() for tag in raw_hashtags],
+                )
+
+            normalized = normalize_generated_post(proposal, self.max_post_chars)
+            if component == "title":
+                proposal = GeneratedPost(normalized.title, post.body, post.hashtags)
+                changed = proposal.title.casefold() != post.title.casefold()
+            else:
+                proposal = GeneratedPost(post.title, post.body, normalized.hashtags)
+                changed = {tag.casefold() for tag in proposal.hashtags} != {
+                    tag.casefold() for tag in post.hashtags
+                }
+            remaining = validate_post(proposal, self.max_post_chars)
+            if not changed:
+                remaining.append("Новый вариант совпадает с текущим")
+            if not remaining:
+                return proposal
+
+        raise ValueError(
+            f"{component} failed validation after regeneration: " + "; ".join(remaining)
         )
 
     async def repair(

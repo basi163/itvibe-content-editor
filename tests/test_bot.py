@@ -18,3 +18,16 @@ def test_rich_video_is_embedded_in_one_message() -> None:
     assert message.html == '<video src="tg://video?id=cover"></video><p>Body</p>'
     assert message.media is not None
     assert isinstance(message.media[0].media, InputMediaVideo)
+
+
+def test_draft_keyboard_describes_automatic_edits() -> None:
+    keyboard = EditorBot._draft_keyboard(7)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    labels = {button.text for button in buttons}
+    callbacks = {button.callback_data for button in buttons}
+
+    assert "Другой заголовок" in labels
+    assert "Другие хэштеги" in labels
+    assert "Другое изображение" in labels
+    assert "image:7" in callbacks
+    assert "media:7" not in callbacks

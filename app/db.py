@@ -362,6 +362,11 @@ class Repository:
             await db.commit()
             return str(row["action"]), int(row["draft_id"])
 
+    async def clear_pending_actions(self) -> None:
+        async with self.connect() as db:
+            await db.execute("DELETE FROM pending_actions")
+            await db.commit()
+
     async def stats(self) -> dict[str, int]:
         async with self.connect() as db:
             result: dict[str, int] = {}

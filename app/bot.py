@@ -63,6 +63,7 @@ class EditorBot:
         self._register_handlers()
 
     async def initialize(self) -> None:
+        await self.repository.clear_pending_actions()
         await self.bot.set_my_commands(
             [
                 BotCommand(command="start", description="Запустить редактор"),
@@ -229,11 +230,6 @@ class EditorBot:
         if message.text and message.text.startswith("/"):
             return
 
-        pending = await self.repository.pop_pending_action(message.from_user.id)
-        if pending:
-            await self._apply_pending_edit(message, *pending)
-            return
-
         if not message.forward_origin:
             await message.answer("Перешли пост из канала или используй команды меню.")
             return
@@ -326,27 +322,32 @@ class EditorBot:
             return
 
         if action == "title":
-            await self.repository.set_pending_action(callback.from_user.id, "title", draft_id)
-            await self.bot.send_message(callback.from_user.id, f"Пришли новый заголовок для #{draft_id}.")
+            await callback.answer("Подбираю новый заголовок")
+            await self._run_automatic_edit(
+                callback.from_user.id,
+                draft_id,
+                "title",
+                "Заголовок обновлен.",
+            )
+            return
         elif action == "tags":
-            await self.repository.set_pending_action(callback.from_user.id, "hashtags", draft_id)
-            await self.bot.send_message(
+            await callback.answer("Подбираю новые хэштеги")
+            await self._run_automatic_edit(
                 callback.from_user.id,
-                f"Пришли три новых хэштега для #{draft_id} через пробел.",
+                draft_id,
+                "hashtags",
+                "Хэштеги обновлены.",
             )
-        elif action == "preview":
-            if not draft["media"]:
-                await callback.answer("Других превью не найдено", show_alert=True)
-                return
-            next_index = (int(draft["preview_index"]) + 1) % len(draft["media"])
-            await self.repository.update_draft(draft_id, preview_index=next_index)
-            await self.refresh_draft(draft_id)
-        elif action == "media":
-            await self.repository.set_pending_action(callback.from_user.id, "media", draft_id)
-            await self.bot.send_message(
+            return
+        elif action in {"preview", "media", "image"}:
+            await callback.answer("Подбираю другое изображение")
+            await self._run_automatic_edit(
                 callback.from_user.id,
-                f"Пришли новую фотографию или видео для #{draft_id}.",
+                draft_id,
+                "image",
+                "Изображение обновлено.",
             )
+            return
         elif action == "sources":
             await self._send_sources(callback.from_user.id, draft)
         elif action == "regen":
@@ -371,6 +372,41 @@ class EditorBot:
                 )
             await self.bot.send_message(callback.from_user.id, f"Черновик #{draft_id} отклонен.")
         await callback.answer()
+
+    async def _run_automatic_edit(
+        self,
+        user_id: int,
+        draft_id: int,
+        component: str,
+        success_message: str,
+    ) -> None:
+        try:
+            if component == "image":
+                changed = await self.pipeline.regenerate_media(draft_id)
+            else:
+                changed = await self.pipeline.regenerate_component(draft_id, component)
+            if not changed:
+                await self.bot.send_message(
+                    user_id,
+                    f"Не удалось подобрать другой вариант для #{draft_id}.",
+                )
+                return
+            await self.refresh_draft(draft_id)
+        except Exception:
+            logger.exception(
+                "Automatic %s regeneration failed for draft %s",
+                component,
+                draft_id,
+            )
+            await self.bot.send_message(
+                user_id,
+                f"Не удалось обновить черновик #{draft_id}. Попробуй еще раз.",
+            )
+            return
+        await self.bot.send_message(
+            user_id,
+            f"Черновик #{draft_id}. {success_message}",
+        )
 
     async def deliver_draft(self, draft_id: int) -> None:
         draft = await self.repository.get_draft(draft_id)
@@ -639,15 +675,23 @@ class EditorBot:
                     InlineKeyboardButton(text="Отклонить", callback_data=f"skip:{draft_id}"),
                 ],
                 [
-                    InlineKeyboardButton(text="Заголовок", callback_data=f"title:{draft_id}"),
-                    InlineKeyboardButton(text="Хэштеги", callback_data=f"tags:{draft_id}"),
+                    InlineKeyboardButton(
+                        text="Другой заголовок",
+                        callback_data=f"title:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Другие хэштеги",
+                        callback_data=f"tags:{draft_id}",
+                    ),
                 ],
                 [
-                    InlineKeyboardButton(text="Превью", callback_data=f"preview:{draft_id}"),
-                    InlineKeyboardButton(text="Загрузить медиа", callback_data=f"media:{draft_id}"),
+                    InlineKeyboardButton(
+                        text="Другое изображение",
+                        callback_data=f"image:{draft_id}",
+                    ),
+                    InlineKeyboardButton(text="Переписать всё", callback_data=f"regen:{draft_id}"),
                 ],
                 [
-                    InlineKeyboardButton(text="Переписать", callback_data=f"regen:{draft_id}"),
                     InlineKeyboardButton(text="Источники", callback_data=f"sources:{draft_id}"),
                 ],
             ]
