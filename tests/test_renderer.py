@@ -2,7 +2,7 @@ import pytest
 
 from app.models import GeneratedPost, SourceDocument
 from app.prompts import render_writer_system_prompt
-from app.renderer import render_post, validate_post
+from app.renderer import SIGNATURE_TEXT, SIGNATURE_URL, render_post, validate_post
 
 SOURCES = [
     SourceDocument(
@@ -30,6 +30,11 @@ def test_render_valid_post_with_contextual_link() -> None:
     assert rendered.rich_html.startswith("<p><b>Новая архитектура")
     assert "<p>Разработчики описали" in rendered.rich_html
     assert '<a href="https://example.com/research">официальной публикации</a>' in rendered.html
+    assert rendered.html.endswith(
+        f'<a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a>'
+    )
+    assert f'<p><a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a></p>' in rendered.rich_html
+    assert rendered.visible_text.endswith(SIGNATURE_TEXT)
     assert "https://" not in rendered.visible_text
 
 
@@ -45,6 +50,25 @@ def test_renderer_adds_exactly_one_blank_line_between_paragraphs() -> None:
     assert "Первый абзац.\n\nВторой абзац.\n\nТретий абзац." in rendered.html
     assert "<p>Первый абзац.</p><p><br></p><p>Второй абзац.</p>" in rendered.rich_html
     assert "<h2>" not in rendered.rich_html
+
+
+def test_signature_is_separated_from_hashtags_by_blank_line() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body="Основной текст.",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+    )
+
+    rendered = render_post(post, SOURCES, 2000)
+
+    assert (
+        '#ИИ #наука #технологии\n\n'
+        f'<a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a>'
+    ) in rendered.html
+    assert (
+        "<p>#ИИ #наука #технологии</p><p><br></p>"
+        f'<p><a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a></p>'
+    ) in rendered.rich_html
 
 
 def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
@@ -65,7 +89,8 @@ def test_renderer_does_not_link_non_primary_source() -> None:
     rendered = render_post(post, sources, 2000)
 
     assert "solidot" not in rendered.html.casefold()
-    assert "<a href=" not in rendered.html
+    assert rendered.html.count("<a href=") == 1
+    assert f'<a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a>' in rendered.html
     assert "в материале" in rendered.visible_text
 
 

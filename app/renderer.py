@@ -28,6 +28,9 @@ BANNED_PHRASES = (
     "вот тут начинается самое интересное",
 )
 
+SIGNATURE_TEXT = "🔳 IT Vibe News"
+SIGNATURE_URL = "https://t.me/+u5H6mukl7zg4NzZi"
+
 
 @dataclass
 class RenderedPost:
@@ -107,8 +110,11 @@ def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
         errors.append("Нужно ровно три хэштега")
     elif any(not TAG_RE.match(tag) for tag in hashtags):
         errors.append("Некорректный формат хэштегов")
-    if len(visible) > max_chars:
-        errors.append(f"Текст длиннее лимита на {len(visible) - max_chars} знаков")
+    total_visible_length = len(visible) + 2 + len(SIGNATURE_TEXT)
+    if total_visible_length > max_chars:
+        errors.append(
+            f"Текст длиннее лимита на {total_visible_length - max_chars} знаков"
+        )
     if post.body.count("[[source:") > 3:
         errors.append("Использовано больше трех ссылок")
     if RAW_URL_RE.search(visible):
@@ -130,10 +136,14 @@ def render_post(
     body = _body_to_html(normalized_body, sources)
     rich_body = _body_to_rich_html(normalized_body, sources)
     hashtags = " ".join(html.escape(tag.strip()) for tag in post.hashtags)
-    rendered = f"<b>{title}</b>\n\n{body}\n\n{hashtags}"
+    signature_url = html.escape(SIGNATURE_URL, quote=True)
+    signature_text = html.escape(SIGNATURE_TEXT)
+    signature = f'<a href="{signature_url}">{signature_text}</a>'
+    rendered = f"<b>{title}</b>\n\n{body}\n\n{hashtags}\n\n{signature}"
     spacer = "<p><br></p>"
     rich_rendered = (
         f"<p><b>{title}</b></p>{spacer}{rich_body}{spacer}<p>{hashtags}</p>"
+        f"{spacer}<p>{signature}</p>"
     )
     visible = HTML_TAG_RE.sub("", rendered)
     visible = html.unescape(visible)
