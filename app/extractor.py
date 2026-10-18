@@ -45,7 +45,10 @@ IGNORED_DISCOVERY_HOSTS = {
 
 
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url.strip())
+    try:
+        parsed = urlparse(url.strip())
+    except (UnicodeError, ValueError):
+        return ""
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return ""
     query = [

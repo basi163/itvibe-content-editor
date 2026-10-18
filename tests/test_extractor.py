@@ -18,6 +18,10 @@ def test_normalize_url_rejects_non_http_protocols() -> None:
     assert normalize_url("file:///etc/passwd") == ""
 
 
+def test_normalize_url_rejects_malformed_ipv6_without_crashing() -> None:
+    assert normalize_url("https://[not-an-ipv6-address]/story") == ""
+
+
 def test_extract_bare_article_url() -> None:
     text = (
         "Подробности https://www.zdnet.com/business/story/?utm_source=rss. "
