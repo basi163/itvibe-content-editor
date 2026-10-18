@@ -159,13 +159,17 @@ async def test_story_uses_contextual_image_when_sources_have_none() -> None:
 @pytest.mark.asyncio
 async def test_regenerate_media_finds_a_different_contextual_image() -> None:
     old_url = "https://images.example/old.jpg"
+    second_old_url = "https://images.example/second-old.jpg"
     new_url = "https://images.example/new.jpg"
     draft = {
         "id": 9,
         "title": "Заголовок",
         "body": "Проверенный текст",
         "hashtags": ["#ИИ", "#наука", "#технологии"],
-        "media": [{"type": "photo", "image_url": old_url}],
+        "media": [
+            {"type": "photo", "image_url": old_url},
+            {"type": "photo", "image_url": second_old_url},
+        ],
         "preview_index": 0,
         "material": {
             "candidate": StoryCandidate("solidot_rss", "", "Story", "").to_dict(),
@@ -199,7 +203,7 @@ async def test_regenerate_media_finds_a_different_contextual_image() -> None:
             post: GeneratedPost,
             excluded_urls: list[str] | None = None,
         ) -> list[dict[str, object]]:
-            assert excluded_urls == [old_url]
+            assert excluded_urls == [old_url, second_old_url]
             return [{"index": 1, "title": "Alternative", "url": new_url}]
 
     repository = Repository()
@@ -215,4 +219,5 @@ async def test_regenerate_media_finds_a_different_contextual_image() -> None:
     media = json.loads(str(repository.updated["media_json"]))
     assert media[0]["image_url"] == new_url
     assert media[1]["image_url"] == old_url
+    assert media[2]["image_url"] == second_old_url
     assert repository.updated["preview_index"] == 0

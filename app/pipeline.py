@@ -227,11 +227,6 @@ class ContentPipeline:
             return False
 
         media = list(draft["media"])
-        if len(media) > 1:
-            next_index = (int(draft["preview_index"]) + 1) % len(media)
-            await self.repository.update_draft(draft_id, preview_index=next_index)
-            return True
-
         candidate = StoryCandidate.from_dict(draft["material"]["candidate"])
         sources = [SourceDocument.from_dict(item) for item in draft["material"]["sources"]]
         triage = TriageDecision.from_dict(draft["triage"])

@@ -275,7 +275,10 @@ class EditorBot:
                 media_json=json.dumps(media, ensure_ascii=False),
                 preview_index=0,
             )
-            await self.refresh_draft(draft_id)
+            await self.refresh_draft(
+                draft_id,
+                replace_message=True,
+            )
             await message.answer("Медиа сохранено.")
             return
         text = (message.text or message.caption or "").strip()
@@ -391,7 +394,10 @@ class EditorBot:
                     f"Не удалось подобрать другой вариант для #{draft_id}.",
                 )
                 return
-            await self.refresh_draft(draft_id)
+            await self.refresh_draft(
+                draft_id,
+                replace_message=component == "image",
+            )
         except Exception:
             logger.exception(
                 "Automatic %s regeneration failed for draft %s",
@@ -439,7 +445,12 @@ class EditorBot:
             editor_media_message_id=media_message_id,
         )
 
-    async def refresh_draft(self, draft_id: int) -> None:
+    async def refresh_draft(
+        self,
+        draft_id: int,
+        *,
+        replace_message: bool = False,
+    ) -> None:
         draft = await self.repository.get_draft(draft_id)
         if not draft or not draft["editor_chat_id"] or not draft["editor_message_id"]:
             return
@@ -450,7 +461,7 @@ class EditorBot:
         old_media_message_id = draft.get("editor_media_message_id")
         media = self._selected_media(draft)
         file_value = await self._media_input(media)
-        if file_value:
+        if file_value and not replace_message:
             try:
                 edited = await self.bot.edit_message_text(
                     text=None,
