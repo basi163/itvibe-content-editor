@@ -8,6 +8,10 @@ from urllib.parse import urlparse
 from app.models import GeneratedPost, SourceDocument
 
 SOURCE_MARKER_RE = re.compile(r"\[\[source:(\d+)\|([^\]]+)]]", re.IGNORECASE)
+SOURCE_MARKER_LIKE_RE = re.compile(
+    r"\[\[\s*source\b[^\]\r\n]*]]",
+    re.IGNORECASE,
+)
 TAG_RE = re.compile(r"^#[\wА-Яа-яЁё]+$", re.UNICODE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 RAW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -58,10 +62,12 @@ def normalize_body_spacing(body: str) -> str:
 def _clean_visible_fragment(value: str) -> str:
     cleaned = EMOJI_RE.sub("", value)
     cleaned = RAW_URL_RE.sub("", cleaned)
+    cleaned = SOURCE_MARKER_LIKE_RE.sub("", cleaned)
     cleaned = cleaned.replace("：", ",").replace(":", ",")
     for phrase in BANNED_PHRASES:
         cleaned = re.sub(re.escape(phrase), "Важно", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,;!?])", r"\1", cleaned)
     cleaned = re.sub(r" *\n *", "\n", cleaned)
     return cleaned
 
@@ -211,6 +217,8 @@ def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
         errors.append("Использовано больше трех ссылок")
     if RAW_URL_RE.search(visible):
         errors.append("В видимом тексте есть URL")
+    if SOURCE_MARKER_LIKE_RE.search(visible):
+        errors.append("В видимом тексте есть некорректный маркер источника")
     return errors
 
 

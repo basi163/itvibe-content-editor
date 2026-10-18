@@ -111,6 +111,26 @@ def test_local_normalizer_trims_post_for_signature_aware_limit() -> None:
     assert render_post(normalized, [], 300).char_count <= 300
 
 
+def test_local_normalizer_removes_malformed_source_markers() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body=(
+            "Факт из источника [[source,0]]. "
+            "Верная ссылка [[source:0|официальная публикация]]."
+        ),
+        hashtags=["#ИИ", "#наука", "#технологии"],
+    )
+
+    assert any("маркер" in error for error in validate_post(post, 2000))
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert "[[source,0]]" not in normalized.body
+    assert "источника ." not in normalized.body
+    assert "[[source:0|официальная публикация]]" in normalized.body
+    assert validate_post(normalized, 2000) == []
+
+
 def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
     prompt = render_writer_system_prompt(2000)
 
