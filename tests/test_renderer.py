@@ -2,7 +2,13 @@ import pytest
 
 from app.models import GeneratedPost, SourceDocument
 from app.prompts import render_writer_system_prompt
-from app.renderer import SIGNATURE_TEXT, SIGNATURE_URL, render_post, validate_post
+from app.renderer import (
+    SIGNATURE_TEXT,
+    SIGNATURE_URL,
+    normalize_generated_post,
+    render_post,
+    validate_post,
+)
 
 SOURCES = [
     SourceDocument(
@@ -69,6 +75,40 @@ def test_signature_is_separated_from_hashtags_by_blank_line() -> None:
         "<p>#ИИ #наука #технологии</p><p><br></p>"
         f'<p><a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a></p>'
     ) in rendered.rich_html
+
+
+def test_local_normalizer_repairs_formal_model_errors() -> None:
+    post = GeneratedPost(
+        title="Новость: важное обновление 🚀",
+        body=(
+            "И вот тут начинается самое важное: подробности — здесь — и — там — снова. "
+            "Ссылка https://example.com. "
+            "[[source:0|Первый источник]] [[source:1|Второй источник]] "
+            "[[source:2|Третий источник]] [[source:3|Четвертый источник]]"
+        ),
+        hashtags=["ИИ", "#ИИ", "#open-source", "🚀"],
+    )
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert validate_post(normalized, 2000) == []
+    assert normalized.title == "Новость, важное обновление"
+    assert len(normalized.hashtags) == 3
+    assert normalized.body.count("[[source:") == 3
+    assert "https://" not in normalized.body
+
+
+def test_local_normalizer_trims_post_for_signature_aware_limit() -> None:
+    post = GeneratedPost(
+        title="Короткий заголовок",
+        body="Очень длинный текст " * 80,
+        hashtags=["#ИИ", "#наука", "#технологии"],
+    )
+
+    normalized = normalize_generated_post(post, 300)
+
+    assert validate_post(normalized, 300) == []
+    assert render_post(normalized, [], 300).char_count <= 300
 
 
 def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:

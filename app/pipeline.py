@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -19,6 +20,16 @@ from app.renderer import render_post
 
 logger = logging.getLogger(__name__)
 DraftDelivery = Callable[[int], Awaitable[None]]
+SECRET_RE = re.compile(
+    r"(?:sk-[A-Za-z0-9._-]{8,}|Bearer\s+[A-Za-z0-9._-]{8,})",
+    re.IGNORECASE,
+)
+
+
+def _safe_error(exc: Exception) -> str:
+    message = " ".join(str(exc).split())
+    message = SECRET_RE.sub("[redacted]", message)
+    return f"{type(exc).__name__}: {message}"[:1000]
 
 
 class ContentPipeline:
@@ -49,7 +60,7 @@ class ContentPipeline:
             return draft_id
         except Exception as exc:
             logger.exception("Failed to process feed item %s", item_id)
-            await self.repository.update_feed_status(item_id, "failed", type(exc).__name__)
+            await self.repository.update_feed_status(item_id, "failed", _safe_error(exc))
             return None
 
     async def process_manual(self, candidate: StoryCandidate) -> int | None:

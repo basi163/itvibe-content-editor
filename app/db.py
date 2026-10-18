@@ -63,6 +63,7 @@ class Repository:
                     status TEXT NOT NULL,
                     raw_json TEXT NOT NULL,
                     error TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(source_key, external_id)
@@ -105,6 +106,12 @@ class Repository:
             for column in ("editor_media_message_id", "target_media_message_id"):
                 if column not in columns:
                     await db.execute(f"ALTER TABLE drafts ADD COLUMN {column} INTEGER")
+            cursor = await db.execute("PRAGMA table_info(feed_items)")
+            feed_columns = {str(row[1]) for row in await cursor.fetchall()}
+            if "attempt_count" not in feed_columns:
+                await db.execute(
+                    "ALTER TABLE feed_items ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
             await db.commit()
 
     async def get_setting(self, key: str) -> str | None:
@@ -169,6 +176,23 @@ class Repository:
             )
             return row is not None
 
+    async def get_feed_item_state(
+        self,
+        source_key: str,
+        external_id: str,
+    ) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                """
+                SELECT id, status, error, attempt_count, updated_at
+                FROM feed_items
+                WHERE source_key = ? AND external_id = ?
+                """,
+                (source_key, external_id),
+            )
+            return dict(row) if row else None
+
     async def add_feed_item(
         self,
         source_key: str,
@@ -185,8 +209,8 @@ class Repository:
                 """
                 INSERT INTO feed_items(
                     source_key, external_id, link, title, published_at, status,
-                    raw_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_json, attempt_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_key,
@@ -196,12 +220,26 @@ class Repository:
                     published_at,
                     status,
                     json.dumps(raw, ensure_ascii=False),
+                    1 if status == "processing" else 0,
                     now,
                     now,
                 ),
             )
             await db.commit()
             return int(cursor.lastrowid)
+
+    async def mark_feed_processing(self, item_id: int) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                """
+                UPDATE feed_items
+                SET status = 'processing', error = NULL,
+                    attempt_count = attempt_count + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (_now(), item_id),
+            )
+            await db.commit()
 
     async def update_feed_status(self, item_id: int, status: str, error: str | None = None) -> None:
         async with self.connect() as db:

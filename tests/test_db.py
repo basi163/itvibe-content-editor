@@ -40,3 +40,35 @@ async def test_first_user_claims_owner(tmp_path: Path) -> None:
     assert not await repository.claim_owner(200)
     assert await repository.is_owner(100)
     assert not await repository.is_owner(200)
+
+
+@pytest.mark.asyncio
+async def test_failed_feed_item_can_be_marked_for_retry(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    item_id = await repository.add_feed_item(
+        "solidot",
+        "story-1",
+        "https://example.org/story",
+        "Story",
+        None,
+        "processing",
+        {},
+    )
+    await repository.update_feed_status(
+        item_id,
+        "failed",
+        "ValueError: invalid generated post",
+    )
+
+    state = await repository.get_feed_item_state("solidot", "story-1")
+    assert state is not None
+    assert state["attempt_count"] == 1
+    assert state["status"] == "failed"
+
+    await repository.mark_feed_processing(item_id)
+    state = await repository.get_feed_item_state("solidot", "story-1")
+    assert state is not None
+    assert state["attempt_count"] == 2
+    assert state["status"] == "processing"
+    assert state["error"] is None

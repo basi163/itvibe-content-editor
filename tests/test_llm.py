@@ -18,7 +18,7 @@ async def test_repair_retries_until_post_is_valid() -> None:
         max_post_chars=2000,
     )
     responses = [
-        {"title": "Всё ещё: плохо", "body": "Текст", "hashtags": ["#ИИ", "#наука", "#тех"]},
+        {"title": "", "body": "Текст", "hashtags": ["#ИИ", "#наука", "#тех"]},
         {"title": "Исправлено", "body": "Текст", "hashtags": ["#ИИ", "#наука", "#тех"]},
     ]
 
@@ -37,6 +37,38 @@ async def test_repair_retries_until_post_is_valid() -> None:
 
     assert repaired.title == "Исправлено"
     assert not responses
+
+
+@pytest.mark.asyncio
+async def test_repair_uses_local_normalizer_after_model_retries() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        return {
+            "title": "Исправление: всё ещё с двоеточием 🚀",
+            "body": "Текст: без новых фактов",
+            "hashtags": ["ИИ"],
+        }
+
+    client._completion = completion  # type: ignore[method-assign]
+    try:
+        repaired = await client.repair(
+            GeneratedPost("Плохо: да", "Текст", ["#ИИ"]),
+            [],
+            ["Двоеточие"],
+        )
+    finally:
+        await client.client.close()
+
+    assert repaired.title == "Исправление, всё ещё с двоеточием"
+    assert repaired.body == "Текст, без новых фактов"
+    assert repaired.hashtags == ["#ИИ", "#технологии", "#новости"]
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,8 @@ from app.pipeline import ContentPipeline
 from app.rss import FeedEntry, SolidotFeed
 
 logger = logging.getLogger(__name__)
+FEED_RETRY_DELAY = timedelta(minutes=30)
+MAX_FEED_ATTEMPTS = 3
 
 
 def rss_poll_delay_seconds(settings: Settings, now: datetime | None = None) -> int:
@@ -71,6 +73,39 @@ async def _store_and_process(
     await pipeline.process_feed_item(item_id, candidate)
 
 
+async def _retry_and_process(
+    item_id: int,
+    entry: FeedEntry,
+    repository: Repository,
+    pipeline: ContentPipeline,
+) -> None:
+    await repository.mark_feed_processing(item_id)
+    candidate = StoryCandidate(
+        origin_type="solidot_rss",
+        origin_ref=entry.link,
+        title=entry.title,
+        text=entry.summary,
+        urls=entry.urls,
+    )
+    await pipeline.process_feed_item(item_id, candidate)
+
+
+def _retryable_feed_item(state: dict[str, object], now: datetime | None = None) -> bool:
+    if state.get("status") != "failed":
+        return False
+    if not str(state.get("error") or "").startswith("ValueError"):
+        return False
+    if int(state.get("attempt_count") or 0) >= MAX_FEED_ATTEMPTS:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(str(state["updated_at"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    return (now or datetime.now(UTC)) - updated_at >= FEED_RETRY_DELAY
+
+
 async def rss_worker(
     settings: Settings,
     repository: Repository,
@@ -83,11 +118,17 @@ async def rss_worker(
         try:
             entries = await feed.fetch()
             has_history = await repository.feed_has_items(SolidotFeed.source_key)
-            unseen = [
-                entry
-                for entry in entries
-                if not await repository.feed_item_exists(SolidotFeed.source_key, entry.external_id)
-            ]
+            unseen: list[FeedEntry] = []
+            retries: list[tuple[int, FeedEntry]] = []
+            for entry in entries:
+                state = await repository.get_feed_item_state(
+                    SolidotFeed.source_key,
+                    entry.external_id,
+                )
+                if state is None:
+                    unseen.append(entry)
+                elif _retryable_feed_item(state):
+                    retries.append((int(state["id"]), entry))
             if not has_history and len(unseen) > settings.rss_bootstrap_items:
                 baseline = unseen[settings.rss_bootstrap_items :]
                 for entry in baseline:
@@ -103,6 +144,9 @@ async def rss_worker(
                 unseen = unseen[: settings.rss_bootstrap_items]
             for entry in reversed(unseen):
                 await _store_and_process(entry, repository, pipeline)
+            for item_id, entry in reversed(retries):
+                logger.info("Retrying failed feed item %s", item_id)
+                await _retry_and_process(item_id, entry, repository, pipeline)
         except Exception:
             logger.exception("Solidot RSS polling failed")
 

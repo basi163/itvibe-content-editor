@@ -13,7 +13,7 @@ from app.prompts import (
     TRIAGE_SYSTEM_PROMPT,
     render_writer_system_prompt,
 )
-from app.renderer import validate_post
+from app.renderer import SIGNATURE_TEXT, normalize_generated_post, validate_post
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -127,7 +127,8 @@ class QwenClient:
         sources: list[SourceDocument],
         triage: TriageDecision,
     ) -> GeneratedPost:
-        system = render_writer_system_prompt(self.max_post_chars)
+        content_limit = self.max_post_chars - 2 - len(SIGNATURE_TEXT)
+        system = render_writer_system_prompt(content_limit)
         payload = {
             "candidate": candidate.to_dict(),
             "editorial_decision": triage.to_dict(),
@@ -147,7 +148,11 @@ class QwenClient:
         )
         errors = validate_post(post, self.max_post_chars)
         if errors:
-            post = await self.repair(post, sources, errors)
+            normalized = normalize_generated_post(post, self.max_post_chars)
+            normalized_errors = validate_post(normalized, self.max_post_chars)
+            if not normalized_errors:
+                return normalized
+            post = await self.repair(normalized, sources, normalized_errors)
         return post
 
     async def search_images(
@@ -225,7 +230,9 @@ class QwenClient:
             payload = {
                 "post": current.to_dict(),
                 "errors": remaining,
-                "maximum_visible_characters": self.max_post_chars,
+                "maximum_visible_characters": self.max_post_chars
+                - 2
+                - len(SIGNATURE_TEXT),
                 "allowed_sources": _source_payload(sources, per_source_chars=3000),
             }
             data = await self._completion(
@@ -243,4 +250,9 @@ class QwenClient:
             remaining = validate_post(current, self.max_post_chars)
             if not remaining:
                 return current
+            normalized = normalize_generated_post(current, self.max_post_chars)
+            remaining = validate_post(normalized, self.max_post_chars)
+            if not remaining:
+                return normalized
+            current = normalized
         raise ValueError("Post failed validation after repair: " + "; ".join(remaining))

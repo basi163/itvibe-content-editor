@@ -55,6 +55,98 @@ def normalize_body_spacing(body: str) -> str:
     return "\n\n".join(paragraphs)
 
 
+def _clean_visible_fragment(value: str) -> str:
+    cleaned = EMOJI_RE.sub("", value)
+    cleaned = RAW_URL_RE.sub("", cleaned)
+    cleaned = cleaned.replace("：", ",").replace(":", ",")
+    for phrase in BANNED_PHRASES:
+        cleaned = re.sub(re.escape(phrase), "Важно", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    return cleaned
+
+
+def _clean_body(body: str) -> str:
+    result: list[str] = []
+    position = 0
+    marker_count = 0
+    for match in SOURCE_MARKER_RE.finditer(body):
+        result.append(_clean_visible_fragment(body[position : match.start()]))
+        anchor = _clean_visible_fragment(match.group(2)).strip()
+        if anchor:
+            marker_count += 1
+            if marker_count <= 3:
+                result.append(f"[[source:{match.group(1)}|{anchor}]]")
+            else:
+                result.append(anchor)
+        position = match.end()
+    result.append(_clean_visible_fragment(body[position:]))
+    return normalize_body_spacing("".join(result))
+
+
+def _limit_em_dashes(value: str, allowed: int) -> str:
+    parts = value.split("—")
+    if len(parts) - 1 <= allowed:
+        return value
+    result = parts[0]
+    for index, part in enumerate(parts[1:]):
+        result += ("—" if index < allowed else "-") + part
+    return result
+
+
+def _clean_hashtags(hashtags: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for hashtag in hashtags:
+        value = re.sub(r"[^\wА-Яа-яЁё]", "", hashtag.lstrip("#"), flags=re.UNICODE)
+        if not value:
+            continue
+        tag = f"#{value}"
+        key = tag.casefold()
+        if key not in seen:
+            cleaned.append(tag)
+            seen.add(key)
+    for fallback in ("#технологии", "#новости", "#IT"):
+        if fallback.casefold() not in seen:
+            cleaned.append(fallback)
+            seen.add(fallback.casefold())
+        if len(cleaned) == 3:
+            break
+    return cleaned[:3]
+
+
+def _truncate_plain_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:limit]
+    candidate = value[: limit - 1].rstrip()
+    boundary = max(candidate.rfind(". "), candidate.rfind("! "), candidate.rfind("? "))
+    if boundary >= max(20, limit // 2):
+        return candidate[: boundary + 1]
+    if " " in candidate:
+        candidate = candidate.rsplit(" ", 1)[0]
+    return candidate.rstrip(".,;!? ") + "…"
+
+
+def normalize_generated_post(post: GeneratedPost, max_chars: int) -> GeneratedPost:
+    """Deterministically repair formal style violations without inventing facts."""
+    title = _clean_visible_fragment(post.title).strip()
+    body = _clean_body(post.body)
+    hashtags = _clean_hashtags(post.hashtags)
+
+    title = _limit_em_dashes(title, 3)
+    body = _limit_em_dashes(body, max(0, 3 - title.count("—")))
+
+    hashtag_text = " ".join(hashtags)
+    fixed_length = len(title) + 2 + 2 + len(hashtag_text) + 2 + len(SIGNATURE_TEXT)
+    body_limit = max_chars - fixed_length
+    if body_limit > 0 and len(visible_body(body)) > body_limit:
+        body = _truncate_plain_text(visible_body(body), body_limit)
+
+    return GeneratedPost(title=title, body=body, hashtags=hashtags)
+
+
 def _body_to_html(body: str, sources: list[SourceDocument]) -> str:
     result: list[str] = []
     position = 0

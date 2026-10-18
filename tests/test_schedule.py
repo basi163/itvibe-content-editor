@@ -1,7 +1,7 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-from app.main import rss_poll_delay_seconds
+from app.main import _retryable_feed_item, rss_poll_delay_seconds
 
 
 def _settings() -> SimpleNamespace:
@@ -36,3 +36,27 @@ def test_offpeak_wait_does_not_cross_active_window_start() -> None:
 def test_active_window_end_is_exclusive() -> None:
     now = datetime(2026, 10, 16, 18, 30, tzinfo=UTC)
     assert rss_poll_delay_seconds(_settings(), now) == 1800
+
+
+def test_validation_failure_is_retried_after_cooldown() -> None:
+    now = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    state = {
+        "status": "failed",
+        "error": "ValueError: Пост содержит двоеточие",
+        "attempt_count": 1,
+        "updated_at": (now - timedelta(minutes=31)).isoformat(),
+    }
+
+    assert _retryable_feed_item(state, now)
+
+
+def test_validation_failure_retry_is_bounded() -> None:
+    now = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+    state = {
+        "status": "failed",
+        "error": "ValueError: Пост содержит двоеточие",
+        "attempt_count": 3,
+        "updated_at": (now - timedelta(hours=1)).isoformat(),
+    }
+
+    assert not _retryable_feed_item(state, now)
