@@ -131,6 +131,26 @@ def test_local_normalizer_removes_malformed_source_markers() -> None:
     assert validate_post(normalized, 2000) == []
 
 
+def test_local_normalizer_removes_meta_commentary_lead_ins() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body=(
+            "Этот шаг показывает, что экосистема Linux меняется.\n\n"
+            "Мы наблюдаем классический пример того, как технология меняет рынок."
+        ),
+        hashtags=["#Linux", "#технологии", "#новости"],
+    )
+
+    errors = validate_post(post, 2000)
+    assert any("этот шаг показывает" in error.casefold() for error in errors)
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert normalized.body.startswith("Экосистема Linux меняется.")
+    assert "\n\nТехнология меняет рынок." in normalized.body
+    assert validate_post(normalized, 2000) == []
+
+
 def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
     prompt = render_writer_system_prompt(2000)
 
