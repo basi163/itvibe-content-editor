@@ -44,6 +44,14 @@ def _active_windows(name: str, default: str) -> tuple[tuple[int, int], ...]:
     return tuple(windows)
 
 
+def _daily_slots(name: str, default: str) -> tuple[int, ...]:
+    raw_value = os.getenv(name, default).strip()
+    slots = sorted({_clock_minutes(raw_slot) for raw_slot in raw_value.split(",")})
+    if not slots:
+        raise RuntimeError(f"{name} must contain at least one HH:MM value")
+    return tuple(slots)
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -58,6 +66,8 @@ class Settings:
     rss_active_windows: tuple[tuple[int, int], ...]
     rss_schedule_utc_offset_hours: int
     rss_bootstrap_items: int
+    publish_schedule_slots: tuple[int, ...]
+    publish_schedule_utc_offset_hours: int
     max_post_chars: int
     relevance_threshold: float
     http_timeout_seconds: float
@@ -89,6 +99,13 @@ class Settings:
                 os.getenv("RSS_SCHEDULE_UTC_OFFSET_HOURS", "4")
             ),
             rss_bootstrap_items=int(os.getenv("RSS_BOOTSTRAP_ITEMS", "1")),
+            publish_schedule_slots=_daily_slots(
+                "PUBLISH_SCHEDULE_SLOTS",
+                "09:00,12:00,15:00,18:00,21:00",
+            ),
+            publish_schedule_utc_offset_hours=int(
+                os.getenv("PUBLISH_SCHEDULE_UTC_OFFSET_HOURS", "4")
+            ),
             max_post_chars=int(os.getenv("MAX_POST_CHARS", "2000")),
             relevance_threshold=float(os.getenv("RELEVANCE_THRESHOLD", "0.72")),
             http_timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "25")),
@@ -123,3 +140,7 @@ class Settings:
             )
         if not -12 <= self.rss_schedule_utc_offset_hours <= 14:
             raise RuntimeError("RSS_SCHEDULE_UTC_OFFSET_HOURS must be between -12 and 14")
+        if not -12 <= self.publish_schedule_utc_offset_hours <= 14:
+            raise RuntimeError(
+                "PUBLISH_SCHEDULE_UTC_OFFSET_HOURS must be between -12 and 14"
+            )

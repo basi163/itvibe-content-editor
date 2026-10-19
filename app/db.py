@@ -88,6 +88,9 @@ class Repository:
                     target_chat_id INTEGER,
                     target_message_id INTEGER,
                     target_media_message_id INTEGER,
+                    scheduled_at TEXT,
+                    schedule_attempts INTEGER NOT NULL DEFAULT 0,
+                    schedule_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -103,9 +106,18 @@ class Repository:
             )
             cursor = await db.execute("PRAGMA table_info(drafts)")
             columns = {str(row[1]) for row in await cursor.fetchall()}
-            for column in ("editor_media_message_id", "target_media_message_id"):
+            draft_migrations = {
+                "editor_media_message_id": "INTEGER",
+                "target_media_message_id": "INTEGER",
+                "scheduled_at": "TEXT",
+                "schedule_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "schedule_error": "TEXT",
+            }
+            for column, definition in draft_migrations.items():
                 if column not in columns:
-                    await db.execute(f"ALTER TABLE drafts ADD COLUMN {column} INTEGER")
+                    await db.execute(
+                        f"ALTER TABLE drafts ADD COLUMN {column} {definition}"
+                    )
             cursor = await db.execute("PRAGMA table_info(feed_items)")
             feed_columns = {str(row[1]) for row in await cursor.fetchall()}
             if "attempt_count" not in feed_columns:
@@ -313,6 +325,9 @@ class Repository:
             "target_chat_id",
             "target_message_id",
             "target_media_message_id",
+            "scheduled_at",
+            "schedule_attempts",
+            "schedule_error",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -333,6 +348,74 @@ class Repository:
                 (limit,),
             )
             return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
+
+    async def due_scheduled_drafts(
+        self,
+        now: datetime | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT * FROM drafts
+                WHERE status = 'scheduled'
+                  AND scheduled_at IS NOT NULL
+                  AND scheduled_at <= ?
+                ORDER BY scheduled_at, id
+                LIMIT ?
+                """,
+                (current, limit),
+            )
+            return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
+
+    async def scheduled_publication_times(
+        self,
+        after: datetime | None = None,
+    ) -> list[datetime]:
+        current = (after or datetime.now(UTC)).astimezone(UTC).isoformat()
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT scheduled_at FROM drafts
+                WHERE status = 'scheduled'
+                  AND scheduled_at IS NOT NULL
+                  AND scheduled_at > ?
+                ORDER BY scheduled_at
+                """,
+                (current,),
+            )
+            values: list[datetime] = []
+            for row in await cursor.fetchall():
+                try:
+                    value = datetime.fromisoformat(str(row["scheduled_at"]))
+                except (TypeError, ValueError):
+                    continue
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=UTC)
+                values.append(value.astimezone(UTC))
+            return values
+
+    async def next_scheduled_publication(self) -> datetime | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                """
+                SELECT scheduled_at FROM drafts
+                WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
+                ORDER BY scheduled_at
+                LIMIT 1
+                """,
+            )
+            if not row:
+                return None
+            try:
+                value = datetime.fromisoformat(str(row["scheduled_at"]))
+            except (TypeError, ValueError):
+                return None
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            return value.astimezone(UTC)
 
     async def set_pending_action(self, user_id: int, action: str, draft_id: int) -> None:
         async with self.connect() as db:

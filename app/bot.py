@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -41,6 +42,109 @@ logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 EDITOR_REQUEST_ID = 101
 TARGET_REQUEST_ID = 102
+SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
+MAX_SCHEDULE_ATTEMPTS = 3
+
+
+def _publish_timezone(utc_offset_hours: int) -> timezone:
+    return timezone(timedelta(hours=utc_offset_hours))
+
+
+def format_publish_time(value: datetime, utc_offset_hours: int) -> str:
+    local = value.astimezone(_publish_timezone(utc_offset_hours))
+    sign = "+" if utc_offset_hours >= 0 else ""
+    return f"{local:%d.%m.%Y %H:%M} (UTC{sign}{utc_offset_hours})"
+
+
+def parse_publish_time(
+    value: str,
+    *,
+    utc_offset_hours: int,
+    now: datetime | None = None,
+) -> datetime:
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    local_tz = _publish_timezone(utc_offset_hours)
+    local_now = current.astimezone(local_tz)
+    cleaned = re.sub(r"\s+", " ", value.strip().casefold())
+    day_shift: int | None = None
+    if cleaned.startswith("сегодня "):
+        day_shift = 0
+        cleaned = cleaned.removeprefix("сегодня ").strip()
+    elif cleaned.startswith("завтра "):
+        day_shift = 1
+        cleaned = cleaned.removeprefix("завтра ").strip()
+
+    candidate: datetime | None = None
+    if day_shift is not None:
+        try:
+            parsed_time = datetime.strptime(cleaned, "%H:%M").time()
+        except ValueError as error:
+            raise ValueError("Время нужно указать в формате ЧЧ:ММ") from error
+        target_date = local_now.date() + timedelta(days=day_shift)
+        candidate = datetime.combine(target_date, parsed_time, tzinfo=local_tz)
+    else:
+        for pattern in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M"):
+            try:
+                candidate = datetime.strptime(cleaned, pattern).replace(tzinfo=local_tz)
+                break
+            except ValueError:
+                pass
+        if candidate is None:
+            try:
+                parsed = datetime.strptime(cleaned, "%d.%m %H:%M")
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                candidate = parsed.replace(year=local_now.year, tzinfo=local_tz)
+                if candidate <= local_now:
+                    candidate = candidate.replace(year=local_now.year + 1)
+        if candidate is None:
+            try:
+                parsed_time = datetime.strptime(cleaned, "%H:%M").time()
+            except ValueError as error:
+                raise ValueError(
+                    "Используй ЧЧ:ММ, сегодня ЧЧ:ММ, завтра ЧЧ:ММ "
+                    "или ДД.ММ.ГГГГ ЧЧ:ММ"
+                ) from error
+            candidate = datetime.combine(local_now.date(), parsed_time, tzinfo=local_tz)
+            if candidate <= local_now:
+                candidate += timedelta(days=1)
+
+    if candidate <= local_now:
+        raise ValueError("Время публикации должно быть в будущем")
+    return candidate.astimezone(UTC)
+
+
+def next_publish_slot(
+    slots: tuple[int, ...],
+    occupied: list[datetime],
+    *,
+    utc_offset_hours: int,
+    now: datetime | None = None,
+) -> datetime:
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    local_tz = _publish_timezone(utc_offset_hours)
+    local_now = current.astimezone(local_tz)
+    occupied_minutes = {
+        int(value.astimezone(UTC).timestamp() // 60)
+        for value in occupied
+    }
+    for day_shift in range(367):
+        target_date = local_now.date() + timedelta(days=day_shift)
+        for minute_of_day in slots:
+            candidate = datetime(
+                target_date.year,
+                target_date.month,
+                target_date.day,
+                minute_of_day // 60,
+                minute_of_day % 60,
+                tzinfo=local_tz,
+            ).astimezone(UTC)
+            if candidate <= current:
+                continue
+            if int(candidate.timestamp() // 60) not in occupied_minutes:
+                return candidate
+    raise RuntimeError("Не удалось найти свободное окно публикации")
 
 
 class EditorBot:
@@ -59,6 +163,8 @@ class EditorBot:
         )
         self.dispatcher = Dispatcher()
         self.router = Router()
+        self.schedule_wakeup = asyncio.Event()
+        self._publication_locks: dict[int, asyncio.Lock] = {}
         self.dispatcher.include_router(self.router)
         self._register_handlers()
 
@@ -183,11 +289,22 @@ class EditorBot:
         stats = await self.repository.stats()
         editor = await self.repository.get_setting("editor_chat_id") or "не привязан"
         target = await self.repository.get_setting("target_chat_id") or "не привязан"
+        next_at = await self.repository.next_scheduled_publication()
+        next_text = (
+            format_publish_time(
+                next_at,
+                self.settings.publish_schedule_utc_offset_hours,
+            )
+            if next_at
+            else "нет"
+        )
         await message.answer(
             "Сервис работает.\n\n"
             f"Получено материалов  {stats.get('feed_items', 0)}\n"
             f"Создано черновиков  {stats.get('drafts', 0)}\n"
             f"Опубликовано  {stats.get('drafts_published', 0)}\n"
+            f"Запланировано  {stats.get('drafts_scheduled', 0)}\n"
+            f"Ближайшая публикация  {next_text}\n"
             f"Редакторский канал  <code>{html.escape(editor)}</code>\n"
             f"Канал публикации  <code>{html.escape(target)}</code>"
         )
@@ -204,6 +321,12 @@ class EditorBot:
     async def _settings(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
+        publish_slots = ", ".join(
+            f"{slot // 60:02d}:{slot % 60:02d}"
+            for slot in self.settings.publish_schedule_slots
+        )
+        offset = self.settings.publish_schedule_utc_offset_hours
+        offset_text = f"UTC{'+' if offset >= 0 else ''}{offset}"
         await message.answer(
             f"Лимит поста  {self.settings.max_post_chars}\n"
             f"Порог релевантности  {self.settings.relevance_threshold:.2f}\n"
@@ -211,6 +334,7 @@ class EditorBot:
             f"В активные часы  каждые {self.settings.rss_poll_interval_seconds} секунд\n"
             "Вне активных часов  каждые "
             f"{self.settings.rss_offpeak_poll_interval_seconds} секунд\n"
+            f"Окна пубикации  {publish_slots} ({offset_text})\n"
             f"Модель отбора  <code>{html.escape(self.settings.triage_model)}</code>\n"
             f"Модель текста  <code>{html.escape(self.settings.writer_model)}</code>"
         )
@@ -228,6 +352,12 @@ class EditorBot:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
         if message.text and message.text.startswith("/"):
+            return
+
+        pending = await self.repository.pop_pending_action(message.from_user.id)
+        if pending:
+            action, draft_id = pending
+            await self._apply_pending_edit(message, action, draft_id)
             return
 
         if not message.forward_origin:
@@ -249,6 +379,19 @@ class EditorBot:
         draft = await self.repository.get_draft(draft_id)
         if not draft:
             await message.answer("Черновик не найден.")
+            return
+        if action == "schedule_time":
+            text = (message.text or message.caption or "").strip()
+            try:
+                scheduled_at = parse_publish_time(
+                    text,
+                    utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+                )
+            except ValueError as error:
+                await self.repository.set_pending_action(message.from_user.id, action, draft_id)
+                await message.answer(f"{error}. Попробуй еще раз.")
+                return
+            await self.schedule_draft(draft_id, message.from_user.id, scheduled_at)
             return
         if action == "media":
             file_id = None
@@ -324,6 +467,42 @@ class EditorBot:
             await callback.answer("Черновик не найден", show_alert=True)
             return
 
+        if action == "pubnow":
+            await callback.answer("Публикую сейчас")
+            await self.publish_draft(draft_id, callback.from_user.id)
+            return
+        if action == "pubnext":
+            await callback.answer("Ставлю в расписание")
+            occupied = await self.repository.scheduled_publication_times()
+            scheduled_at = next_publish_slot(
+                self.settings.publish_schedule_slots,
+                occupied,
+                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+            )
+            await self.schedule_draft(draft_id, callback.from_user.id, scheduled_at)
+            return
+        if action == "pubtime":
+            await callback.answer("Жду время в боте")
+            await self.repository.set_pending_action(
+                callback.from_user.id,
+                "schedule_time",
+                draft_id,
+            )
+            await self.bot.send_message(
+                callback.from_user.id,
+                f"Пришли время публикации для #{draft_id}.\n\n"
+                "Примеры\n"
+                "<code>18:30</code>\n"
+                "<code>сегодня 18:30</code>\n"
+                "<code>завтра 10:00</code>\n"
+                "<code>25.10.2026 12:00</code>",
+            )
+            return
+        if action == "pubunschedule":
+            await callback.answer("Снимаю с расписания")
+            await self.unschedule_draft(draft_id, callback.from_user.id)
+            return
+
         if action == "title":
             await callback.answer("Подбираю новый заголовок")
             await self._run_automatic_edit(
@@ -362,8 +541,12 @@ class EditorBot:
                 await self.bot.send_message(callback.from_user.id, "Не удалось переписать материал.")
             return
         elif action == "publish":
-            await callback.answer("Публикую")
-            await self.publish_draft(draft_id, callback.from_user.id)
+            await callback.answer("Выбери время публикации")
+            await self.bot.send_message(
+                callback.from_user.id,
+                f"Когда опубликовать черновик #{draft_id}?",
+                reply_markup=self._publish_options_keyboard(draft_id),
+            )
             return
         elif action == "skip":
             await self.repository.update_draft(draft_id, status="rejected")
@@ -474,7 +657,7 @@ class EditorBot:
                         file_value,
                         str(media.get("type") or "photo"),
                     ),
-                    reply_markup=self._draft_keyboard(draft_id),
+                    reply_markup=self._editor_keyboard(draft),
                 )
                 if isinstance(edited, Message):
                     if old_media_message_id and int(old_media_message_id) != old_message_id:
@@ -544,7 +727,7 @@ class EditorBot:
                         file_value,
                         str(media.get("type") or "photo"),
                     ),
-                    reply_markup=self._draft_keyboard(int(draft["id"])),
+                    reply_markup=self._editor_keyboard(draft),
                 )
                 return message, None
             except TelegramBadRequest:
@@ -558,14 +741,14 @@ class EditorBot:
                             chat_id,
                             video=file_value,
                             caption=text,
-                            reply_markup=self._draft_keyboard(int(draft["id"])),
+                            reply_markup=self._editor_keyboard(draft),
                         )
                     else:
                         message = await self.bot.send_photo(
                             chat_id,
                             photo=file_value,
                             caption=text,
-                            reply_markup=self._draft_keyboard(int(draft["id"])),
+                            reply_markup=self._editor_keyboard(draft),
                         )
                     return message, None
                 if not preview_url:
@@ -575,36 +758,202 @@ class EditorBot:
         message = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
-            reply_markup=self._draft_keyboard(int(draft["id"])),
+            reply_markup=self._editor_keyboard(draft),
             link_preview_options=self._preview_options(preview_url),
         )
         return message, None
 
-    async def publish_draft(self, draft_id: int, owner_id: int) -> None:
+    async def schedule_draft(
+        self,
+        draft_id: int,
+        owner_id: int,
+        scheduled_at: datetime,
+    ) -> bool:
         draft = await self.repository.get_draft(draft_id)
         if not draft:
-            return
+            await self.bot.send_message(owner_id, "Черновик не найден.")
+            return False
         if draft["status"] == "published":
             await self.bot.send_message(owner_id, "Этот материал уже опубликован.")
+            return False
+        if not await self.repository.get_setting("target_chat_id"):
+            await self.bot.send_message(
+                owner_id,
+                "Канал публикации не настроен. Используй /setup.",
+            )
+            return False
+        scheduled_at = scheduled_at.astimezone(UTC)
+        if scheduled_at <= datetime.now(UTC):
+            await self.bot.send_message(
+                owner_id,
+                "Время публикации должно быть в будущем.",
+            )
+            return False
+        await self.repository.update_draft(
+            draft_id,
+            status="scheduled",
+            scheduled_at=scheduled_at.isoformat(),
+            schedule_attempts=0,
+            schedule_error=None,
+        )
+        await self._set_editor_keyboard(draft_id)
+        self.schedule_wakeup.set()
+        formatted = format_publish_time(
+            scheduled_at,
+            self.settings.publish_schedule_utc_offset_hours,
+        )
+        await self.bot.send_message(
+            owner_id,
+            f"Черновик #{draft_id} запланирован на {formatted}.",
+        )
+        return True
+
+    async def unschedule_draft(self, draft_id: int, owner_id: int) -> None:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft or draft["status"] != "scheduled":
+            await self.bot.send_message(owner_id, "Черновик не стоит в расписании.")
             return
+        await self.repository.update_draft(
+            draft_id,
+            status="draft",
+            scheduled_at=None,
+            schedule_attempts=0,
+            schedule_error=None,
+        )
+        await self._set_editor_keyboard(draft_id)
+        self.schedule_wakeup.set()
+        await self.bot.send_message(owner_id, f"Черновик #{draft_id} снят с расписания.")
+
+    async def _set_editor_keyboard(self, draft_id: int) -> None:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft or not draft["editor_chat_id"] or not draft["editor_message_id"]:
+            return
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id=int(draft["editor_chat_id"]),
+                message_id=int(draft["editor_message_id"]),
+                reply_markup=self._editor_keyboard(draft),
+            )
+        except TelegramBadRequest:
+            logger.warning("Could not update schedule keyboard for draft %s", draft_id)
+
+    async def scheduled_publish_worker(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            self.schedule_wakeup.clear()
+            now = datetime.now(UTC)
+            due = await self.repository.due_scheduled_drafts(now)
+            for draft in due:
+                draft_id = int(draft["id"])
+                owners = await self.repository.owner_ids()
+                owner_id = owners[0] if owners else None
+                try:
+                    published = await self.publish_draft(draft_id, owner_id)
+                except Exception as error:
+                    logger.exception("Scheduled publication failed for draft %s", draft_id)
+                    published = False
+                    failure = f"{type(error).__name__}: {error}"
+                else:
+                    failure = "Telegram publication failed"
+                if published:
+                    continue
+                current = await self.repository.get_draft(draft_id)
+                if not current or current["status"] != "scheduled":
+                    continue
+                attempts = int(current.get("schedule_attempts") or 0) + 1
+                if attempts >= MAX_SCHEDULE_ATTEMPTS:
+                    await self.repository.update_draft(
+                        draft_id,
+                        status="draft",
+                        scheduled_at=None,
+                        schedule_attempts=attempts,
+                        schedule_error=failure,
+                    )
+                    await self._set_editor_keyboard(draft_id)
+                    if owner_id is not None:
+                        await self.bot.send_message(
+                            owner_id,
+                            f"Отложенная публикация #{draft_id} не удалась "
+                            "после трёх попыток. Черновик вернут на редактуру.",
+                        )
+                else:
+                    retry_at = datetime.now(UTC) + SCHEDULE_RETRY_DELAY
+                    await self.repository.update_draft(
+                        draft_id,
+                        scheduled_at=retry_at.isoformat(),
+                        schedule_attempts=attempts,
+                        schedule_error=failure,
+                    )
+                    if owner_id is not None:
+                        await self.bot.send_message(
+                            owner_id,
+                            f"Публикация #{draft_id} не прошла. "
+                            "Повторю через 5 минут.",
+                        )
+
+            next_at = await self.repository.next_scheduled_publication()
+            timeout = 3600.0
+            if next_at is not None:
+                timeout = max(
+                    1.0,
+                    min(timeout, (next_at - datetime.now(UTC)).total_seconds()),
+                )
+            stop_task = asyncio.create_task(stop_event.wait())
+            wake_task = asyncio.create_task(self.schedule_wakeup.wait())
+            done, pending = await asyncio.wait(
+                {stop_task, wake_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if stop_task in done and stop_event.is_set():
+                return
+
+    async def publish_draft(self, draft_id: int, owner_id: int | None) -> bool:
+        lock = self._publication_locks.setdefault(draft_id, asyncio.Lock())
+        async with lock:
+            return await self._publish_draft_unlocked(draft_id, owner_id)
+
+    async def _publish_draft_unlocked(
+        self,
+        draft_id: int,
+        owner_id: int | None,
+    ) -> bool:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft:
+            return False
+        if draft["status"] == "published":
+            if owner_id is not None:
+                await self.bot.send_message(owner_id, "Этот материал уже опубликован.")
+            return True
         target_chat_id = await self.repository.get_setting("target_chat_id")
         if not target_chat_id:
-            await self.bot.send_message(owner_id, "Канал публикации не настроен. Используй /setup.")
-            return
+            if owner_id is not None:
+                await self.bot.send_message(
+                    owner_id,
+                    "Канал публикации не настроен. Используй /setup.",
+                )
+            return False
         sources = [SourceDocument.from_dict(item) for item in draft["sources"]]
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
         rendered = render_post(post, sources, self.settings.max_post_chars)
         media = self._selected_media(draft)
         if not media:
-            await self.bot.send_message(owner_id, "Публикация остановлена. У материала нет изображения.")
-            return
+            if owner_id is not None:
+                await self.bot.send_message(
+                    owner_id,
+                    "Публикация остановлена. У материала нет изображения.",
+                )
+            return False
         file_value = await self._media_input(media)
         if not file_value:
-            await self.bot.send_message(
-                owner_id,
-                "Публикация остановлена. Не удалось скачать изображение.",
-            )
-            return
+            if owner_id is not None:
+                await self.bot.send_message(
+                    owner_id,
+                    "Публикация остановлена. Не удалось скачать изображение.",
+                )
+            return False
 
         try:
             sent = await self.bot.send_rich_message(
@@ -636,11 +985,12 @@ class EditorBot:
                 sent = None
             if sent is None:
                 logger.warning("Rich media publication failed for draft %s", draft_id)
-                await self.bot.send_message(
-                    owner_id,
-                    "Публикация остановлена. Telegram не принял единый пост с изображением.",
-                )
-                return
+                if owner_id is not None:
+                    await self.bot.send_message(
+                        owner_id,
+                        "Публикация остановлена. Telegram не принял единый пост с изображением.",
+                    )
+                return False
 
         await self.repository.update_draft(
             draft_id,
@@ -648,6 +998,9 @@ class EditorBot:
             target_chat_id=int(target_chat_id),
             target_message_id=sent.message_id,
             target_media_message_id=None,
+            scheduled_at=None,
+            schedule_attempts=0,
+            schedule_error=None,
         )
         if draft["editor_chat_id"] and draft["editor_message_id"]:
             await self.bot.edit_message_reply_markup(
@@ -655,7 +1008,9 @@ class EditorBot:
                 message_id=draft["editor_message_id"],
                 reply_markup=None,
             )
-        await self.bot.send_message(owner_id, f"Черновик #{draft_id} опубликован.")
+        if owner_id is not None:
+            await self.bot.send_message(owner_id, f"Черновик #{draft_id} опубликован.")
+        return True
 
     async def _send_sources(self, user_id: int, draft: dict[str, Any]) -> None:
         lines = [f"Источники черновика #{draft['id']}\n"]
@@ -676,6 +1031,59 @@ class EditorBot:
             lines.append("Официальные первоисточники не найдены.")
         text = "\n".join(lines)
         await self.bot.send_message(user_id, text[:4000], link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+    @classmethod
+    def _editor_keyboard(cls, draft: dict[str, Any]) -> InlineKeyboardMarkup:
+        draft_id = int(draft["id"])
+        if draft.get("status") == "scheduled":
+            return cls._scheduled_keyboard(draft_id)
+        return cls._draft_keyboard(draft_id)
+
+    @staticmethod
+    def _publish_options_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Сейчас",
+                        callback_data=f"pubnow:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Следующее окно",
+                        callback_data=f"pubnext:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Указать время",
+                        callback_data=f"pubtime:{draft_id}",
+                    ),
+                ],
+            ]
+        )
+
+    @staticmethod
+    def _scheduled_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Опубликовать сейчас",
+                        callback_data=f"pubnow:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Изменить время",
+                        callback_data=f"pubtime:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Снять с расписания",
+                        callback_data=f"pubunschedule:{draft_id}",
+                    ),
+                ],
+            ]
+        )
 
     @staticmethod
     def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:

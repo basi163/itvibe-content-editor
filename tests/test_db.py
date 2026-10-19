@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,8 @@ async def test_draft_round_trip(tmp_path: Path) -> None:
     assert draft["hashtags"] == ["#ИИ", "#наука", "#технологии"]
     assert draft["editor_media_message_id"] is None
     assert draft["target_media_message_id"] is None
+    assert draft["scheduled_at"] is None
+    assert draft["schedule_attempts"] == 0
 
 
 @pytest.mark.asyncio
@@ -94,3 +97,35 @@ async def test_pending_manual_edits_can_be_cleared(tmp_path: Path) -> None:
     await repository.clear_pending_actions()
 
     assert await repository.pop_pending_action(100) is None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    draft_id = await repository.create_draft(
+        origin_type="test",
+        origin_ref="test",
+        title="Заголовок",
+        body="Текст",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+        sources=[],
+        media=[],
+        material={},
+        triage={},
+    )
+    now = datetime(2026, 10, 19, 10, 0, tzinfo=UTC)
+    scheduled_at = now + timedelta(minutes=10)
+    await repository.update_draft(
+        draft_id,
+        status="scheduled",
+        scheduled_at=scheduled_at.isoformat(),
+    )
+
+    assert await repository.due_scheduled_drafts(now) == []
+    due = await repository.due_scheduled_drafts(now + timedelta(minutes=11))
+    future = await repository.scheduled_publication_times(now)
+
+    assert [draft["id"] for draft in due] == [draft_id]
+    assert future == [scheduled_at]
+    assert await repository.next_scheduled_publication() == scheduled_at

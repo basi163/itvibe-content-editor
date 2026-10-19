@@ -198,12 +198,15 @@ async def main() -> None:
             pass
 
     feed_task = asyncio.create_task(rss_worker(settings, repository, pipeline, stop_event))
+    publish_task = asyncio.create_task(editor_bot.scheduled_publish_worker(stop_event))
     try:
         await editor_bot.start_polling()
     finally:
         stop_event.set()
+        editor_bot.schedule_wakeup.set()
         feed_task.cancel()
-        await asyncio.gather(feed_task, return_exceptions=True)
+        publish_task.cancel()
+        await asyncio.gather(feed_task, publish_task, return_exceptions=True)
         await extractor.close()
         await editor_bot.close()
 
