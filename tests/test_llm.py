@@ -236,6 +236,48 @@ async def test_regenerate_title_fits_available_post_space() -> None:
 
 
 @pytest.mark.asyncio
+async def test_regenerate_title_prefers_an_option_that_needs_no_truncation() -> None:
+    original = GeneratedPost(
+        "Linux меняет изоляцию",
+        "Проверенный текст без изменений.",
+        ["#Linux", "#ядро", "#технологии"],
+    )
+    visible = f"{original.title}\n\n{original.body}\n\n{' '.join(original.hashtags)}"
+    max_post_chars = len(visible) + 2 + len(SIGNATURE_TEXT)
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=max_post_chars,
+    )
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        return {
+            "titles": [
+                "Очень длинный заголовок о новой системе изоляции Linux",
+                "Новая изоляция Linux",
+            ]
+        }
+
+    client._completion = completion  # type: ignore[method-assign]
+    try:
+        changed = await client.regenerate_component(
+            "title",
+            StoryCandidate("solidot_rss", "", "Original", ""),
+            [SourceDocument(url="https://example.org", title="Official")],
+            TriageDecision(True, 0.9, "technology", "relevant"),
+            original,
+        )
+    finally:
+        await client.client.close()
+
+    assert changed.title == "Новая изоляция Linux"
+    assert "…" not in changed.title
+    assert validate_post(changed, max_post_chars) == []
+
+
+@pytest.mark.asyncio
 async def test_regenerate_hashtags_changes_only_hashtags() -> None:
     client = QwenClient(
         api_key="test",

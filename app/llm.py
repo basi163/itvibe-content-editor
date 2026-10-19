@@ -291,17 +291,22 @@ class QwenClient:
                 if not isinstance(raw_titles, list) or not raw_titles:
                     raw_titles = [data.get("title", "")]
                 attempt_errors: list[str] = []
+                prepared_titles: list[tuple[bool, str]] = []
                 for raw_title in raw_titles[:5]:
-                    proposal = GeneratedPost(
+                    raw_proposal = GeneratedPost(
                         title=str(raw_title).strip(),
                         body=post.body,
                         hashtags=post.hashtags,
                     )
-                    normalized = normalize_generated_post(proposal, self.max_post_chars)
+                    normalized = normalize_generated_post(raw_proposal, self.max_post_chars)
                     fitted_title = _fit_title_to_limit(
                         normalized.title,
                         title_character_limit,
                     )
+                    was_truncated = fitted_title != normalized.title
+                    prepared_titles.append((was_truncated, fitted_title))
+
+                for _, fitted_title in sorted(prepared_titles, key=lambda item: item[0]):
                     proposal = GeneratedPost(fitted_title, post.body, post.hashtags)
                     title_key = proposal.title.casefold()
                     errors = validate_post(proposal, self.max_post_chars)
