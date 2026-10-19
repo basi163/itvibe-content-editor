@@ -197,7 +197,7 @@ def _body_to_rich_html(body: str, sources: list[SourceDocument]) -> str:
     for paragraph in paragraphs:
         content = _body_to_html(paragraph, sources)
         blocks.append(f"<p>{content}</p>")
-    return "".join(blocks)
+    return "<br>".join(blocks)
 
 
 def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
@@ -257,8 +257,10 @@ def render_post(
     signature_text = html.escape(SIGNATURE_TEXT)
     signature = f'<a href="{signature_url}">{signature_text}</a>'
     rendered = f"<b>{title}</b>\n\n{body}\n\n{hashtags}\n\n{signature}"
+    spacer = "<br>"
     rich_rendered = (
-        f"<p><b>{title}</b></p>{rich_body}<p>{hashtags}</p><p>{signature}</p>"
+        f"<p><b>{title}</b></p>{spacer}{rich_body}{spacer}<p>{hashtags}</p>"
+        f"{spacer}<p>{signature}</p>"
     )
     visible = HTML_TAG_RE.sub("", rendered)
     visible = html.unescape(visible)

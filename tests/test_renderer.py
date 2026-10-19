@@ -54,7 +54,7 @@ def test_renderer_adds_exactly_one_blank_line_between_paragraphs() -> None:
     rendered = render_post(post, SOURCES, 2000)
 
     assert "Первый абзац.\n\nВторой абзац.\n\nТретий абзац." in rendered.html
-    assert "<p>Первый абзац.</p><p>Второй абзац.</p>" in rendered.rich_html
+    assert "<p>Первый абзац.</p><br><p>Второй абзац.</p>" in rendered.rich_html
     assert "<p><br></p>" not in rendered.rich_html
     assert "<h2>" not in rendered.rich_html
 
@@ -73,7 +73,7 @@ def test_signature_is_separated_from_hashtags_by_blank_line() -> None:
         f'<a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a>'
     ) in rendered.html
     assert (
-        "<p>#ИИ #наука #технологии</p>"
+        "<p>#ИИ #наука #технологии</p><br>"
         f'<p><a href="{SIGNATURE_URL}">{SIGNATURE_TEXT}</a></p>'
     ) in rendered.rich_html
 
