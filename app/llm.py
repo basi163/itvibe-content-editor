@@ -265,6 +265,8 @@ class QwenClient:
 
         title_character_limit = _title_character_limit(post, self.max_post_chars)
         remaining: list[str] = []
+        rejected_titles: list[str] = []
+        seen_titles = {post.title.casefold()}
         for _ in range(3):
             payload = {
                 "component": component,
@@ -275,6 +277,7 @@ class QwenClient:
                 "previous_errors": remaining,
                 "maximum_visible_characters": self.max_post_chars,
                 "maximum_title_characters": title_character_limit,
+                "rejected_titles": rejected_titles,
             }
             data = await self._completion(
                 model=self.writer_model,
@@ -284,31 +287,48 @@ class QwenClient:
                 max_tokens=500,
             )
             if component == "title":
-                proposal = GeneratedPost(
-                    title=str(data.get("title", "")).strip(),
-                    body=post.body,
-                    hashtags=post.hashtags,
-                )
-            else:
-                raw_hashtags = data.get("hashtags", [])
-                if not isinstance(raw_hashtags, list):
-                    raw_hashtags = []
-                proposal = GeneratedPost(
-                    title=post.title,
-                    body=post.body,
-                    hashtags=[str(tag).strip() for tag in raw_hashtags],
-                )
+                raw_titles = data.get("titles", [])
+                if not isinstance(raw_titles, list) or not raw_titles:
+                    raw_titles = [data.get("title", "")]
+                attempt_errors: list[str] = []
+                for raw_title in raw_titles[:5]:
+                    proposal = GeneratedPost(
+                        title=str(raw_title).strip(),
+                        body=post.body,
+                        hashtags=post.hashtags,
+                    )
+                    normalized = normalize_generated_post(proposal, self.max_post_chars)
+                    fitted_title = _fit_title_to_limit(
+                        normalized.title,
+                        title_character_limit,
+                    )
+                    proposal = GeneratedPost(fitted_title, post.body, post.hashtags)
+                    title_key = proposal.title.casefold()
+                    errors = validate_post(proposal, self.max_post_chars)
+                    if title_key in seen_titles:
+                        errors.append("Новый вариант совпадает с текущим или отклоненным")
+                    if not errors:
+                        return proposal
+                    seen_titles.add(title_key)
+                    if proposal.title and proposal.title not in rejected_titles:
+                        rejected_titles.append(proposal.title)
+                    attempt_errors.extend(errors)
+                remaining = list(dict.fromkeys(attempt_errors))
+                continue
 
+            raw_hashtags = data.get("hashtags", [])
+            if not isinstance(raw_hashtags, list):
+                raw_hashtags = []
+            proposal = GeneratedPost(
+                title=post.title,
+                body=post.body,
+                hashtags=[str(tag).strip() for tag in raw_hashtags],
+            )
             normalized = normalize_generated_post(proposal, self.max_post_chars)
-            if component == "title":
-                fitted_title = _fit_title_to_limit(normalized.title, title_character_limit)
-                proposal = GeneratedPost(fitted_title, post.body, post.hashtags)
-                changed = proposal.title.casefold() != post.title.casefold()
-            else:
-                proposal = GeneratedPost(post.title, post.body, normalized.hashtags)
-                changed = {tag.casefold() for tag in proposal.hashtags} != {
-                    tag.casefold() for tag in post.hashtags
-                }
+            proposal = GeneratedPost(post.title, post.body, normalized.hashtags)
+            changed = {tag.casefold() for tag in proposal.hashtags} != {
+                tag.casefold() for tag in post.hashtags
+            }
             remaining = validate_post(proposal, self.max_post_chars)
             if not changed:
                 remaining.append("Новый вариант совпадает с текущим")

@@ -149,6 +149,51 @@ async def test_regenerate_title_changes_only_title() -> None:
 
 
 @pytest.mark.asyncio
+async def test_regenerate_title_selects_a_distinct_option() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+    original = GeneratedPost(
+        "Linux меняет изоляцию",
+        "Проверенный текст",
+        ["#Linux", "#ядро", "#технологии"],
+    )
+    calls = 0
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {
+            "titles": [
+                original.title,
+                original.title,
+                "Новый подход Linux к изоляции",
+            ]
+        }
+
+    client._completion = completion  # type: ignore[method-assign]
+    try:
+        changed = await client.regenerate_component(
+            "title",
+            StoryCandidate("solidot_rss", "", "Original", ""),
+            [SourceDocument(url="https://example.org", title="Official")],
+            TriageDecision(True, 0.9, "technology", "relevant"),
+            original,
+        )
+    finally:
+        await client.client.close()
+
+    assert calls == 1
+    assert changed.title == "Новый подход Linux к изоляции"
+    assert changed.body == original.body
+    assert changed.hashtags == original.hashtags
+
+
+@pytest.mark.asyncio
 async def test_regenerate_title_fits_available_post_space() -> None:
     original = GeneratedPost(
         "Linux меняет изоляцию",
