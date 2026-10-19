@@ -38,7 +38,11 @@ def test_draft_keyboard_describes_automatic_edits() -> None:
     assert "Другой заголовок" in labels
     assert "Другие хэштеги" in labels
     assert "Другое изображение" in labels
+    assert "Контент-план" in labels
+    assert "Канал публикации" in labels
     assert "image:7" in callbacks
+    assert "plan:0" in callbacks
+    assert "targetmenu:0" in callbacks
     assert "media:7" not in callbacks
 
 
@@ -76,7 +80,56 @@ def test_scheduled_keyboard_can_publish_reschedule_or_cancel() -> None:
         for button in row
     }
 
-    assert callbacks == {"pubnow:7", "pubtime:7", "pubunschedule:7"}
+    assert callbacks == {
+        "pubnow:7",
+        "publish:7",
+        "pubunschedule:7",
+        "plan:0",
+        "targetmenu:0",
+    }
+
+
+def test_content_plan_keyboard_opens_posts_and_channel_settings() -> None:
+    keyboard = EditorBot._content_plan_keyboard(
+        [{"id": 7, "title": "Запланированный пост"}],
+        "IT Vibe News",
+    )
+    callbacks = {
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert "planitem:7" in callbacks
+    assert "planrefresh:0" in callbacks
+    assert "targetmenu:0" in callbacks
+    assert "targetadd:0" in callbacks
+
+
+def test_content_plan_item_can_edit_and_reschedule_post() -> None:
+    keyboard = EditorBot._content_plan_item_keyboard(7)
+    callbacks = {
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert "planreschedule:7" in callbacks
+    assert "title:7" in callbacks
+    assert "tags:7" in callbacks
+    assert "image:7" in callbacks
+    assert "regen:7" in callbacks
+    assert "pubunschedule:7" in callbacks
+
+
+def test_target_only_channel_picker_requests_channel_metadata() -> None:
+    keyboard = EditorBot._channel_request_keyboard(target_only=True)
+    request = keyboard.keyboard[0][0].request_chat
+
+    assert request is not None
+    assert request.request_id == 102
+    assert request.request_title is True
+    assert request.request_username is True
 
 
 def test_parse_publish_time_uses_samara_time_and_rolls_clock_to_tomorrow() -> None:

@@ -44,6 +44,7 @@ EDITOR_REQUEST_ID = 101
 TARGET_REQUEST_ID = 102
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 MAX_SCHEDULE_ATTEMPTS = 3
+PUBLICATION_CHANNELS_SETTING = "publication_channels"
 
 
 def _publish_timezone(utc_offset_hours: int) -> timezone:
@@ -214,16 +215,36 @@ class EditorBot:
             [
                 BotCommand(command="start", description="Запустить редактор"),
                 BotCommand(command="setup", description="Привязать каналы"),
+                BotCommand(command="plan", description="Контент-план"),
                 BotCommand(command="status", description="Показать состояние системы"),
                 BotCommand(command="sources", description="Показать источники"),
                 BotCommand(command="settings", description="Настройки генерации"),
                 BotCommand(command="help", description="Помощь"),
             ]
         )
-        if self.settings.editor_chat_id:
+        if self.settings.editor_chat_id and not await self.repository.get_setting(
+            "editor_chat_id"
+        ):
             await self.repository.set_setting("editor_chat_id", str(self.settings.editor_chat_id))
-        if self.settings.target_chat_id:
+        if self.settings.target_chat_id and not await self.repository.get_setting(
+            "target_chat_id"
+        ):
             await self.repository.set_setting("target_chat_id", str(self.settings.target_chat_id))
+        target_chat_id = await self.repository.get_setting("target_chat_id")
+        known_channels = await self._publication_channels()
+        if target_chat_id and not any(
+            str(channel["chat_id"]) == target_chat_id for channel in known_channels
+        ):
+            try:
+                target_chat = await self.bot.get_chat(int(target_chat_id))
+            except TelegramBadRequest:
+                logger.warning("Could not load current publication channel metadata")
+            else:
+                await self._remember_publication_channel(
+                    int(target_chat_id),
+                    str(target_chat.title or target_chat_id),
+                    target_chat.username,
+                )
 
     async def start_polling(self) -> None:
         await self.dispatcher.start_polling(self.bot, allowed_updates=self.dispatcher.resolve_used_update_types())
@@ -234,6 +255,7 @@ class EditorBot:
     def _register_handlers(self) -> None:
         self.router.message.register(self._start, Command("start"))
         self.router.message.register(self._setup, Command("setup"))
+        self.router.message.register(self._plan, Command("plan"))
         self.router.message.register(self._status, Command("status"))
         self.router.message.register(self._sources, Command("sources"))
         self.router.message.register(self._settings, Command("settings"))
@@ -244,6 +266,44 @@ class EditorBot:
 
     async def _is_owner(self, user_id: int) -> bool:
         return await self.repository.is_owner(user_id)
+
+    async def _publication_channels(self) -> list[dict[str, Any]]:
+        raw = await self.repository.get_setting(PUBLICATION_CHANNELS_SETTING)
+        if not raw:
+            return []
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return [value for value in values if isinstance(value, dict) and value.get("chat_id")]
+
+    async def _remember_publication_channel(
+        self,
+        chat_id: int,
+        title: str,
+        username: str | None,
+    ) -> None:
+        channels = await self._publication_channels()
+        channel = {
+            "chat_id": chat_id,
+            "title": title or str(chat_id),
+            "username": username,
+        }
+        channels = [item for item in channels if int(item["chat_id"]) != chat_id]
+        channels.append(channel)
+        await self.repository.set_setting(
+            PUBLICATION_CHANNELS_SETTING,
+            json.dumps(channels, ensure_ascii=False),
+        )
+
+    async def _target_channel_label(self) -> str:
+        target = await self.repository.get_setting("target_chat_id")
+        if not target:
+            return "не выбран"
+        for channel in await self._publication_channels():
+            if str(channel["chat_id"]) == target:
+                return str(channel.get("title") or channel.get("username") or target)
+        return target
 
     async def _start(self, message: Message) -> None:
         if not message.from_user:
@@ -262,8 +322,16 @@ class EditorBot:
     async def _setup(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[
+        await message.answer(
+            "Сначала добавь бота администратором нужного канала, затем выбери канал.",
+            reply_markup=self._channel_request_keyboard(),
+        )
+
+    @staticmethod
+    def _channel_request_keyboard(*, target_only: bool = False) -> ReplyKeyboardMarkup:
+        rows: list[list[KeyboardButton]] = []
+        if not target_only:
+            rows.append(
                 [
                     KeyboardButton(
                         text="Выбрать редакторский канал",
@@ -273,25 +341,32 @@ class EditorBot:
                             bot_is_member=True,
                         ),
                     )
-                ],
-                [
-                    KeyboardButton(
-                        text="Выбрать канал публикации",
-                        request_chat=KeyboardButtonRequestChat(
-                            request_id=TARGET_REQUEST_ID,
-                            chat_is_channel=True,
-                            bot_is_member=True,
-                        ),
-                    )
-                ],
-            ],
+                ]
+            )
+        rows.append(
+            [
+                KeyboardButton(
+                    text="Выбрать канал публикации",
+                    request_chat=KeyboardButtonRequestChat(
+                        request_id=TARGET_REQUEST_ID,
+                        chat_is_channel=True,
+                        bot_is_member=True,
+                        request_title=True,
+                        request_username=True,
+                    ),
+                )
+            ]
+        )
+        return ReplyKeyboardMarkup(
+            keyboard=rows,
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await message.answer(
-            "Сначала добавь бота администратором нужного канала, затем выбери канал.",
-            reply_markup=keyboard,
-        )
+
+    async def _plan(self, message: Message) -> None:
+        if not message.from_user or not await self._is_owner(message.from_user.id):
+            return
+        await self._show_content_plan(message.chat.id)
 
     async def _chat_shared(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
@@ -300,6 +375,7 @@ class EditorBot:
         try:
             me = await self.bot.get_me()
             member = await self.bot.get_chat_member(shared.chat_id, me.id)
+            selected_chat = await self.bot.get_chat(shared.chat_id)
         except TelegramBadRequest:
             await message.answer("Не удалось проверить канал. Добавь бота в него администратором.")
             return
@@ -318,8 +394,14 @@ class EditorBot:
                     await self.deliver_draft(int(draft["id"]))
         elif shared.request_id == TARGET_REQUEST_ID:
             await self.repository.set_setting("target_chat_id", str(shared.chat_id))
+            await self._remember_publication_channel(
+                shared.chat_id,
+                str(selected_chat.title or shared.title or shared.chat_id),
+                selected_chat.username or shared.username,
+            )
             await message.answer(
-                "Канал публикации привязан.",
+                f"Канал публикации переключён на "
+                f"<b>{html.escape(str(selected_chat.title or shared.chat_id))}</b>.",
                 reply_markup=ReplyKeyboardRemove(),
             )
 
@@ -328,7 +410,7 @@ class EditorBot:
             return
         stats = await self.repository.stats()
         editor = await self.repository.get_setting("editor_chat_id") or "не привязан"
-        target = await self.repository.get_setting("target_chat_id") or "не привязан"
+        target = await self._target_channel_label()
         next_at = await self.repository.next_scheduled_publication()
         next_text = (
             format_publish_time(
@@ -379,13 +461,232 @@ class EditorBot:
             f"Модель текста  <code>{html.escape(self.settings.writer_model)}</code>"
         )
 
+    async def _show_content_plan(
+        self,
+        chat_id: int,
+        message_id: int | None = None,
+    ) -> None:
+        drafts = await self.repository.scheduled_drafts()
+        target_label = await self._target_channel_label()
+        lines = [
+            "<b>Контент-план</b>",
+            f"Канал публикации  <b>{html.escape(target_label)}</b>",
+            "",
+        ]
+        if drafts:
+            for draft in drafts:
+                scheduled_at = self._draft_scheduled_at(draft)
+                when = (
+                    format_publish_time(
+                        scheduled_at,
+                        self.settings.publish_schedule_utc_offset_hours,
+                    )
+                    if scheduled_at
+                    else "время не указано"
+                )
+                lines.append(
+                    f"<b>#{draft['id']}</b>  {when}\n"
+                    f"{html.escape(str(draft['title']))}"
+                )
+        else:
+            lines.append("Запланированных постов пока нет.")
+        text = "\n\n".join(lines)
+        keyboard = self._content_plan_keyboard(drafts, target_label)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not refresh content plan message; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_plan_item(
+        self,
+        chat_id: int,
+        message_id: int,
+        draft: dict[str, Any],
+    ) -> None:
+        scheduled_at = self._draft_scheduled_at(draft)
+        when = (
+            format_publish_time(
+                scheduled_at,
+                self.settings.publish_schedule_utc_offset_hours,
+            )
+            if scheduled_at
+            else "не запланировано"
+        )
+        target_label = await self._target_channel_label()
+        text = (
+            f"<b>Контент-план · пост #{draft['id']}</b>\n\n"
+            f"<b>{html.escape(str(draft['title']))}</b>\n\n"
+            f"Публикация  {when}\n"
+            f"Канал  <b>{html.escape(target_label)}</b>"
+        )
+        await self.bot.edit_message_text(
+            text=text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=self._content_plan_item_keyboard(int(draft["id"])),
+        )
+
+    async def _show_target_channel_menu(self, chat_id: int) -> None:
+        channels = await self._publication_channels()
+        current = await self.repository.get_setting("target_chat_id")
+        rows: list[list[InlineKeyboardButton]] = []
+        for channel in channels:
+            channel_id = int(channel["chat_id"])
+            title = str(channel.get("title") or channel.get("username") or channel_id)
+            marker = "✅ " if str(channel_id) == current else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{marker}{title}"[:60],
+                        callback_data=f"target:{channel_id}",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Добавить другой канал",
+                        callback_data="targetadd:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Контент-план",
+                        callback_data="plan:0",
+                    )
+                ],
+            ]
+        )
+        await self.bot.send_message(
+            chat_id,
+            "<b>Канал итоговой публикации</b>\n\n"
+            "Выбери добавленный канал или добавь новый.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def _send_target_channel_picker(self, user_id: int) -> None:
+        await self.bot.send_message(
+            user_id,
+            "Добавь бота администратором нужного канала и выбери его кнопкой ниже.",
+            reply_markup=self._channel_request_keyboard(target_only=True),
+        )
+
+    @staticmethod
+    def _draft_scheduled_at(draft: dict[str, Any]) -> datetime | None:
+        value = draft.get("scheduled_at")
+        if not value:
+            return None
+        try:
+            scheduled_at = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=UTC)
+        return scheduled_at.astimezone(UTC)
+
+    @staticmethod
+    def _content_plan_keyboard(
+        drafts: list[dict[str, Any]],
+        target_label: str,
+    ) -> InlineKeyboardMarkup:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=f"#{draft['id']}  {str(draft['title'])[:42]}",
+                    callback_data=f"planitem:{draft['id']}",
+                )
+            ]
+            for draft in drafts[:40]
+        ]
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(text="Обновить", callback_data="planrefresh:0"),
+                    InlineKeyboardButton(
+                        text=f"Канал: {target_label}"[:45],
+                        callback_data="targetmenu:0",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Добавить/сменить канал",
+                        callback_data="targetadd:0",
+                    )
+                ],
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _content_plan_item_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Изменить время",
+                        callback_data=f"planreschedule:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Опубликовать сейчас",
+                        callback_data=f"pubnow:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Другой заголовок",
+                        callback_data=f"title:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Другие хэштеги",
+                        callback_data=f"tags:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Другое изображение",
+                        callback_data=f"image:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Переписать всё",
+                        callback_data=f"regen:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Снять с расписания",
+                        callback_data=f"pubunschedule:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Канал публикации",
+                        callback_data="targetmenu:0",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Назад к плану",
+                        callback_data="planrefresh:0",
+                    )
+                ],
+            ]
+        )
+
     async def _help(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
         await message.answer(
             "Перешли сюда пост из любого канала или дождись новой публикации Solidot. "
             "Подготовленный материал появится в редакторском канале. Управление выполняется "
-            "кнопками под черновиком."
+            "кнопками под черновиком. Очередь публикаций и её настройки доступны "
+            "через /plan и кнопку «Контент-план»."
         )
 
     async def _private_message(self, message: Message) -> None:
@@ -500,16 +801,56 @@ class EditorBot:
         parts = (callback.data or "").split(":")
         action = parts[0]
         is_slot_action = action == "pubslot"
-        valid = (
-            len(parts) == 3
-            and parts[1].isdigit()
-            and parts[2].isdigit()
-            if is_slot_action
-            else len(parts) == 2 and parts[1].isdigit()
-        )
+        if is_slot_action:
+            valid = len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()
+        elif action == "target":
+            valid = len(parts) == 2 and parts[1].lstrip("-").isdigit()
+        else:
+            valid = len(parts) == 2 and parts[1].isdigit()
         if not valid:
             await callback.answer("Некорректная команда", show_alert=True)
             return
+
+        if action in {"plan", "planrefresh"}:
+            await callback.answer("Открываю контент-план")
+            if callback.message:
+                message_id = (
+                    callback.message.message_id
+                    if action == "planrefresh"
+                    else None
+                )
+                await self._show_content_plan(callback.message.chat.id, message_id)
+            return
+        if action == "targetmenu":
+            await callback.answer("Выбери канал")
+            if callback.message:
+                await self._show_target_channel_menu(callback.message.chat.id)
+            return
+        if action == "targetadd":
+            await callback.answer("Выбор канала отправлен в бот")
+            await self._send_target_channel_picker(callback.from_user.id)
+            return
+        if action == "target":
+            channel_id = int(parts[1])
+            channels = await self._publication_channels()
+            selected = next(
+                (
+                    channel
+                    for channel in channels
+                    if int(channel["chat_id"]) == channel_id
+                ),
+                None,
+            )
+            if not selected:
+                await callback.answer("Канал не найден", show_alert=True)
+                return
+            await self.repository.set_setting("target_chat_id", str(channel_id))
+            title = str(selected.get("title") or selected.get("username") or channel_id)
+            await callback.answer(f"Выбран канал {title}", show_alert=True)
+            if callback.message:
+                await self._show_content_plan(callback.message.chat.id)
+            return
+
         draft_id = int(parts[1])
         draft = await self.repository.get_draft(draft_id)
         if not draft:
@@ -524,10 +865,12 @@ class EditorBot:
                 return
             await callback.answer("Ставлю в расписание")
             await self.schedule_draft(draft_id, callback.from_user.id, scheduled_at)
+            await self._refresh_plan_from_callback(callback)
             return
         if action == "pubnow":
             await callback.answer("Публикую сейчас")
             await self.publish_draft(draft_id, callback.from_user.id)
+            await self._refresh_plan_from_callback(callback)
             return
         if action == "pubnext":
             await callback.answer("Ставлю в расписание")
@@ -538,6 +881,7 @@ class EditorBot:
                 utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
             )
             await self.schedule_draft(draft_id, callback.from_user.id, scheduled_at)
+            await self._refresh_plan_from_callback(callback)
             return
         if action == "pubtime":
             await callback.answer("Жду время в боте")
@@ -559,6 +903,7 @@ class EditorBot:
         if action == "pubunschedule":
             await callback.answer("Снимаю с расписания")
             await self.unschedule_draft(draft_id, callback.from_user.id)
+            await self._refresh_plan_from_callback(callback)
             return
         if action == "pubback":
             await callback.answer("Возвращаю к черновику")
@@ -570,6 +915,45 @@ class EditorBot:
                 )
             return
 
+        if action == "planitem":
+            await callback.answer(f"Открываю пост #{draft_id}")
+            if callback.message:
+                await self._show_plan_item(
+                    callback.message.chat.id,
+                    callback.message.message_id,
+                    draft,
+                )
+            return
+        if action == "planreschedule":
+            await callback.answer("Выбери новое время")
+            occupied = await self.repository.scheduled_publication_times()
+            current_time = self._draft_scheduled_at(draft)
+            if current_time:
+                occupied = [
+                    value
+                    for value in occupied
+                    if int(value.timestamp() // 60)
+                    != int(current_time.timestamp() // 60)
+                ]
+            slots = upcoming_publish_slots(
+                self.settings.publish_schedule_slots,
+                occupied,
+                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+            )
+            keyboard = self._publish_options_keyboard(
+                draft_id,
+                slots=slots,
+                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+                back_callback=f"planitem:{draft_id}",
+            )
+            if callback.message:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                    reply_markup=keyboard,
+                )
+            return
+
         if action == "title":
             await callback.answer("Подбираю новый заголовок")
             await self._run_automatic_edit(
@@ -578,6 +962,7 @@ class EditorBot:
                 "title",
                 "Заголовок обновлен.",
             )
+            await self._refresh_plan_from_callback(callback)
             return
         elif action == "tags":
             await callback.answer("Подбираю новые хэштеги")
@@ -587,6 +972,7 @@ class EditorBot:
                 "hashtags",
                 "Хэштеги обновлены.",
             )
+            await self._refresh_plan_from_callback(callback)
             return
         elif action in {"preview", "media", "image"}:
             await callback.answer("Подбираю другое изображение")
@@ -596,6 +982,7 @@ class EditorBot:
                 "image",
                 "Изображение обновлено.",
             )
+            await self._refresh_plan_from_callback(callback)
             return
         elif action == "sources":
             await self._send_sources(callback.from_user.id, draft)
@@ -606,6 +993,7 @@ class EditorBot:
                 await self.bot.send_message(callback.from_user.id, f"Черновик #{draft_id} переписан.")
             else:
                 await self.bot.send_message(callback.from_user.id, "Не удалось переписать материал.")
+            await self._refresh_plan_from_callback(callback)
             return
         elif action == "publish":
             await callback.answer("Выбери время публикации")
@@ -685,6 +1073,17 @@ class EditorBot:
         await self.bot.send_message(
             user_id,
             f"Черновик #{draft_id}. {success_message}",
+        )
+
+    async def _refresh_plan_from_callback(self, callback: CallbackQuery) -> None:
+        if not callback.message:
+            return
+        text = str(getattr(callback.message, "text", "") or "")
+        if not text.startswith("Контент-план"):
+            return
+        await self._show_content_plan(
+            callback.message.chat.id,
+            callback.message.message_id,
         )
 
     async def deliver_draft(self, draft_id: int) -> None:
@@ -1136,6 +1535,7 @@ class EditorBot:
         slots: list[datetime] | None = None,
         utc_offset_hours: int = 4,
         now: datetime | None = None,
+        back_callback: str | None = None,
     ) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = [
             [
@@ -1175,7 +1575,7 @@ class EditorBot:
                 [
                     InlineKeyboardButton(
                         text="Назад",
-                        callback_data=f"pubback:{draft_id}",
+                        callback_data=back_callback or f"pubback:{draft_id}",
                     ),
                 ],
             ]
@@ -1195,13 +1595,23 @@ class EditorBot:
                     ),
                     InlineKeyboardButton(
                         text="Изменить время",
-                        callback_data=f"pubtime:{draft_id}",
+                        callback_data=f"publish:{draft_id}",
                     ),
                 ],
                 [
                     InlineKeyboardButton(
                         text="Снять с расписания",
                         callback_data=f"pubunschedule:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Контент-план",
+                        callback_data="plan:0",
+                    ),
+                    InlineKeyboardButton(
+                        text="Канал публикации",
+                        callback_data="targetmenu:0",
                     ),
                 ],
             ]
@@ -1234,6 +1644,16 @@ class EditorBot:
                 ],
                 [
                     InlineKeyboardButton(text="Источники", callback_data=f"sources:{draft_id}"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Контент-план",
+                        callback_data="plan:0",
+                    ),
+                    InlineKeyboardButton(
+                        text="Канал публикации",
+                        callback_data="targetmenu:0",
+                    ),
                 ],
             ]
         )

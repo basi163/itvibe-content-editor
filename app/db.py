@@ -417,6 +417,19 @@ class Repository:
                 value = value.replace(tzinfo=UTC)
             return value.astimezone(UTC)
 
+    async def scheduled_drafts(self, limit: int = 50) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT * FROM drafts
+                WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
+                ORDER BY scheduled_at, id
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
+
     async def set_pending_action(self, user_id: int, action: str, draft_id: int) -> None:
         async with self.connect() as db:
             await db.execute(

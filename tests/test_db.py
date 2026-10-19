@@ -129,3 +129,5 @@ async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
     assert [draft["id"] for draft in due] == [draft_id]
     assert future == [scheduled_at]
     assert await repository.next_scheduled_publication() == scheduled_at
+    scheduled_drafts = await repository.scheduled_drafts()
+    assert [draft["id"] for draft in scheduled_drafts] == [draft_id]
