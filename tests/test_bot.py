@@ -132,6 +132,15 @@ def test_target_only_channel_picker_requests_channel_metadata() -> None:
     assert request.request_username is True
 
 
+def test_target_channel_instructions_are_step_by_step() -> None:
+    text = EditorBot._target_channel_instructions(include_picker_note=True)
+
+    assert "1. Открой" in text
+    assert "@itvibe_editor_bot" in text
+    assert "Публикация сообщений" in text
+    assert "системный выбор Telegram" in text
+
+
 def test_parse_publish_time_uses_samara_time_and_rolls_clock_to_tomorrow() -> None:
     now = datetime(2026, 10, 19, 16, 0, tzinfo=UTC)
 

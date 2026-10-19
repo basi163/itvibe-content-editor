@@ -560,6 +560,12 @@ class EditorBot:
                 ],
                 [
                     InlineKeyboardButton(
+                        text="Как добавить канал",
+                        callback_data="targethelp:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
                         text="Контент-план",
                         callback_data="plan:0",
                     )
@@ -576,8 +582,51 @@ class EditorBot:
     async def _send_target_channel_picker(self, user_id: int) -> None:
         await self.bot.send_message(
             user_id,
-            "Добавь бота администратором нужного канала и выбери его кнопкой ниже.",
+            self._target_channel_instructions(),
             reply_markup=self._channel_request_keyboard(target_only=True),
+        )
+
+    async def _show_target_channel_help(self, chat_id: int) -> None:
+        await self.bot.send_message(
+            chat_id,
+            self._target_channel_instructions(include_picker_note=True),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Перейти к выбору канала в боте",
+                            callback_data="targetadd:0",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Каналы публикации",
+                            callback_data="targetmenu:0",
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _target_channel_instructions(*, include_picker_note: bool = False) -> str:
+        picker_note = (
+            "\n\nВажно: системный выбор Telegram откроется в личном чате с ботом."
+            if include_picker_note
+            else ""
+        )
+        return (
+            "<b>Как добавить канал публикации</b>\n\n"
+            "1. Открой нужный Telegram-канал.\n"
+            "2. Открой <b>Управление каналом → Администраторы</b>.\n"
+            "3. Нажми <b>Добавить администратора</b> и найди "
+            "<code>@itvibe_editor_bot</code>.\n"
+            "4. Включи для бота право <b>Публикация сообщений</b> и сохрани изменения.\n"
+            "5. Вернись в чат с ботом и нажми "
+            "<b>Выбрать канал публикации</b>.\n"
+            "6. Выбери канал в системном окне Telegram.\n"
+            "7. Дождись сообщения «Канал публикации переключён». После этого канал появится в контент-плане."
+            f"{picker_note}"
         )
 
     @staticmethod
@@ -825,6 +874,11 @@ class EditorBot:
             await callback.answer("Выбери канал")
             if callback.message:
                 await self._show_target_channel_menu(callback.message.chat.id)
+            return
+        if action == "targethelp":
+            await callback.answer("Открываю инструкцию")
+            if callback.message:
+                await self._show_target_channel_help(callback.message.chat.id)
             return
         if action == "targetadd":
             await callback.answer("Выбор канала отправлен в бот")
