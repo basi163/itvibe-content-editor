@@ -117,6 +117,7 @@ COMPONENT_REWRITE_SYSTEM_PROMPT = """
 
 Если component равен title
 - придумай один новый и заметно отличающийся заголовок;
+- строго соблюдай maximum_title_characters из входных данных;
 - не используй двоеточия, эмодзи, URL и хэштеги;
 - верни JSON {"title": ""}.
 

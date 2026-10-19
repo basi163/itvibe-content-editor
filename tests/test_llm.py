@@ -6,6 +6,7 @@ import pytest
 
 from app.llm import QwenClient
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
+from app.renderer import SIGNATURE_TEXT, validate_post
 
 
 @pytest.mark.asyncio
@@ -145,6 +146,48 @@ async def test_regenerate_title_changes_only_title() -> None:
     assert changed.title == "Новый взгляд на технологию"
     assert changed.body == original.body
     assert changed.hashtags == original.hashtags
+
+
+@pytest.mark.asyncio
+async def test_regenerate_title_fits_available_post_space() -> None:
+    original = GeneratedPost(
+        "Linux меняет изоляцию",
+        "Проверенный текст без изменений.",
+        ["#Linux", "#ядро", "#технологии"],
+    )
+    visible = f"{original.title}\n\n{original.body}\n\n{' '.join(original.hashtags)}"
+    max_post_chars = len(visible) + 2 + len(SIGNATURE_TEXT)
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=max_post_chars,
+    )
+    payloads: list[dict[str, Any]] = []
+
+    async def completion(**kwargs: Any) -> dict[str, Any]:
+        payloads.append(json.loads(kwargs["user"]))
+        return {"title": "Совершенно новый и слишком длинный заголовок о Linux"}
+
+    client._completion = completion  # type: ignore[method-assign]
+    try:
+        changed = await client.regenerate_component(
+            "title",
+            StoryCandidate("solidot_rss", "", "Original", ""),
+            [SourceDocument(url="https://example.org", title="Official")],
+            TriageDecision(True, 0.9, "technology", "relevant"),
+            original,
+        )
+    finally:
+        await client.client.close()
+
+    assert payloads[0]["maximum_title_characters"] == len(original.title)
+    assert changed.title != original.title
+    assert len(changed.title) <= len(original.title)
+    assert changed.body == original.body
+    assert changed.hashtags == original.hashtags
+    assert validate_post(changed, max_post_chars) == []
 
 
 @pytest.mark.asyncio

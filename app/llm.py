@@ -14,9 +14,40 @@ from app.prompts import (
     TRIAGE_SYSTEM_PROMPT,
     render_writer_system_prompt,
 )
-from app.renderer import SIGNATURE_TEXT, normalize_generated_post, validate_post
+from app.renderer import (
+    SIGNATURE_TEXT,
+    normalize_body_spacing,
+    normalize_generated_post,
+    validate_post,
+    visible_body,
+)
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def _title_character_limit(post: GeneratedPost, max_post_chars: int) -> int:
+    """Return the title budget while leaving every other post component unchanged."""
+    body = visible_body(normalize_body_spacing(post.body))
+    hashtags = " ".join(tag.strip() for tag in post.hashtags)
+    fixed_length = len(body) + len(hashtags) + len(SIGNATURE_TEXT) + 6
+    return max(0, max_post_chars - fixed_length)
+
+
+def _fit_title_to_limit(title: str, limit: int) -> str:
+    if len(title) <= limit:
+        return title
+    if limit <= 0:
+        return ""
+    if limit == 1:
+        return title[:1]
+
+    candidate = title[: limit - 1].rstrip()
+    if " " in candidate:
+        word_boundary = candidate.rsplit(" ", 1)[0].rstrip(".,;!?—- ")
+        if word_boundary:
+            candidate = word_boundary
+    candidate = candidate.rstrip(".,;!?—- ")
+    return f"{candidate}…" if candidate else title[:limit]
 
 
 def _parse_json(content: str) -> dict[str, Any]:
@@ -232,6 +263,7 @@ class QwenClient:
         if component not in {"title", "hashtags"}:
             raise ValueError(f"Unsupported post component: {component}")
 
+        title_character_limit = _title_character_limit(post, self.max_post_chars)
         remaining: list[str] = []
         for _ in range(3):
             payload = {
@@ -242,6 +274,7 @@ class QwenClient:
                 "sources": _source_payload(sources, per_source_chars=3000),
                 "previous_errors": remaining,
                 "maximum_visible_characters": self.max_post_chars,
+                "maximum_title_characters": title_character_limit,
             }
             data = await self._completion(
                 model=self.writer_model,
@@ -268,7 +301,8 @@ class QwenClient:
 
             normalized = normalize_generated_post(proposal, self.max_post_chars)
             if component == "title":
-                proposal = GeneratedPost(normalized.title, post.body, post.hashtags)
+                fitted_title = _fit_title_to_limit(normalized.title, title_character_limit)
+                proposal = GeneratedPost(fitted_title, post.body, post.hashtags)
                 changed = proposal.title.casefold() != post.title.casefold()
             else:
                 proposal = GeneratedPost(post.title, post.body, normalized.hashtags)
