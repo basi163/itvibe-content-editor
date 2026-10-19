@@ -147,6 +147,46 @@ def next_publish_slot(
     raise RuntimeError("Не удалось найти свободное окно публикации")
 
 
+def upcoming_publish_slots(
+    slots: tuple[int, ...],
+    occupied: list[datetime],
+    *,
+    utc_offset_hours: int,
+    count: int = 6,
+    now: datetime | None = None,
+) -> list[datetime]:
+    upcoming: list[datetime] = []
+    reserved = list(occupied)
+    for _ in range(count):
+        candidate = next_publish_slot(
+            slots,
+            reserved,
+            utc_offset_hours=utc_offset_hours,
+            now=now,
+        )
+        upcoming.append(candidate)
+        reserved.append(candidate)
+    return upcoming
+
+
+def publish_slot_label(
+    value: datetime,
+    *,
+    utc_offset_hours: int,
+    now: datetime | None = None,
+) -> str:
+    local_tz = _publish_timezone(utc_offset_hours)
+    current_date = (now or datetime.now(UTC)).astimezone(local_tz).date()
+    local = value.astimezone(local_tz)
+    if local.date() == current_date:
+        prefix = "Сегодня"
+    elif local.date() == current_date + timedelta(days=1):
+        prefix = "Завтра"
+    else:
+        prefix = f"{local:%d.%m}"
+    return f"{prefix} {local:%H:%M}"
+
+
 class EditorBot:
     def __init__(
         self,
@@ -457,16 +497,34 @@ class EditorBot:
         if not callback.from_user or not await self._is_owner(callback.from_user.id):
             await callback.answer("Недостаточно прав", show_alert=True)
             return
-        action, _, value = (callback.data or "").partition(":")
-        if not value.isdigit():
+        parts = (callback.data or "").split(":")
+        action = parts[0]
+        is_slot_action = action == "pubslot"
+        valid = (
+            len(parts) == 3
+            and parts[1].isdigit()
+            and parts[2].isdigit()
+            if is_slot_action
+            else len(parts) == 2 and parts[1].isdigit()
+        )
+        if not valid:
             await callback.answer("Некорректная команда", show_alert=True)
             return
-        draft_id = int(value)
+        draft_id = int(parts[1])
         draft = await self.repository.get_draft(draft_id)
         if not draft:
             await callback.answer("Черновик не найден", show_alert=True)
             return
 
+        if action == "pubslot":
+            try:
+                scheduled_at = datetime.fromtimestamp(int(parts[2]), UTC)
+            except (OverflowError, OSError, ValueError):
+                await callback.answer("Некорректное время", show_alert=True)
+                return
+            await callback.answer("Ставлю в расписание")
+            await self.schedule_draft(draft_id, callback.from_user.id, scheduled_at)
+            return
         if action == "pubnow":
             await callback.answer("Публикую сейчас")
             await self.publish_draft(draft_id, callback.from_user.id)
@@ -501,6 +559,15 @@ class EditorBot:
         if action == "pubunschedule":
             await callback.answer("Снимаю с расписания")
             await self.unschedule_draft(draft_id, callback.from_user.id)
+            return
+        if action == "pubback":
+            await callback.answer("Возвращаю к черновику")
+            if callback.message:
+                await self.bot.edit_message_reply_markup(
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                    reply_markup=self._editor_keyboard(draft),
+                )
             return
 
         if action == "title":
@@ -542,10 +609,33 @@ class EditorBot:
             return
         elif action == "publish":
             await callback.answer("Выбери время публикации")
+            occupied = await self.repository.scheduled_publication_times()
+            slots = upcoming_publish_slots(
+                self.settings.publish_schedule_slots,
+                occupied,
+                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+            )
+            keyboard = self._publish_options_keyboard(
+                draft_id,
+                slots=slots,
+                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+            )
+            if callback.message:
+                try:
+                    await self.bot.edit_message_reply_markup(
+                        chat_id=callback.message.chat.id,
+                        message_id=callback.message.message_id,
+                        reply_markup=keyboard,
+                    )
+                except TelegramBadRequest:
+                    logger.exception(
+                        "Could not show publication menu in editor channel for draft %s",
+                        draft_id,
+                    )
             await self.bot.send_message(
                 callback.from_user.id,
                 f"Когда опубликовать черновик #{draft_id}?",
-                reply_markup=self._publish_options_keyboard(draft_id),
+                reply_markup=keyboard,
             )
             return
         elif action == "skip":
@@ -1040,26 +1130,58 @@ class EditorBot:
         return cls._draft_keyboard(draft_id)
 
     @staticmethod
-    def _publish_options_keyboard(draft_id: int) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
+    def _publish_options_keyboard(
+        draft_id: int,
+        *,
+        slots: list[datetime] | None = None,
+        utc_offset_hours: int = 4,
+        now: datetime | None = None,
+    ) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    text="Сейчас",
+                    callback_data=f"pubnow:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Следующее окно",
+                    callback_data=f"pubnext:{draft_id}",
+                ),
+            ],
+        ]
+        slot_buttons = [
+            InlineKeyboardButton(
+                text=publish_slot_label(
+                    value,
+                    utc_offset_hours=utc_offset_hours,
+                    now=now,
+                ),
+                callback_data=f"pubslot:{draft_id}:{int(value.timestamp())}",
+            )
+            for value in slots or []
+        ]
+        rows.extend(
+            slot_buttons[index : index + 2]
+            for index in range(0, len(slot_buttons), 2)
+        )
+        rows.extend(
+            [
                 [
                     InlineKeyboardButton(
-                        text="Сейчас",
-                        callback_data=f"pubnow:{draft_id}",
-                    ),
-                    InlineKeyboardButton(
-                        text="Следующее окно",
-                        callback_data=f"pubnext:{draft_id}",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Указать время",
+                        text="Указать другое время",
                         callback_data=f"pubtime:{draft_id}",
                     ),
                 ],
+                [
+                    InlineKeyboardButton(
+                        text="Назад",
+                        callback_data=f"pubback:{draft_id}",
+                    ),
+                ],
             ]
+        )
+        return InlineKeyboardMarkup(
+            inline_keyboard=rows,
         )
 
     @staticmethod

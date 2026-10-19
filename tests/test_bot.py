@@ -3,7 +3,13 @@ from datetime import UTC, datetime
 import pytest
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 
-from app.bot import EditorBot, next_publish_slot, parse_publish_time
+from app.bot import (
+    EditorBot,
+    next_publish_slot,
+    parse_publish_time,
+    publish_slot_label,
+    upcoming_publish_slots,
+)
 
 
 def test_rich_photo_is_embedded_in_one_message() -> None:
@@ -44,7 +50,22 @@ def test_publish_keyboard_offers_now_next_slot_and_custom_time() -> None:
         for button in row
     }
 
-    assert callbacks == {"pubnow:7", "pubnext:7", "pubtime:7"}
+    assert callbacks == {"pubnow:7", "pubnext:7", "pubtime:7", "pubback:7"}
+
+
+def test_publish_keyboard_offers_direct_editor_channel_slots() -> None:
+    now = datetime(2026, 10, 19, 10, 0, tzinfo=UTC)
+    slots = [
+        datetime(2026, 10, 19, 11, 0, tzinfo=UTC),
+        datetime(2026, 10, 19, 14, 0, tzinfo=UTC),
+    ]
+
+    keyboard = EditorBot._publish_options_keyboard(7, slots=slots, now=now)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert any(button.text == "Сегодня 15:00" for button in buttons)
+    assert any(button.text == "Сегодня 18:00" for button in buttons)
+    assert "pubslot:7:1792407600" in {button.callback_data for button in buttons}
 
 
 def test_scheduled_keyboard_can_publish_reschedule_or_cancel() -> None:
@@ -99,3 +120,32 @@ def test_next_publish_slot_skips_past_and_occupied_slots() -> None:
     )
 
     assert scheduled == datetime(2026, 10, 19, 14, 0, tzinfo=UTC)
+
+
+def test_upcoming_publish_slots_are_unique_and_skip_occupied() -> None:
+    now = datetime(2026, 10, 19, 10, 30, tzinfo=UTC)
+    occupied = [datetime(2026, 10, 19, 11, 0, tzinfo=UTC)]
+
+    scheduled = upcoming_publish_slots(
+        (9 * 60, 15 * 60, 18 * 60),
+        occupied,
+        utc_offset_hours=4,
+        count=3,
+        now=now,
+    )
+
+    assert scheduled == [
+        datetime(2026, 10, 19, 14, 0, tzinfo=UTC),
+        datetime(2026, 10, 20, 5, 0, tzinfo=UTC),
+        datetime(2026, 10, 20, 11, 0, tzinfo=UTC),
+    ]
+
+
+def test_publish_slot_label_uses_local_day() -> None:
+    now = datetime(2026, 10, 19, 10, 0, tzinfo=UTC)
+
+    assert publish_slot_label(
+        datetime(2026, 10, 20, 5, 0, tzinfo=UTC),
+        utc_offset_hours=4,
+        now=now,
+    ) == "Завтра 09:00"
