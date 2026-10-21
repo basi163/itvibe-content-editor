@@ -522,6 +522,12 @@ class EditorBot:
                         callback_data="targetmenu:0",
                     )
                 ],
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Обновить статус",
+                        callback_data="home:0",
+                    )
+                ],
             ]
         )
 
@@ -532,14 +538,78 @@ class EditorBot:
         message_id: int | None = None,
     ) -> None:
         unpublished_count = await self.repository.unpublished_draft_count()
-        target_label = await self._target_channel_label()
-        text = (
-            "<b>🏠 Главное меню</b>\n\n"
-            f"Неопубликованных постов: <b>{unpublished_count}</b>\n"
-            f"Каналы: <b>{html.escape(target_label)}</b>\n\n"
-            "Выбери раздел. На каждом следующем экране есть "
-            "кнопка возврата."
+        stats = await self.repository.stats()
+        scheduled = await self.repository.scheduled_publications_by_channel()
+        channels = await self._publication_channels()
+        selected = set(await self._selected_publication_channel_ids())
+        channel_titles = {
+            int(channel["chat_id"]): str(
+                channel.get("title")
+                or channel.get("username")
+                or channel["chat_id"]
+            )
+            for channel in channels
+        }
+        channel_ids = list(channel_titles)
+        channel_ids.extend(
+            channel_id
+            for channel_id in sorted(scheduled)
+            if channel_id not in channel_titles
         )
+        for channel_id in channel_ids:
+            if channel_id not in channel_titles:
+                channel_titles[channel_id] = await self._channel_label(channel_id)
+
+        scheduled_total = sum(len(values) for values in scheduled.values())
+        scheduled_channel_count = sum(bool(values) for values in scheduled.values())
+        lines = [
+            "<b>🏠 Главное меню</b>",
+            (
+                "<b>Текущий статус</b>\n"
+                f"Неопубликовано: <b>{unpublished_count}</b>\n"
+                "Опубликовано постов всего: "
+                f"<b>{stats.get('drafts_published', 0)}</b>\n"
+                f"Запланировано публикаций: <b>{scheduled_total}</b>\n"
+                f"Каналов с планом: <b>{scheduled_channel_count}</b>"
+            ),
+        ]
+        if scheduled_total:
+            next_at = min(values[0] for values in scheduled.values() if values)
+            next_channels = [
+                channel_titles[channel_id]
+                for channel_id, values in scheduled.items()
+                if values and values[0] == next_at
+            ]
+            lines.append(
+                "<b>Ближайшая публикация</b>\n"
+                f"{format_publish_time(next_at, self.settings.publish_schedule_utc_offset_hours)}\n"
+                f"Канал: <b>{html.escape(', '.join(next_channels))}</b>"
+            )
+        else:
+            lines.append("<b>Ближайшая публикация</b>\nНет запланированных постов.")
+
+        channel_lines = ["<b>По каналам</b>"]
+        for channel_id in channel_ids:
+            values = scheduled.get(channel_id, [])
+            next_text = (
+                format_publish_time(
+                    values[0],
+                    self.settings.publish_schedule_utc_offset_hours,
+                )
+                if values
+                else "нет"
+            )
+            marker = "🟢" if channel_id in selected else "⚪️"
+            channel_lines.append(
+                f"{marker} <b>{html.escape(channel_titles[channel_id])}</b>\n"
+                f"Запланировано: <b>{len(values)}</b> · "
+                f"следующая: <b>{next_text}</b>"
+            )
+        if len(channel_lines) == 1:
+            channel_lines.append("Каналы публикации ещё не добавлены.")
+        lines.append("\n\n".join(channel_lines))
+        lines.append("Выбери раздел:")
+        text = "\n\n".join(lines)
         keyboard = self._home_keyboard(unpublished_count)
         if message_id is not None:
             try:

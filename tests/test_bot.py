@@ -116,7 +116,14 @@ def test_home_keyboard_opens_every_main_section() -> None:
     callbacks = {button.callback_data for button in buttons}
 
     assert "🗂 Неопубликованные — 23" in labels
-    assert callbacks == {"unpublished:0", "plan:0", "schedule:0", "targetmenu:0"}
+    assert "🔄 Обновить статус" in labels
+    assert callbacks == {
+        "home:0",
+        "unpublished:0",
+        "plan:0",
+        "schedule:0",
+        "targetmenu:0",
+    }
 
 
 @pytest.mark.asyncio
@@ -141,6 +148,50 @@ async def test_home_callback_replaces_service_screen_in_place() -> None:
         -1009876543210,
         message_id=55,
     )
+
+
+@pytest.mark.asyncio
+async def test_home_menu_shows_publication_status_for_each_channel() -> None:
+    editor = object.__new__(EditorBot)
+    first_at = datetime(2026, 10, 22, 8, 10, tzinfo=UTC)
+    second_at = datetime(2026, 10, 22, 16, 10, tzinfo=UTC)
+    editor.repository = SimpleNamespace(
+        unpublished_draft_count=AsyncMock(return_value=5),
+        stats=AsyncMock(return_value={"drafts_published": 17}),
+        scheduled_publications_by_channel=AsyncMock(
+            return_value={
+                -1001: [first_at, second_at],
+                -1002: [second_at],
+            }
+        ),
+    )
+    editor._publication_channels = AsyncMock(
+        return_value=[
+            {"chat_id": -1001, "title": "IT Vibe News"},
+            {"chat_id": -1002, "title": "Business Vibe"},
+        ]
+    )
+    editor._selected_publication_channel_ids = AsyncMock(
+        return_value=[-1001, -1002]
+    )
+    editor.settings = SimpleNamespace(publish_schedule_utc_offset_hours=4)
+    editor.bot = SimpleNamespace(
+        edit_message_text=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+
+    await editor._show_home_menu(-1009876543210)
+
+    text = editor.bot.send_message.await_args.args[1]
+    assert "Неопубликовано: <b>5</b>" in text
+    assert "Опубликовано постов всего: <b>17</b>" in text
+    assert "Запланировано публикаций: <b>3</b>" in text
+    assert "Каналов с планом: <b>2</b>" in text
+    assert "IT Vibe News" in text
+    assert "Business Vibe" in text
+    assert "22.10.2026 12:10 (UTC+4)" in text
+    assert "Запланировано: <b>2</b>" in text
+    assert "Запланировано: <b>1</b>" in text
 
 
 def test_content_plan_keyboard_opens_posts_and_channel_settings() -> None:

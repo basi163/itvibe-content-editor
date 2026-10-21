@@ -248,12 +248,14 @@ async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
         now,
         target_chat_id=-1002,
     )
+    by_channel = await repository.scheduled_publications_by_channel()
 
     assert [draft["id"] for draft in due] == [draft_id]
     assert due[0]["publication_target_chat_id"] == -1001
     assert future == [first_at, second_at]
     assert target_future == [first_at]
     assert second_target_future == [second_at]
+    assert by_channel == {-1001: [first_at], -1002: [second_at]}
     assert await repository.next_scheduled_publication() == first_at
     scheduled_drafts = await repository.scheduled_drafts()
     assert [draft["id"] for draft in scheduled_drafts] == [draft_id]

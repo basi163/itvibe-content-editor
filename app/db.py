@@ -465,6 +465,36 @@ class Repository:
             )
             return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
 
+    async def scheduled_publications_by_channel(
+        self,
+    ) -> dict[int, list[datetime]]:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT * FROM drafts WHERE status = 'scheduled'"
+            )
+            result: dict[int, list[datetime]] = {}
+            for row in await cursor.fetchall():
+                draft = self._decode_draft(dict(row))
+                for publication in draft["publications"]:
+                    if publication.get("status") != "scheduled":
+                        continue
+                    try:
+                        channel_id = int(publication["target_chat_id"])
+                        scheduled_at = datetime.fromisoformat(
+                            str(publication.get("scheduled_at") or "")
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    result.setdefault(channel_id, []).append(
+                        scheduled_at.astimezone(UTC)
+                    )
+            return {
+                channel_id: sorted(values)
+                for channel_id, values in result.items()
+            }
+
     async def set_navigation_context(
         self,
         user_id: int,
