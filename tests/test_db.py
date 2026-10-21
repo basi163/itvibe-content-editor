@@ -89,6 +89,45 @@ async def test_unpublished_queue_and_navigation_context(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_existing_edited_drafts_are_backfilled_once(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    draft_id = await repository.create_draft(
+        origin_type="test",
+        origin_ref="story",
+        title="Заголовок",
+        body="Текст",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+        sources=[],
+        media=[],
+        material={},
+        triage={},
+    )
+    created_at = datetime(2026, 10, 21, 10, 0, tzinfo=UTC).isoformat()
+    updated_at = datetime(2026, 10, 21, 10, 2, tzinfo=UTC).isoformat()
+    async with repository.connect() as db:
+        await db.execute(
+            """
+            UPDATE drafts
+            SET editor_chat_id = ?, editor_message_id = ?,
+                created_at = ?, updated_at = ?, editor_touched_at = NULL
+            WHERE id = ?
+            """,
+            (-1001234567890, 55, created_at, updated_at, draft_id),
+        )
+        await db.execute(
+            "DELETE FROM settings WHERE key = 'editor_touched_backfill_v1'"
+        )
+        await db.commit()
+
+    await repository.initialize()
+    draft = await repository.get_draft(draft_id)
+
+    assert draft is not None
+    assert draft["editor_touched_at"] == updated_at
+
+
+@pytest.mark.asyncio
 async def test_first_user_claims_owner(tmp_path: Path) -> None:
     repository = Repository(tmp_path / "editor.sqlite3")
     await repository.initialize()

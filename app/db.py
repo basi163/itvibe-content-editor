@@ -131,6 +131,31 @@ class Repository:
                     await db.execute(
                         f"ALTER TABLE drafts ADD COLUMN {column} {definition}"
                     )
+            touched_backfill = await self._fetchone(
+                db,
+                "SELECT 1 FROM settings WHERE key = 'editor_touched_backfill_v1'",
+            )
+            if not touched_backfill:
+                await db.execute(
+                    """
+                    UPDATE drafts
+                    SET editor_touched_at = updated_at
+                    WHERE editor_touched_at IS NULL
+                      AND editor_message_id IS NOT NULL
+                      AND status IN ('draft', 'scheduled')
+                      AND (
+                          strftime('%s', updated_at)
+                          - strftime('%s', created_at)
+                      ) >= 60
+                    """
+                )
+                await db.execute(
+                    """
+                    INSERT INTO settings(key, value, updated_at)
+                    VALUES ('editor_touched_backfill_v1', 'done', ?)
+                    """,
+                    (_now(),),
+                )
             cursor = await db.execute(
                 """
                 SELECT id, target_chat_id, target_message_id, scheduled_at,
