@@ -141,6 +141,7 @@ class QwenClient:
             score=max(0.0, min(1.0, float(data.get("score", 0)))),
             category=str(data.get("category", "")).strip(),
             reason=str(data.get("reason", "")).strip(),
+            industry_critical=bool(data.get("industry_critical", False)),
             primary_source_index=max(0, int(data.get("primary_source_index", 0))),
             linkable_source_indices=[
                 int(item)

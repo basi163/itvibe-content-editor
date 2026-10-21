@@ -48,6 +48,70 @@ def test_telegram_public_image_is_available_to_the_existing_media_pipeline() -> 
 
 
 @pytest.mark.asyncio
+async def test_industry_critical_story_bypasses_threshold_and_is_marked() -> None:
+    class Extractor:
+        async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:
+            return []
+
+    class Llm:
+        async def triage(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+        ) -> TriageDecision:
+            return TriageDecision(
+                relevant=False,
+                score=0.2,
+                category="security",
+                reason="Critical update for widely used infrastructure",
+                industry_critical=True,
+            )
+
+        async def generate(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+        ) -> GeneratedPost:
+            assert triage.relevant is True
+            assert triage.score == 0.72
+            return GeneratedPost(
+                "PHP закрывает критические уязвимости",
+                "Разработчики выпустили срочное обновление.",
+                ["#PHP", "#безопасность", "#обновление"],
+            )
+
+    class Repository:
+        created: dict[str, object] | None = None
+
+        async def create_draft(self, **kwargs: object) -> int:
+            self.created = kwargs
+            return 45
+
+    repository = Repository()
+    pipeline = ContentPipeline(
+        settings=SimpleNamespace(relevance_threshold=0.72, max_post_chars=2000),
+        repository=repository,
+        extractor=Extractor(),
+        llm=Llm(),
+    )
+    candidate = StoryCandidate(
+        "telegram_web",
+        "https://t.me/example/1",
+        "Critical PHP update",
+        "Install the security update",
+        media_urls=["https://images.example/php.jpg"],
+    )
+
+    assert await pipeline._process(candidate) == 45
+    assert repository.created is not None
+    assert repository.created["title"] == "⚡️ PHP закрывает критические уязвимости"
+    triage = repository.created["triage"]
+    assert isinstance(triage, dict)
+    assert triage["industry_critical"] is True
+
+
+@pytest.mark.asyncio
 async def test_story_without_image_is_not_created() -> None:
     class Extractor:
         async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:

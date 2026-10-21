@@ -219,6 +219,26 @@ def test_validation_rejects_visible_url() -> None:
     assert any("URL" in error for error in validate_post(post, 2000))
 
 
+def test_validation_allows_one_leading_industry_alert_marker() -> None:
+    post = GeneratedPost(
+        "⚡️ PHP закрывает критические уязвимости",
+        "Разработчики рекомендуют срочно установить обновление.",
+        ["#PHP", "#безопасность", "#обновление"],
+    )
+
+    assert validate_post(post, 2000) == []
+
+
+def test_validation_rejects_industry_alert_marker_inside_body() -> None:
+    post = GeneratedPost(
+        "PHP закрывает критические уязвимости",
+        "Разработчики рекомендуют ⚡️ срочно установить обновление.",
+        ["#PHP", "#безопасность", "#обновление"],
+    )
+
+    assert any("эмодзи" in error.casefold() for error in validate_post(post, 2000))
+
+
 @pytest.mark.parametrize(
     "post,error",
     [

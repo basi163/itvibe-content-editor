@@ -17,7 +17,7 @@ from app.extractor import (
 )
 from app.llm import QwenClient
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
-from app.renderer import render_post
+from app.renderer import mark_industry_alert, normalize_generated_post, render_post
 
 logger = logging.getLogger(__name__)
 DraftDelivery = Callable[[int], Awaitable[None]]
@@ -99,6 +99,9 @@ class ContentPipeline:
         elif candidate.text and not sources[0].text:
             sources[0].text = candidate.text
         triage = await self.llm.triage(candidate, sources)
+        if triage.industry_critical:
+            triage.relevant = True
+            triage.score = max(triage.score, self.settings.relevance_threshold)
         if not triage.relevant or triage.score < self.settings.relevance_threshold:
             logger.info(
                 "Story rejected with score %.2f (%s): %s",
@@ -121,6 +124,9 @@ class ContentPipeline:
         ]
 
         post = await self.llm.generate(candidate, sources, triage)
+        if triage.industry_critical:
+            post.title = mark_industry_alert(post.title)
+            post = normalize_generated_post(post, self.settings.max_post_chars)
         render_post(post, sources, self.settings.max_post_chars)
         media = self._media_candidates(candidate, sources, triage)
         if not media:
@@ -190,6 +196,9 @@ class ContentPipeline:
         sources = [SourceDocument.from_dict(item) for item in draft["material"]["sources"]]
         triage = TriageDecision.from_dict(draft["triage"])
         post = await self.llm.generate(candidate, sources, triage)
+        if triage.industry_critical:
+            post.title = mark_industry_alert(post.title)
+            post = normalize_generated_post(post, self.settings.max_post_chars)
         render_post(post, sources, self.settings.max_post_chars)
         await self.repository.update_draft(
             draft_id,
@@ -214,6 +223,9 @@ class ContentPipeline:
             triage,
             current,
         )
+        if component == "title" and triage.industry_critical:
+            post.title = mark_industry_alert(post.title)
+            post = normalize_generated_post(post, self.settings.max_post_chars)
         render_post(post, sources, self.settings.max_post_chars)
         if component == "title":
             await self.repository.update_draft(draft_id, title=post.title)

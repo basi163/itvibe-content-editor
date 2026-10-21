@@ -10,6 +10,48 @@ from app.renderer import SIGNATURE_TEXT, validate_post
 
 
 @pytest.mark.asyncio
+async def test_triage_reads_industry_critical_flag() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        return {
+            "relevant": True,
+            "score": 0.91,
+            "category": "security",
+            "reason": "Urgent PHP security update",
+            "industry_critical": True,
+            "primary_source_index": 0,
+            "linkable_source_indices": [],
+            "facts": ["Two critical vulnerabilities were fixed"],
+            "uncertainties": [],
+        }
+
+    client._completion = completion  # type: ignore[method-assign]
+    try:
+        decision = await client.triage(
+            StoryCandidate("telegram_web", "https://t.me/example/1", "PHP", "Update"),
+            [
+                SourceDocument(
+                    url="https://www.php.net/",
+                    title="PHP update",
+                    text="Install immediately",
+                )
+            ],
+        )
+    finally:
+        await client.client.close()
+
+    assert decision.industry_critical is True
+    assert decision.relevant is True
+
+
+@pytest.mark.asyncio
 async def test_repair_retries_until_post_is_valid() -> None:
     client = QwenClient(
         api_key="test",

@@ -48,6 +48,7 @@ class TriageDecision:
     score: float
     category: str
     reason: str
+    industry_critical: bool = False
     primary_source_index: int = 0
     linkable_source_indices: list[int] = field(default_factory=list)
     facts: list[str] = field(default_factory=list)

@@ -61,6 +61,8 @@ META_LEAD_IN_RE = re.compile(
 
 SIGNATURE_TEXT = "🔳 IT Vibe News"
 SIGNATURE_URL = "https://t.me/+u5H6mukl7zg4NzZi"
+INDUSTRY_ALERT_MARKER = "⚡️"
+INDUSTRY_ALERT_RE = re.compile(r"^\s*⚡(?:\ufe0f)?\s*")
 
 
 @dataclass
@@ -78,6 +80,11 @@ def _safe_url(url: str) -> bool:
 
 def visible_body(body: str) -> str:
     return SOURCE_MARKER_RE.sub(lambda match: match.group(2), body)
+
+
+def mark_industry_alert(title: str) -> str:
+    clean_title = INDUSTRY_ALERT_RE.sub("", title.strip(), count=1).strip()
+    return f"{INDUSTRY_ALERT_MARKER} {clean_title}"
 
 
 def normalize_body_spacing(body: str) -> str:
@@ -172,7 +179,15 @@ def _truncate_plain_text(value: str, limit: int) -> str:
 
 def normalize_generated_post(post: GeneratedPost, max_chars: int) -> GeneratedPost:
     """Deterministically repair formal style violations without inventing facts."""
-    title = _clean_visible_fragment(post.title).strip()
+    has_industry_alert = bool(INDUSTRY_ALERT_RE.match(post.title))
+    raw_title = (
+        INDUSTRY_ALERT_RE.sub("", post.title, count=1)
+        if has_industry_alert
+        else post.title
+    )
+    title = _clean_visible_fragment(raw_title).strip()
+    if has_industry_alert:
+        title = mark_industry_alert(title)
     body = _clean_body(post.body)
     hashtags = _clean_hashtags(post.hashtags)
 
@@ -237,7 +252,9 @@ def validate_post(
         errors.append("Пустой основной текст")
     if ":" in visible or "：" in visible:
         errors.append("В видимом тексте есть двоеточие")
-    if EMOJI_RE.search(visible):
+    emoji_checked_title = INDUSTRY_ALERT_RE.sub("", title, count=1)
+    emoji_checked_visible = f"{emoji_checked_title}\n\n{body}\n\n{' '.join(hashtags)}"
+    if EMOJI_RE.search(emoji_checked_visible):
         errors.append("В тексте есть эмодзи")
     if visible.count("—") > 3:
         errors.append("Слишком много длинных тире")
