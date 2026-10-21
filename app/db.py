@@ -372,19 +372,33 @@ class Repository:
     async def scheduled_publication_times(
         self,
         after: datetime | None = None,
+        target_chat_id: int | None = None,
     ) -> list[datetime]:
         current = (after or datetime.now(UTC)).astimezone(UTC).isoformat()
         async with self.connect() as db:
-            cursor = await db.execute(
-                """
-                SELECT scheduled_at FROM drafts
-                WHERE status = 'scheduled'
-                  AND scheduled_at IS NOT NULL
-                  AND scheduled_at > ?
-                ORDER BY scheduled_at
-                """,
-                (current,),
-            )
+            if target_chat_id is None:
+                cursor = await db.execute(
+                    """
+                    SELECT scheduled_at FROM drafts
+                    WHERE status = 'scheduled'
+                      AND scheduled_at IS NOT NULL
+                      AND scheduled_at > ?
+                    ORDER BY scheduled_at
+                    """,
+                    (current,),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT scheduled_at FROM drafts
+                    WHERE status = 'scheduled'
+                      AND scheduled_at IS NOT NULL
+                      AND scheduled_at > ?
+                      AND (target_chat_id = ? OR target_chat_id IS NULL)
+                    ORDER BY scheduled_at
+                    """,
+                    (current, target_chat_id),
+                )
             values: list[datetime] = []
             for row in await cursor.fetchall():
                 try:

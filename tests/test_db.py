@@ -119,15 +119,26 @@ async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
     await repository.update_draft(
         draft_id,
         status="scheduled",
+        target_chat_id=-1001,
         scheduled_at=scheduled_at.isoformat(),
     )
 
     assert await repository.due_scheduled_drafts(now) == []
     due = await repository.due_scheduled_drafts(now + timedelta(minutes=11))
     future = await repository.scheduled_publication_times(now)
+    target_future = await repository.scheduled_publication_times(
+        now,
+        target_chat_id=-1001,
+    )
+    other_target_future = await repository.scheduled_publication_times(
+        now,
+        target_chat_id=-1002,
+    )
 
     assert [draft["id"] for draft in due] == [draft_id]
     assert future == [scheduled_at]
+    assert target_future == [scheduled_at]
+    assert other_target_future == []
     assert await repository.next_scheduled_publication() == scheduled_at
     scheduled_drafts = await repository.scheduled_drafts()
     assert [draft["id"] for draft in scheduled_drafts] == [draft_id]

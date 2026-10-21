@@ -45,6 +45,17 @@ TARGET_REQUEST_ID = 102
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 MAX_SCHEDULE_ATTEMPTS = 3
 PUBLICATION_CHANNELS_SETTING = "publication_channels"
+PUBLICATION_SCHEDULES_SETTING = "publication_schedules"
+WEEKDAY_NAMES = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+WEEKDAY_SHORT_NAMES = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 
 
 def _publish_timezone(utc_offset_hours: int) -> timezone:
@@ -148,6 +159,96 @@ def next_publish_slot(
     raise RuntimeError("Не удалось найти свободное окно публикации")
 
 
+def parse_clock_minutes(value: str) -> int:
+    cleaned = re.sub(r"\s+", "", value)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", cleaned)
+    if match is None:
+        match = re.fullmatch(r"(\d{2})(\d{2})", cleaned)
+    if match is None:
+        raise ValueError("Время нужно указать в формате ЧЧ:ММ или ЧЧММ")
+    hour, minute = (int(part) for part in match.groups())
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError("Укажи корректное время от 00:00 до 23:59")
+    return hour * 60 + minute
+
+
+def format_clock_minutes(value: int) -> str:
+    return f"{value // 60:02d}:{value % 60:02d}"
+
+
+def parse_interval_minutes(value: str) -> int:
+    cleaned = value.strip()
+    if ":" in cleaned:
+        parts = cleaned.split(":", 1)
+        if not all(part.isdigit() for part in parts):
+            raise ValueError("Интервал нужно указать в минутах или как ЧЧ:ММ")
+        hours, minutes = (int(part) for part in parts)
+        interval = hours * 60 + minutes
+    elif cleaned.isdigit():
+        interval = int(cleaned)
+    else:
+        raise ValueError("Интервал нужно указать в минутах или как ЧЧ:ММ")
+    if not 15 <= interval <= 12 * 60:
+        raise ValueError("Интервал должен быть от 15 минут до 12 часов")
+    return interval
+
+
+def next_weekly_publish_slot(
+    weekly_slots: dict[int, tuple[int, ...]],
+    occupied: list[datetime],
+    *,
+    utc_offset_hours: int,
+    now: datetime | None = None,
+) -> datetime:
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    local_tz = _publish_timezone(utc_offset_hours)
+    local_now = current.astimezone(local_tz)
+    occupied_minutes = {
+        int(value.astimezone(UTC).timestamp() // 60)
+        for value in occupied
+    }
+    for day_shift in range(367):
+        target_date = local_now.date() + timedelta(days=day_shift)
+        for minute_of_day in weekly_slots.get(target_date.weekday(), ()):
+            candidate = datetime(
+                target_date.year,
+                target_date.month,
+                target_date.day,
+                minute_of_day // 60,
+                minute_of_day % 60,
+                tzinfo=local_tz,
+            ).astimezone(UTC)
+            if candidate <= current:
+                continue
+            if int(candidate.timestamp() // 60) not in occupied_minutes:
+                return candidate
+    raise RuntimeError("В расписании канала нет свободных окон")
+
+
+def upcoming_weekly_publish_slots(
+    weekly_slots: dict[int, tuple[int, ...]],
+    occupied: list[datetime],
+    *,
+    utc_offset_hours: int,
+    count: int = 6,
+    now: datetime | None = None,
+) -> list[datetime]:
+    if not any(weekly_slots.values()):
+        return []
+    upcoming: list[datetime] = []
+    reserved = list(occupied)
+    for _ in range(count):
+        candidate = next_weekly_publish_slot(
+            weekly_slots,
+            reserved,
+            utc_offset_hours=utc_offset_hours,
+            now=now,
+        )
+        upcoming.append(candidate)
+        reserved.append(candidate)
+    return upcoming
+
+
 def upcoming_publish_slots(
     slots: tuple[int, ...],
     occupied: list[datetime],
@@ -206,6 +307,7 @@ class EditorBot:
         self.router = Router()
         self.schedule_wakeup = asyncio.Event()
         self._publication_locks: dict[int, asyncio.Lock] = {}
+        self._schedule_input_states: dict[int, dict[str, Any]] = {}
         self.dispatcher.include_router(self.router)
         self._register_handlers()
 
@@ -216,6 +318,7 @@ class EditorBot:
                 BotCommand(command="start", description="Запустить редактор"),
                 BotCommand(command="setup", description="Привязать каналы"),
                 BotCommand(command="plan", description="Контент-план"),
+                BotCommand(command="schedule", description="Расписание публикаций"),
                 BotCommand(command="status", description="Показать состояние системы"),
                 BotCommand(command="sources", description="Показать источники"),
                 BotCommand(command="settings", description="Настройки генерации"),
@@ -256,6 +359,7 @@ class EditorBot:
         self.router.message.register(self._start, Command("start"))
         self.router.message.register(self._setup, Command("setup"))
         self.router.message.register(self._plan, Command("plan"))
+        self.router.message.register(self._schedule, Command("schedule"))
         self.router.message.register(self._status, Command("status"))
         self.router.message.register(self._sources, Command("sources"))
         self.router.message.register(self._settings, Command("settings"))
@@ -296,14 +400,86 @@ class EditorBot:
             json.dumps(channels, ensure_ascii=False),
         )
 
-    async def _target_channel_label(self) -> str:
-        target = await self.repository.get_setting("target_chat_id")
-        if not target:
+    async def _publication_schedules(self) -> dict[str, dict[str, list[int]]]:
+        raw = await self.repository.get_setting(PUBLICATION_SCHEDULES_SETTING)
+        if not raw:
+            return {}
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(values, dict):
+            return {}
+        schedules: dict[str, dict[str, list[int]]] = {}
+        for channel_id, days in values.items():
+            if not isinstance(days, dict):
+                continue
+            normalized_days: dict[str, list[int]] = {}
+            for day in range(7):
+                raw_slots = days.get(str(day), [])
+                if not isinstance(raw_slots, list):
+                    raw_slots = []
+                normalized_days[str(day)] = sorted(
+                    {
+                        int(slot)
+                        for slot in raw_slots
+                        if isinstance(slot, int) and 0 <= slot < 24 * 60
+                    }
+                )
+            schedules[str(channel_id)] = normalized_days
+        return schedules
+
+    def _default_weekly_schedule(self) -> dict[int, tuple[int, ...]]:
+        return {
+            day: tuple(self.settings.publish_schedule_slots)
+            for day in range(7)
+        }
+
+    async def _channel_weekly_schedule(
+        self,
+        channel_id: int,
+    ) -> dict[int, tuple[int, ...]]:
+        stored = (await self._publication_schedules()).get(str(channel_id))
+        if stored is None:
+            return self._default_weekly_schedule()
+        return {
+            day: tuple(int(slot) for slot in stored.get(str(day), []))
+            for day in range(7)
+        }
+
+    async def _set_channel_day_schedule(
+        self,
+        channel_id: int,
+        day: int,
+        slots: list[int],
+    ) -> None:
+        schedules = await self._publication_schedules()
+        channel_schedule = await self._channel_weekly_schedule(channel_id)
+        channel_schedule[day] = tuple(sorted(set(slots)))
+        schedules[str(channel_id)] = {
+            str(day_index): list(channel_schedule[day_index])
+            for day_index in range(7)
+        }
+        await self.repository.set_setting(
+            PUBLICATION_SCHEDULES_SETTING,
+            json.dumps(schedules, ensure_ascii=False, sort_keys=True),
+        )
+
+    async def _channel_label(self, channel_id: int | str | None) -> str:
+        if channel_id is None:
             return "не выбран"
         for channel in await self._publication_channels():
-            if str(channel["chat_id"]) == target:
-                return str(channel.get("title") or channel.get("username") or target)
-        return target
+            if str(channel["chat_id"]) == str(channel_id):
+                return str(
+                    channel.get("title")
+                    or channel.get("username")
+                    or channel_id
+                )
+        return str(channel_id)
+
+    async def _target_channel_label(self) -> str:
+        target = await self.repository.get_setting("target_chat_id")
+        return await self._channel_label(target)
 
     async def _start(self, message: Message) -> None:
         if not message.from_user:
@@ -367,6 +543,11 @@ class EditorBot:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
         await self._show_content_plan(message.chat.id)
+
+    async def _schedule(self, message: Message) -> None:
+        if not message.from_user or not await self._is_owner(message.from_user.id):
+            return
+        await self._show_schedule_menu(message.chat.id)
 
     async def _chat_shared(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
@@ -456,7 +637,7 @@ class EditorBot:
             f"В активные часы  каждые {self.settings.rss_poll_interval_seconds} секунд\n"
             "Вне активных часов  каждые "
             f"{self.settings.rss_offpeak_poll_interval_seconds} секунд\n"
-            f"Окна пубикации  {publish_slots} ({offset_text})\n"
+            f"Окна публикации по умолчанию  {publish_slots} ({offset_text})\n"
             f"Модель отбора  <code>{html.escape(self.settings.triage_model)}</code>\n"
             f"Модель текста  <code>{html.escape(self.settings.writer_model)}</code>"
         )
@@ -476,6 +657,7 @@ class EditorBot:
         if drafts:
             for draft in drafts:
                 scheduled_at = self._draft_scheduled_at(draft)
+                draft_target_label = await self._channel_label(draft.get("target_chat_id"))
                 when = (
                     format_publish_time(
                         scheduled_at,
@@ -486,7 +668,8 @@ class EditorBot:
                 )
                 lines.append(
                     f"<b>#{draft['id']}</b>  {when}\n"
-                    f"{html.escape(str(draft['title']))}"
+                    f"{html.escape(str(draft['title']))}\n"
+                    f"Канал  <b>{html.escape(draft_target_label)}</b>"
                 )
         else:
             lines.append("Запланированных постов пока нет.")
@@ -520,7 +703,7 @@ class EditorBot:
             if scheduled_at
             else "не запланировано"
         )
-        target_label = await self._target_channel_label()
+        target_label = await self._channel_label(draft.get("target_chat_id"))
         text = (
             f"<b>Контент-план · пост #{draft['id']}</b>\n\n"
             f"<b>{html.escape(str(draft['title']))}</b>\n\n"
@@ -578,6 +761,113 @@ class EditorBot:
             "Выбери добавленный канал или добавь новый.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
+
+    async def _show_schedule_channel_picker(
+        self,
+        chat_id: int,
+        message_id: int | None = None,
+    ) -> None:
+        channels = await self._publication_channels()
+        current = await self.repository.get_setting("target_chat_id")
+        rows: list[list[InlineKeyboardButton]] = []
+        for channel in channels:
+            channel_id = int(channel["chat_id"])
+            title = str(channel.get("title") or channel.get("username") or channel_id)
+            marker = "✅ " if str(channel_id) == current else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{marker}{title}"[:60],
+                        callback_data=f"schedulechannel:{channel_id}",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Добавить канал",
+                        callback_data="targetadd:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="« Назад к контент-плану",
+                        callback_data="planrefresh:0",
+                    )
+                ],
+            ]
+        )
+        text = (
+            "<b>Расписание публикаций</b>\n\n"
+            "Выбери канал, для которого нужно настроить время."
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not edit schedule channel picker; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_schedule_menu(
+        self,
+        chat_id: int,
+        channel_id: int | None = None,
+        day: int | None = None,
+        message_id: int | None = None,
+    ) -> None:
+        if channel_id is None:
+            raw_target = await self.repository.get_setting("target_chat_id")
+            channel_id = int(raw_target) if raw_target else None
+        if channel_id is None:
+            await self._show_schedule_channel_picker(chat_id, message_id)
+            return
+        local_now = datetime.now(UTC).astimezone(
+            _publish_timezone(self.settings.publish_schedule_utc_offset_hours)
+        )
+        selected_day = local_now.weekday() if day is None else day
+        if not 0 <= selected_day <= 6:
+            selected_day = local_now.weekday()
+        weekly = await self._channel_weekly_schedule(channel_id)
+        slots = list(weekly[selected_day])
+        channel_label = await self._channel_label(channel_id)
+        offset = self.settings.publish_schedule_utc_offset_hours
+        offset_label = f"UTC{'+' if offset >= 0 else ''}{offset}"
+        text = (
+            "<b>Расписание публикаций</b>\n\n"
+            f"Канал: <b>{html.escape(channel_label)}</b>\n"
+            f"Часовой пояс: <b>{offset_label}</b>\n"
+            f"Выбранный день: <b>{WEEKDAY_NAMES[selected_day]}</b>\n"
+            f"Публикаций: <b>{len(slots)}</b>\n\n"
+            "Нажми «Добавить время» и отправь его в формате "
+            "<code>03:12</code> или <code>0312</code>.\n"
+            "Нажатие на кнопку с временем удаляет это окно."
+        )
+        keyboard = self._schedule_keyboard(
+            channel_id,
+            selected_day,
+            slots,
+            channel_label,
+        )
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not refresh schedule message; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
 
     async def _send_target_channel_picker(self, user_id: int) -> None:
         await self.bot.send_message(
@@ -642,6 +932,44 @@ class EditorBot:
             scheduled_at = scheduled_at.replace(tzinfo=UTC)
         return scheduled_at.astimezone(UTC)
 
+    async def _draft_publication_channel_id(
+        self,
+        draft: dict[str, Any],
+    ) -> int | None:
+        draft_target = draft.get("target_chat_id")
+        if draft.get("status") == "scheduled" and draft_target is not None:
+            return int(draft_target)
+        active_target = await self.repository.get_setting("target_chat_id")
+        return int(active_target) if active_target else None
+
+    async def _upcoming_slots_for_draft(
+        self,
+        draft: dict[str, Any],
+        *,
+        exclude_current: bool = False,
+    ) -> list[datetime]:
+        channel_id = await self._draft_publication_channel_id(draft)
+        if channel_id is None:
+            return []
+        occupied = await self.repository.scheduled_publication_times(
+            target_chat_id=channel_id,
+        )
+        if exclude_current:
+            current_time = self._draft_scheduled_at(draft)
+            if current_time:
+                occupied = [
+                    value
+                    for value in occupied
+                    if int(value.timestamp() // 60)
+                    != int(current_time.timestamp() // 60)
+                ]
+        weekly = await self._channel_weekly_schedule(channel_id)
+        return upcoming_weekly_publish_slots(
+            weekly,
+            occupied,
+            utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+        )
+
     @staticmethod
     def _content_plan_keyboard(
         drafts: list[dict[str, Any]],
@@ -661,6 +989,12 @@ class EditorBot:
                 [
                     InlineKeyboardButton(text="Обновить", callback_data="planrefresh:0"),
                     InlineKeyboardButton(
+                        text="Расписание",
+                        callback_data="schedule:0",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         text=f"Канал: {target_label}"[:45],
                         callback_data="targetmenu:0",
                     ),
@@ -669,6 +1003,67 @@ class EditorBot:
                     InlineKeyboardButton(
                         text="Добавить/сменить канал",
                         callback_data="targetadd:0",
+                    )
+                ],
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _schedule_keyboard(
+        channel_id: int,
+        selected_day: int,
+        slots: list[int],
+        channel_label: str,
+    ) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    text=("🟢 " if day == selected_day else "") + WEEKDAY_SHORT_NAMES[day],
+                    callback_data=f"scheduleday:{channel_id}:{day}",
+                )
+                for day in range(7)
+            ]
+        ]
+        time_buttons = [
+            InlineKeyboardButton(
+                text=f"✕ {format_clock_minutes(slot)}",
+                callback_data=f"scheduledel:{channel_id}:{selected_day}:{slot}",
+            )
+            for slot in slots
+        ]
+        rows.extend(
+            time_buttons[index : index + 2]
+            for index in range(0, len(time_buttons), 2)
+        )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="➕ Добавить время",
+                        callback_data=f"scheduleadd:{channel_id}:{selected_day}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Настроить интервал",
+                        callback_data=f"scheduleinterval:{channel_id}:{selected_day}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Сбросить время",
+                        callback_data=f"schedulereset:{channel_id}:{selected_day}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=f"Канал: {channel_label}"[:60],
+                        callback_data="schedulechannels:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="« Назад к контент-плану",
+                        callback_data="planrefresh:0",
                     )
                 ],
             ]
@@ -735,13 +1130,18 @@ class EditorBot:
             "Перешли сюда пост из любого канала или дождись новой публикации Solidot. "
             "Подготовленный материал появится в редакторском канале. Управление выполняется "
             "кнопками под черновиком. Очередь публикаций и её настройки доступны "
-            "через /plan и кнопку «Контент-план»."
+            "через /plan, /schedule и кнопки под черновиком."
         )
 
     async def _private_message(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
         if message.text and message.text.startswith("/"):
+            return
+
+        schedule_state = self._schedule_input_states.get(message.from_user.id)
+        if schedule_state:
+            await self._apply_schedule_input(message, schedule_state)
             return
 
         pending = await self.repository.pop_pending_action(message.from_user.id)
@@ -764,6 +1164,84 @@ class EditorBot:
                 await message.answer("Материал отклонен фильтром или не удалось его обработать.")
 
         asyncio.create_task(process())
+
+    async def _apply_schedule_input(
+        self,
+        message: Message,
+        state: dict[str, Any],
+    ) -> None:
+        if not message.from_user:
+            return
+        user_id = message.from_user.id
+        text = (message.text or message.caption or "").strip()
+        channel_id = int(state["channel_id"])
+        day = int(state["day"])
+        mode = str(state["mode"])
+        if mode in {"add", "interval_start"}:
+            try:
+                minute = parse_clock_minutes(text)
+            except ValueError as error:
+                await message.answer(f"{error}. Попробуй ещё раз.")
+                return
+            if mode == "add":
+                weekly = await self._channel_weekly_schedule(channel_id)
+                await self._set_channel_day_schedule(
+                    channel_id,
+                    day,
+                    [*weekly[day], minute],
+                )
+                self._schedule_input_states.pop(user_id, None)
+                await message.answer(
+                    f"Время <b>{format_clock_minutes(minute)}</b> добавлено."
+                )
+                await self._show_schedule_menu(message.chat.id, channel_id, day)
+                return
+            state["start"] = minute
+            state["mode"] = "interval_count"
+            await message.answer(
+                "Сколько постов должно выходить в этот день?\n"
+                "Отправь число от <b>1</b> до <b>12</b>."
+            )
+            return
+
+        if mode == "interval_count":
+            if not text.isdigit() or not 1 <= int(text) <= 12:
+                await message.answer("Отправь целое число от 1 до 12.")
+                return
+            count = int(text)
+            state["count"] = count
+            if count == 1:
+                await self._set_channel_day_schedule(channel_id, day, [int(state["start"])])
+                self._schedule_input_states.pop(user_id, None)
+                await message.answer("Расписание на день обновлено.")
+                await self._show_schedule_menu(message.chat.id, channel_id, day)
+                return
+            state["mode"] = "interval_gap"
+            await message.answer(
+                "Отправь интервал между постами в минутах или в формате "
+                "<b>ЧЧ:ММ</b>.\nНапример: <code>240</code> или <code>04:00</code>."
+            )
+            return
+
+        if mode == "interval_gap":
+            try:
+                gap = parse_interval_minutes(text)
+            except ValueError as error:
+                await message.answer(f"{error}. Попробуй ещё раз.")
+                return
+            start = int(state["start"])
+            count = int(state["count"])
+            slots = [start + index * gap for index in range(count)]
+            if slots[-1] >= 24 * 60:
+                await message.answer(
+                    "Последний пост выходит уже на следующий день. "
+                    "Отправь меньший интервал."
+                )
+                return
+            await self._set_channel_day_schedule(channel_id, day, slots)
+            self._schedule_input_states.pop(user_id, None)
+            await message.answer("Расписание с равным интервалом сохранено.")
+            await self._show_schedule_menu(message.chat.id, channel_id, day)
 
     async def _apply_pending_edit(self, message: Message, action: str, draft_id: int) -> None:
         draft = await self.repository.get_draft(draft_id)
@@ -849,6 +1327,123 @@ class EditorBot:
             return
         parts = (callback.data or "").split(":")
         action = parts[0]
+        schedule_actions = {
+            "schedule",
+            "schedulechannels",
+            "schedulechannel",
+            "scheduleday",
+            "scheduleadd",
+            "scheduleinterval",
+            "schedulereset",
+            "scheduledel",
+        }
+        if action in schedule_actions:
+            if action in {"schedule", "schedulechannels"}:
+                valid = len(parts) == 2 and parts[1].isdigit()
+            elif action == "schedulechannel":
+                valid = len(parts) == 2 and parts[1].lstrip("-").isdigit()
+            elif action == "scheduledel":
+                valid = (
+                    len(parts) == 4
+                    and parts[1].lstrip("-").isdigit()
+                    and parts[2].isdigit()
+                    and parts[3].isdigit()
+                )
+            else:
+                valid = (
+                    len(parts) == 3
+                    and parts[1].lstrip("-").isdigit()
+                    and parts[2].isdigit()
+                )
+            if not valid:
+                await callback.answer("Некорректная команда", show_alert=True)
+                return
+            self._schedule_input_states.pop(callback.from_user.id, None)
+            message_id = callback.message.message_id if callback.message else None
+            chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+            if action == "schedule":
+                await callback.answer("Открываю расписание")
+                edit_message_id = None
+                if callback.message:
+                    current_text = str(getattr(callback.message, "text", "") or "")
+                    if current_text.startswith("Контент-план"):
+                        edit_message_id = message_id
+                await self._show_schedule_menu(chat_id, message_id=edit_message_id)
+                return
+            if action == "schedulechannels":
+                await callback.answer("Выбери канал")
+                await self._show_schedule_channel_picker(chat_id, message_id)
+                return
+            channel_id = int(parts[1])
+            if action == "schedulechannel":
+                await callback.answer("Канал выбран")
+                await self._show_schedule_menu(chat_id, channel_id, message_id=message_id)
+                return
+            day = int(parts[2])
+            if not 0 <= day <= 6:
+                await callback.answer("Некорректный день", show_alert=True)
+                return
+            if action == "scheduleday":
+                await callback.answer(WEEKDAY_NAMES[day].capitalize())
+                await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                return
+            if action == "scheduledel":
+                slot = int(parts[3])
+                weekly = await self._channel_weekly_schedule(channel_id)
+                await self._set_channel_day_schedule(
+                    channel_id,
+                    day,
+                    [value for value in weekly[day] if value != slot],
+                )
+                await callback.answer(f"{format_clock_minutes(slot)} удалено")
+                await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                return
+            if action == "schedulereset":
+                await self._set_channel_day_schedule(channel_id, day, [])
+                await callback.answer("Время на этот день сброшено")
+                await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                return
+            await self.repository.pop_pending_action(callback.from_user.id)
+            if action == "scheduleadd":
+                self._schedule_input_states[callback.from_user.id] = {
+                    "mode": "add",
+                    "channel_id": channel_id,
+                    "day": day,
+                }
+                prompt = (
+                    f"Добавляем время на <b>{WEEKDAY_NAMES[day]}</b>.\n\n"
+                    "Отправь его в формате <code>03:12</code> или <code>0312</code>."
+                )
+                answer_text = "Жду время в личном чате с ботом"
+            else:
+                self._schedule_input_states[callback.from_user.id] = {
+                    "mode": "interval_start",
+                    "channel_id": channel_id,
+                    "day": day,
+                }
+                prompt = (
+                    "Отправь время, в которое должен выйти первый пост, "
+                    "в формате <code>09:30</code> или <code>0930</code>."
+                )
+                answer_text = "Настройка интервала отправлена в бот"
+            await callback.answer(answer_text)
+            await self.bot.send_message(
+                callback.from_user.id,
+                prompt,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="« Назад",
+                                callback_data=f"scheduleday:{channel_id}:{day}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        self._schedule_input_states.pop(callback.from_user.id, None)
         is_slot_action = action == "pubslot"
         if is_slot_action:
             valid = len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()
@@ -927,13 +1522,15 @@ class EditorBot:
             await self._refresh_plan_from_callback(callback)
             return
         if action == "pubnext":
-            await callback.answer("Ставлю в расписание")
-            occupied = await self.repository.scheduled_publication_times()
-            scheduled_at = next_publish_slot(
-                self.settings.publish_schedule_slots,
-                occupied,
-                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
-            )
+            slots = await self._upcoming_slots_for_draft(draft)
+            if not slots:
+                await callback.answer(
+                    "В расписании канала нет окон. Открой «Расписание».",
+                    show_alert=True,
+                )
+                return
+            await callback.answer("Ставлю в следующее окно")
+            scheduled_at = slots[0]
             await self.schedule_draft(draft_id, callback.from_user.id, scheduled_at)
             await self._refresh_plan_from_callback(callback)
             return
@@ -980,19 +1577,9 @@ class EditorBot:
             return
         if action == "planreschedule":
             await callback.answer("Выбери новое время")
-            occupied = await self.repository.scheduled_publication_times()
-            current_time = self._draft_scheduled_at(draft)
-            if current_time:
-                occupied = [
-                    value
-                    for value in occupied
-                    if int(value.timestamp() // 60)
-                    != int(current_time.timestamp() // 60)
-                ]
-            slots = upcoming_publish_slots(
-                self.settings.publish_schedule_slots,
-                occupied,
-                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+            slots = await self._upcoming_slots_for_draft(
+                draft,
+                exclude_current=True,
             )
             keyboard = self._publish_options_keyboard(
                 draft_id,
@@ -1051,12 +1638,7 @@ class EditorBot:
             return
         elif action == "publish":
             await callback.answer("Выбери время публикации")
-            occupied = await self.repository.scheduled_publication_times()
-            slots = upcoming_publish_slots(
-                self.settings.publish_schedule_slots,
-                occupied,
-                utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
-            )
+            slots = await self._upcoming_slots_for_draft(draft)
             keyboard = self._publish_options_keyboard(
                 draft_id,
                 slots=slots,
@@ -1319,7 +1901,13 @@ class EditorBot:
         if draft["status"] == "published":
             await self.bot.send_message(owner_id, "Этот материал уже опубликован.")
             return False
-        if not await self.repository.get_setting("target_chat_id"):
+        active_target = await self.repository.get_setting("target_chat_id")
+        target_chat_id = (
+            int(draft["target_chat_id"])
+            if draft.get("status") == "scheduled" and draft.get("target_chat_id")
+            else int(active_target) if active_target else None
+        )
+        if target_chat_id is None:
             await self.bot.send_message(
                 owner_id,
                 "Канал публикации не настроен. Используй /setup.",
@@ -1335,6 +1923,7 @@ class EditorBot:
         await self.repository.update_draft(
             draft_id,
             status="scheduled",
+            target_chat_id=target_chat_id,
             scheduled_at=scheduled_at.isoformat(),
             schedule_attempts=0,
             schedule_error=None,
@@ -1359,6 +1948,7 @@ class EditorBot:
         await self.repository.update_draft(
             draft_id,
             status="draft",
+            target_chat_id=None,
             scheduled_at=None,
             schedule_attempts=0,
             schedule_error=None,
@@ -1470,7 +2060,9 @@ class EditorBot:
             if owner_id is not None:
                 await self.bot.send_message(owner_id, "Этот материал уже опубликован.")
             return True
-        target_chat_id = await self.repository.get_setting("target_chat_id")
+        target_chat_id = draft.get("target_chat_id")
+        if target_chat_id is None:
+            target_chat_id = await self.repository.get_setting("target_chat_id")
         if not target_chat_id:
             if owner_id is not None:
                 await self.bot.send_message(
@@ -1664,6 +2256,12 @@ class EditorBot:
                         callback_data="plan:0",
                     ),
                     InlineKeyboardButton(
+                        text="Расписание",
+                        callback_data="schedule:0",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         text="Канал публикации",
                         callback_data="targetmenu:0",
                     ),
@@ -1704,6 +2302,12 @@ class EditorBot:
                         text="Контент-план",
                         callback_data="plan:0",
                     ),
+                    InlineKeyboardButton(
+                        text="Расписание",
+                        callback_data="schedule:0",
+                    ),
+                ],
+                [
                     InlineKeyboardButton(
                         text="Канал публикации",
                         callback_data="targetmenu:0",
