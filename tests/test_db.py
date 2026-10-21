@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -124,12 +125,33 @@ async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
         triage={},
     )
     now = datetime(2026, 10, 19, 10, 0, tzinfo=UTC)
-    scheduled_at = now + timedelta(minutes=10)
+    first_at = now + timedelta(minutes=10)
+    second_at = now + timedelta(minutes=20)
     await repository.update_draft(
         draft_id,
         status="scheduled",
         target_chat_id=-1001,
-        scheduled_at=scheduled_at.isoformat(),
+        scheduled_at=first_at.isoformat(),
+        publications_json=json.dumps(
+            [
+                {
+                    "target_chat_id": -1001,
+                    "scheduled_at": first_at.isoformat(),
+                    "status": "scheduled",
+                    "attempts": 0,
+                    "error": None,
+                    "target_message_id": None,
+                },
+                {
+                    "target_chat_id": -1002,
+                    "scheduled_at": second_at.isoformat(),
+                    "status": "scheduled",
+                    "attempts": 0,
+                    "error": None,
+                    "target_message_id": None,
+                },
+            ]
+        ),
     )
 
     assert await repository.due_scheduled_drafts(now) == []
@@ -139,15 +161,16 @@ async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
         now,
         target_chat_id=-1001,
     )
-    other_target_future = await repository.scheduled_publication_times(
+    second_target_future = await repository.scheduled_publication_times(
         now,
         target_chat_id=-1002,
     )
 
     assert [draft["id"] for draft in due] == [draft_id]
-    assert future == [scheduled_at]
-    assert target_future == [scheduled_at]
-    assert other_target_future == []
-    assert await repository.next_scheduled_publication() == scheduled_at
+    assert due[0]["publication_target_chat_id"] == -1001
+    assert future == [first_at, second_at]
+    assert target_future == [first_at]
+    assert second_target_future == [second_at]
+    assert await repository.next_scheduled_publication() == first_at
     scheduled_drafts = await repository.scheduled_drafts()
     assert [draft["id"] for draft in scheduled_drafts] == [draft_id]

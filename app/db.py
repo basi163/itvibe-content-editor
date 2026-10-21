@@ -91,6 +91,7 @@ class Repository:
                     scheduled_at TEXT,
                     schedule_attempts INTEGER NOT NULL DEFAULT 0,
                     schedule_error TEXT,
+                    publications_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -112,12 +113,37 @@ class Repository:
                 "scheduled_at": "TEXT",
                 "schedule_attempts": "INTEGER NOT NULL DEFAULT 0",
                 "schedule_error": "TEXT",
+                "publications_json": "TEXT NOT NULL DEFAULT '[]'",
             }
             for column, definition in draft_migrations.items():
                 if column not in columns:
                     await db.execute(
                         f"ALTER TABLE drafts ADD COLUMN {column} {definition}"
                     )
+            cursor = await db.execute(
+                """
+                SELECT id, target_chat_id, target_message_id, scheduled_at,
+                       schedule_attempts, schedule_error
+                FROM drafts
+                WHERE status = 'scheduled'
+                  AND target_chat_id IS NOT NULL
+                  AND scheduled_at IS NOT NULL
+                  AND (publications_json IS NULL OR publications_json = '[]')
+                """
+            )
+            for row in await cursor.fetchall():
+                publication = {
+                    "target_chat_id": int(row["target_chat_id"]),
+                    "scheduled_at": str(row["scheduled_at"]),
+                    "status": "scheduled",
+                    "attempts": int(row["schedule_attempts"] or 0),
+                    "error": row["schedule_error"],
+                    "target_message_id": row["target_message_id"],
+                }
+                await db.execute(
+                    "UPDATE drafts SET publications_json = ? WHERE id = ?",
+                    (json.dumps([publication], ensure_ascii=False), int(row["id"])),
+                )
             cursor = await db.execute("PRAGMA table_info(feed_items)")
             feed_columns = {str(row[1]) for row in await cursor.fetchall()}
             if "attempt_count" not in feed_columns:
@@ -349,6 +375,7 @@ class Repository:
             "scheduled_at",
             "schedule_attempts",
             "schedule_error",
+            "publications_json",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -375,82 +402,86 @@ class Repository:
         now: datetime | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        current = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        current = (now or datetime.now(UTC)).astimezone(UTC)
         async with self.connect() as db:
             cursor = await db.execute(
                 """
                 SELECT * FROM drafts
                 WHERE status = 'scheduled'
-                  AND scheduled_at IS NOT NULL
-                  AND scheduled_at <= ?
-                ORDER BY scheduled_at, id
-                LIMIT ?
                 """,
-                (current, limit),
             )
-            return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
+            due: list[dict[str, Any]] = []
+            for row in await cursor.fetchall():
+                draft = self._decode_draft(dict(row))
+                for publication in draft["publications"]:
+                    if publication.get("status") != "scheduled":
+                        continue
+                    try:
+                        scheduled_at = datetime.fromisoformat(
+                            str(publication.get("scheduled_at") or "")
+                        )
+                    except ValueError:
+                        continue
+                    if scheduled_at.tzinfo is None:
+                        scheduled_at = scheduled_at.replace(tzinfo=UTC)
+                    if scheduled_at.astimezone(UTC) > current:
+                        continue
+                    item = dict(draft)
+                    item["publication_target_chat_id"] = int(
+                        publication["target_chat_id"]
+                    )
+                    item["publication_scheduled_at"] = scheduled_at.astimezone(UTC)
+                    item["publication_attempts"] = int(
+                        publication.get("attempts") or 0
+                    )
+                    due.append(item)
+            due.sort(
+                key=lambda item: (
+                    item["publication_scheduled_at"],
+                    int(item["id"]),
+                    int(item["publication_target_chat_id"]),
+                )
+            )
+            return due[:limit]
 
     async def scheduled_publication_times(
         self,
         after: datetime | None = None,
         target_chat_id: int | None = None,
     ) -> list[datetime]:
-        current = (after or datetime.now(UTC)).astimezone(UTC).isoformat()
+        current = (after or datetime.now(UTC)).astimezone(UTC)
         async with self.connect() as db:
-            if target_chat_id is None:
-                cursor = await db.execute(
-                    """
-                    SELECT scheduled_at FROM drafts
-                    WHERE status = 'scheduled'
-                      AND scheduled_at IS NOT NULL
-                      AND scheduled_at > ?
-                    ORDER BY scheduled_at
-                    """,
-                    (current,),
-                )
-            else:
-                cursor = await db.execute(
-                    """
-                    SELECT scheduled_at FROM drafts
-                    WHERE status = 'scheduled'
-                      AND scheduled_at IS NOT NULL
-                      AND scheduled_at > ?
-                      AND (target_chat_id = ? OR target_chat_id IS NULL)
-                    ORDER BY scheduled_at
-                    """,
-                    (current, target_chat_id),
-                )
+            cursor = await db.execute(
+                "SELECT * FROM drafts WHERE status = 'scheduled'"
+            )
             values: list[datetime] = []
             for row in await cursor.fetchall():
-                try:
-                    value = datetime.fromisoformat(str(row["scheduled_at"]))
-                except (TypeError, ValueError):
-                    continue
-                if value.tzinfo is None:
-                    value = value.replace(tzinfo=UTC)
-                values.append(value.astimezone(UTC))
-            return values
+                draft = self._decode_draft(dict(row))
+                for publication in draft["publications"]:
+                    if publication.get("status") != "scheduled":
+                        continue
+                    if (
+                        target_chat_id is not None
+                        and int(publication.get("target_chat_id") or 0)
+                        != target_chat_id
+                    ):
+                        continue
+                    try:
+                        value = datetime.fromisoformat(
+                            str(publication.get("scheduled_at") or "")
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if value.tzinfo is None:
+                        value = value.replace(tzinfo=UTC)
+                    value = value.astimezone(UTC)
+                    if value > current:
+                        values.append(value)
+            return sorted(values)
 
     async def next_scheduled_publication(self) -> datetime | None:
-        async with self.connect() as db:
-            row = await self._fetchone(
-                db,
-                """
-                SELECT scheduled_at FROM drafts
-                WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
-                ORDER BY scheduled_at
-                LIMIT 1
-                """,
-            )
-            if not row:
-                return None
-            try:
-                value = datetime.fromisoformat(str(row["scheduled_at"]))
-            except (TypeError, ValueError):
-                return None
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=UTC)
-            return value.astimezone(UTC)
+        values = await self.scheduled_publication_times(after=datetime.min.replace(tzinfo=UTC))
+        return values[0] if values else None
 
     async def scheduled_drafts(self, limit: int = 50) -> list[dict[str, Any]]:
         async with self.connect() as db:
@@ -518,4 +549,5 @@ class Repository:
         row["media"] = json.loads(row.pop("media_json"))
         row["material"] = json.loads(row.pop("material_json"))
         row["triage"] = json.loads(row.pop("triage_json"))
+        row["publications"] = json.loads(row.pop("publications_json", "[]") or "[]")
         return row

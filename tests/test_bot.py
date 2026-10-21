@@ -261,6 +261,51 @@ async def test_native_telegram_edit_updates_stored_draft() -> None:
     assert fields["body"] == "Новый текст публикации."
 
 
+@pytest.mark.asyncio
+async def test_publish_draft_sends_one_edited_post_to_both_selected_channels() -> None:
+    editor = object.__new__(EditorBot)
+    draft = {
+        "id": 7,
+        "status": "draft",
+        "title": "Новый заголовок",
+        "body": "Новый текст публикации.",
+        "hashtags": ["#ИИ", "#новости", "#IT"],
+        "sources": [],
+        "media": [{"type": "photo", "telegram_file_id": "photo-file-id"}],
+        "preview_index": 0,
+        "publications": [],
+    }
+    editor.repository = SimpleNamespace(get_draft=AsyncMock(return_value=draft))
+    editor.settings = SimpleNamespace(max_post_chars=2000)
+    editor.bot = SimpleNamespace(
+        send_rich_message=AsyncMock(
+            side_effect=[
+                SimpleNamespace(message_id=101),
+                SimpleNamespace(message_id=202),
+            ]
+        ),
+        send_photo=AsyncMock(),
+        send_video=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+    editor._selected_publication_channel_ids = AsyncMock(
+        return_value=[-1001, -1002]
+    )
+    editor._channel_label = AsyncMock(side_effect=["Канал 1", "Канал 2"])
+    editor._media_input = AsyncMock(return_value="photo-file-id")
+    editor._save_draft_publications = AsyncMock(return_value="published")
+
+    published = await editor._publish_draft_unlocked(7, 100)
+
+    assert published
+    assert [
+        call.kwargs["chat_id"]
+        for call in editor.bot.send_rich_message.await_args_list
+    ] == [-1001, -1002]
+    final_publications = editor._save_draft_publications.await_args_list[-1].args[1]
+    assert {item["status"] for item in final_publications} == {"published"}
+
+
 def test_parse_publish_time_uses_samara_time_and_rolls_clock_to_tomorrow() -> None:
     now = datetime(2026, 10, 19, 16, 0, tzinfo=UTC)
 

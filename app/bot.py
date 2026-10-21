@@ -51,6 +51,7 @@ TARGET_REQUEST_ID = 102
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 MAX_SCHEDULE_ATTEMPTS = 3
 PUBLICATION_CHANNELS_SETTING = "publication_channels"
+SELECTED_PUBLICATION_CHANNELS_SETTING = "selected_publication_channels"
 PUBLICATION_SCHEDULES_SETTING = "publication_schedules"
 PUBLICATION_SCHEDULE_DAYS_SETTING = "publication_schedule_days"
 WEEKDAY_NAMES = (
@@ -407,6 +408,61 @@ class EditorBot:
             json.dumps(channels, ensure_ascii=False),
         )
 
+    async def _selected_publication_channel_ids(self) -> list[int]:
+        raw = await self.repository.get_setting(
+            SELECTED_PUBLICATION_CHANNELS_SETTING
+        )
+        selected: list[int] = []
+        if raw is not None:
+            try:
+                values = json.loads(raw)
+            except (TypeError, ValueError):
+                values = []
+            if isinstance(values, list):
+                selected = [
+                    int(value)
+                    for value in values
+                    if str(value).lstrip("-").isdigit()
+                ]
+        else:
+            legacy = await self.repository.get_setting("target_chat_id")
+            if legacy and legacy.lstrip("-").isdigit():
+                selected = [int(legacy)]
+        known = {
+            int(channel["chat_id"])
+            for channel in await self._publication_channels()
+        }
+        return list(dict.fromkeys(value for value in selected if value in known))
+
+    async def _set_selected_publication_channel_ids(
+        self,
+        channel_ids: list[int] | tuple[int, ...] | set[int],
+    ) -> None:
+        normalized = list(dict.fromkeys(int(value) for value in channel_ids))
+        await self.repository.set_setting(
+            SELECTED_PUBLICATION_CHANNELS_SETTING,
+            json.dumps(normalized),
+        )
+        if normalized:
+            await self.repository.set_setting("target_chat_id", str(normalized[0]))
+
+    async def _select_publication_channel(self, channel_id: int) -> None:
+        selected = await self._selected_publication_channel_ids()
+        if channel_id not in selected:
+            selected.append(channel_id)
+        await self._set_selected_publication_channel_ids(selected)
+
+    async def _toggle_publication_channel(self, channel_id: int) -> bool:
+        selected = await self._selected_publication_channel_ids()
+        if channel_id in selected:
+            selected.remove(channel_id)
+            enabled = False
+        else:
+            selected.append(channel_id)
+            enabled = True
+        await self._set_selected_publication_channel_ids(selected)
+        return enabled
+
     async def _publication_schedules(self) -> dict[str, dict[str, list[int]]]:
         raw = await self.repository.get_setting(PUBLICATION_SCHEDULES_SETTING)
         if not raw:
@@ -558,8 +614,12 @@ class EditorBot:
         return str(channel_id)
 
     async def _target_channel_label(self) -> str:
-        target = await self.repository.get_setting("target_chat_id")
-        return await self._channel_label(target)
+        selected = await self._selected_publication_channel_ids()
+        if not selected:
+            return "не выбраны"
+        return ", ".join(
+            [await self._channel_label(channel_id) for channel_id in selected]
+        )
 
     async def _start(self, message: Message) -> None:
         if not message.from_user:
@@ -654,14 +714,14 @@ class EditorBot:
                 if draft["status"] == "draft" and not draft["editor_message_id"]:
                     await self.deliver_draft(int(draft["id"]))
         elif shared.request_id == TARGET_REQUEST_ID:
-            await self.repository.set_setting("target_chat_id", str(shared.chat_id))
             await self._remember_publication_channel(
                 shared.chat_id,
                 str(selected_chat.title or shared.title or shared.chat_id),
                 selected_chat.username or shared.username,
             )
+            await self._select_publication_channel(shared.chat_id)
             await message.answer(
-                f"Канал публикации переключён на "
+                f"Канал публикации добавлен и включён: "
                 f"<b>{html.escape(str(selected_chat.title or shared.chat_id))}</b>.",
                 reply_markup=ReplyKeyboardRemove(),
             )
@@ -689,7 +749,7 @@ class EditorBot:
             f"Запланировано  {stats.get('drafts_scheduled', 0)}\n"
             f"Ближайшая публикация  {next_text}\n"
             f"Редакторский канал  <code>{html.escape(editor)}</code>\n"
-            f"Канал публикации  <code>{html.escape(target)}</code>"
+            f"Каналы публикации  <code>{html.escape(target)}</code>"
         )
 
     async def _sources(self, message: Message) -> None:
@@ -731,26 +791,31 @@ class EditorBot:
         target_label = await self._target_channel_label()
         lines = [
             "<b>Контент-план</b>",
-            f"Канал публикации  <b>{html.escape(target_label)}</b>",
+            f"Каналы публикации  <b>{html.escape(target_label)}</b>",
             "",
         ]
         if drafts:
             for draft in drafts:
-                scheduled_at = self._draft_scheduled_at(draft)
-                draft_target_label = await self._channel_label(draft.get("target_chat_id"))
-                when = (
-                    format_publish_time(
-                        scheduled_at,
-                        self.settings.publish_schedule_utc_offset_hours,
+                for publication in draft.get("publications", []):
+                    if publication.get("status") != "scheduled":
+                        continue
+                    scheduled_at = self._publication_scheduled_at(publication)
+                    draft_target_label = await self._channel_label(
+                        publication.get("target_chat_id")
                     )
-                    if scheduled_at
-                    else "время не указано"
-                )
-                lines.append(
-                    f"<b>#{draft['id']}</b>  {when}\n"
-                    f"{html.escape(str(draft['title']))}\n"
-                    f"Канал  <b>{html.escape(draft_target_label)}</b>"
-                )
+                    when = (
+                        format_publish_time(
+                            scheduled_at,
+                            self.settings.publish_schedule_utc_offset_hours,
+                        )
+                        if scheduled_at
+                        else "время не указано"
+                    )
+                    lines.append(
+                        f"<b>#{draft['id']}</b>  {when}\n"
+                        f"{html.escape(str(draft['title']))}\n"
+                        f"Канал  <b>{html.escape(draft_target_label)}</b>"
+                    )
         else:
             lines.append("Запланированных постов пока нет.")
         text = "\n\n".join(lines)
@@ -774,21 +839,31 @@ class EditorBot:
         message_id: int,
         draft: dict[str, Any],
     ) -> None:
-        scheduled_at = self._draft_scheduled_at(draft)
-        when = (
-            format_publish_time(
-                scheduled_at,
-                self.settings.publish_schedule_utc_offset_hours,
+        publication_lines: list[str] = []
+        for publication in draft.get("publications", []):
+            if publication.get("status") != "scheduled":
+                continue
+            scheduled_at = self._publication_scheduled_at(publication)
+            when = (
+                format_publish_time(
+                    scheduled_at,
+                    self.settings.publish_schedule_utc_offset_hours,
+                )
+                if scheduled_at
+                else "время не указано"
             )
-            if scheduled_at
-            else "не запланировано"
-        )
-        target_label = await self._channel_label(draft.get("target_chat_id"))
+            target_label = await self._channel_label(
+                publication.get("target_chat_id")
+            )
+            publication_lines.append(
+                f"<b>{html.escape(target_label)}</b>  {when}"
+            )
+        if not publication_lines:
+            publication_lines.append("Публикации не запланированы")
         text = (
             f"<b>Контент-план · пост #{draft['id']}</b>\n\n"
             f"<b>{html.escape(str(draft['title']))}</b>\n\n"
-            f"Публикация  {when}\n"
-            f"Канал  <b>{html.escape(target_label)}</b>"
+            + "\n".join(publication_lines)
         )
         await self.bot.edit_message_text(
             text=text,
@@ -797,14 +872,18 @@ class EditorBot:
             reply_markup=self._content_plan_item_keyboard(int(draft["id"])),
         )
 
-    async def _show_target_channel_menu(self, chat_id: int) -> None:
+    async def _show_target_channel_menu(
+        self,
+        chat_id: int,
+        message_id: int | None = None,
+    ) -> None:
         channels = await self._publication_channels()
-        current = await self.repository.get_setting("target_chat_id")
+        selected = set(await self._selected_publication_channel_ids())
         rows: list[list[InlineKeyboardButton]] = []
         for channel in channels:
             channel_id = int(channel["chat_id"])
             title = str(channel.get("title") or channel.get("username") or channel_id)
-            marker = "✅ " if str(channel_id) == current else ""
+            marker = "🟢 " if channel_id in selected else "⚪️ "
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -835,12 +914,24 @@ class EditorBot:
                 ],
             ]
         )
-        await self.bot.send_message(
-            chat_id,
-            "<b>Канал итоговой публикации</b>\n\n"
-            "Выбери добавленный канал или добавь новый.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        text = (
+            "<b>Каналы итоговой публикации</b>\n\n"
+            "Можно включить несколько каналов. 🟢 означает, что канал "
+            "получит итоговый пост. У каждого канала своё расписание."
         )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not edit channel selection; sending a new message")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
 
     async def _show_schedule_channel_picker(
         self,
@@ -848,12 +939,12 @@ class EditorBot:
         message_id: int | None = None,
     ) -> None:
         channels = await self._publication_channels()
-        current = await self.repository.get_setting("target_chat_id")
+        selected = set(await self._selected_publication_channel_ids())
         rows: list[list[InlineKeyboardButton]] = []
         for channel in channels:
             channel_id = int(channel["chat_id"])
             title = str(channel.get("title") or channel.get("username") or channel_id)
-            marker = "✅ " if str(channel_id) == current else ""
+            marker = "🟢 " if channel_id in selected else ""
             rows.append(
                 [
                     InlineKeyboardButton(
@@ -903,8 +994,11 @@ class EditorBot:
         message_id: int | None = None,
     ) -> None:
         if channel_id is None:
-            raw_target = await self.repository.get_setting("target_chat_id")
-            channel_id = int(raw_target) if raw_target else None
+            selected = await self._selected_publication_channel_ids()
+            if len(await self._publication_channels()) > 1:
+                await self._show_schedule_channel_picker(chat_id, message_id)
+                return
+            channel_id = selected[0] if selected else None
         if channel_id is None:
             await self._show_schedule_channel_picker(chat_id, message_id)
             return
@@ -1211,32 +1305,94 @@ class EditorBot:
             "<b>Добавить этот канал</b>.\n"
             "6. Для другого канала нажми <b>Выбрать другой канал</b> "
             "и выбери его в системном окне Telegram.\n"
-            "7. Дождись сообщения «Канал публикации переключён». После этого канал появится в контент-плане."
+            "7. После добавления канал появится в меню и будет включён. "
+            "Можно одновременно включить несколько каналов."
             f"{picker_note}"
         )
 
     @staticmethod
     def _draft_scheduled_at(draft: dict[str, Any]) -> datetime | None:
+        values: list[datetime] = []
+        for publication in draft.get("publications", []):
+            if publication.get("status") != "scheduled":
+                continue
+            try:
+                scheduled_at = datetime.fromisoformat(
+                    str(publication.get("scheduled_at") or "")
+                )
+            except ValueError:
+                continue
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=UTC)
+            values.append(scheduled_at.astimezone(UTC))
+        if values:
+            return min(values)
         value = draft.get("scheduled_at")
-        if not value:
-            return None
-        try:
-            scheduled_at = datetime.fromisoformat(str(value))
-        except ValueError:
-            return None
-        if scheduled_at.tzinfo is None:
-            scheduled_at = scheduled_at.replace(tzinfo=UTC)
-        return scheduled_at.astimezone(UTC)
+        if value:
+            try:
+                scheduled_at = datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=UTC)
+            return scheduled_at.astimezone(UTC)
+        return None
 
-    async def _draft_publication_channel_id(
+    async def _draft_publication_channel_ids(
         self,
         draft: dict[str, Any],
-    ) -> int | None:
-        draft_target = draft.get("target_chat_id")
-        if draft.get("status") == "scheduled" and draft_target is not None:
-            return int(draft_target)
-        active_target = await self.repository.get_setting("target_chat_id")
-        return int(active_target) if active_target else None
+    ) -> list[int]:
+        scheduled = [
+            int(publication["target_chat_id"])
+            for publication in draft.get("publications", [])
+            if publication.get("status") == "scheduled"
+        ]
+        if scheduled:
+            return list(dict.fromkeys(scheduled))
+        return await self._selected_publication_channel_ids()
+
+    @staticmethod
+    def _publication_scheduled_at(
+        publication: dict[str, Any],
+    ) -> datetime | None:
+        try:
+            value = datetime.fromisoformat(
+                str(publication.get("scheduled_at") or "")
+            )
+        except ValueError:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    async def _upcoming_slots_for_channel(
+        self,
+        draft: dict[str, Any],
+        channel_id: int,
+        *,
+        exclude_current: bool = False,
+    ) -> list[datetime]:
+        occupied = await self.repository.scheduled_publication_times(
+            target_chat_id=channel_id,
+        )
+        if exclude_current:
+            current_times = {
+                int(value.timestamp() // 60)
+                for publication in draft.get("publications", [])
+                if int(publication.get("target_chat_id") or 0) == channel_id
+                and (value := self._publication_scheduled_at(publication))
+            }
+            occupied = [
+                value
+                for value in occupied
+                if int(value.timestamp() // 60) not in current_times
+            ]
+        weekly = await self._channel_weekly_schedule(channel_id)
+        return upcoming_weekly_publish_slots(
+            weekly,
+            occupied,
+            utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+        )
 
     async def _upcoming_slots_for_draft(
         self,
@@ -1244,26 +1400,13 @@ class EditorBot:
         *,
         exclude_current: bool = False,
     ) -> list[datetime]:
-        channel_id = await self._draft_publication_channel_id(draft)
-        if channel_id is None:
+        channel_ids = await self._draft_publication_channel_ids(draft)
+        if len(channel_ids) != 1:
             return []
-        occupied = await self.repository.scheduled_publication_times(
-            target_chat_id=channel_id,
-        )
-        if exclude_current:
-            current_time = self._draft_scheduled_at(draft)
-            if current_time:
-                occupied = [
-                    value
-                    for value in occupied
-                    if int(value.timestamp() // 60)
-                    != int(current_time.timestamp() // 60)
-                ]
-        weekly = await self._channel_weekly_schedule(channel_id)
-        return upcoming_weekly_publish_slots(
-            weekly,
-            occupied,
-            utc_offset_hours=self.settings.publish_schedule_utc_offset_hours,
+        return await self._upcoming_slots_for_channel(
+            draft,
+            channel_ids[0],
+            exclude_current=exclude_current,
         )
 
     @staticmethod
@@ -1291,7 +1434,7 @@ class EditorBot:
                 ],
                 [
                     InlineKeyboardButton(
-                        text=f"Канал: {target_label}"[:45],
+                        text=f"Каналы: {target_label}"[:45],
                         callback_data="targetmenu:0",
                     ),
                 ],
@@ -2381,13 +2524,13 @@ class EditorBot:
                     show_alert=True,
                 )
                 return
-            await self.repository.set_setting("target_chat_id", str(channel_id))
             await self._remember_publication_channel(
                 channel_id,
                 str(selected_chat.title or channel_id),
                 selected_chat.username,
             )
-            await callback.answer("Канал добавлен", show_alert=True)
+            await self._select_publication_channel(channel_id)
+            await callback.answer("Канал добавлен и включён", show_alert=True)
             await self._show_target_channel_menu(callback.message.chat.id)
             return
         if action == "target":
@@ -2404,11 +2547,16 @@ class EditorBot:
             if not selected:
                 await callback.answer("Канал не найден", show_alert=True)
                 return
-            await self.repository.set_setting("target_chat_id", str(channel_id))
             title = str(selected.get("title") or selected.get("username") or channel_id)
-            await callback.answer(f"Выбран канал {title}", show_alert=True)
+            enabled = await self._toggle_publication_channel(channel_id)
+            await callback.answer(
+                f"{title}: {'включён' if enabled else 'выключен'}",
+            )
             if callback.message:
-                await self._show_content_plan(callback.message.chat.id)
+                await self._show_target_channel_menu(
+                    callback.message.chat.id,
+                    callback.message.message_id,
+                )
             return
 
         draft_id = int(parts[1])
@@ -2457,16 +2605,11 @@ class EditorBot:
             await self._refresh_plan_from_callback(callback)
             return
         if action == "pubnext":
-            slots = await self._upcoming_slots_for_draft(draft)
-            if not slots:
-                await callback.answer(
-                    "В расписании канала нет окон. Открой «Расписание».",
-                    show_alert=True,
-                )
-                return
-            await callback.answer("Ставлю в следующее окно")
-            scheduled_at = slots[0]
-            await self.schedule_draft(draft_id, callback.from_user.id, scheduled_at)
+            await callback.answer("Ставлю в следующие окна")
+            await self.schedule_draft_in_next_slots(
+                draft_id,
+                callback.from_user.id,
+            )
             await self._refresh_plan_from_callback(callback)
             return
         if action == "pubtime":
@@ -2823,6 +2966,132 @@ class EditorBot:
         )
         return message, None
 
+    @staticmethod
+    def _draft_status_for_publications(publications: list[dict[str, Any]]) -> str:
+        if any(item.get("status") == "scheduled" for item in publications):
+            return "scheduled"
+        if any(item.get("status") == "failed" for item in publications):
+            return "draft"
+        if any(item.get("status") == "published" for item in publications):
+            return "published"
+        return "draft"
+
+    async def _save_draft_publications(
+        self,
+        draft_id: int,
+        publications: list[dict[str, Any]],
+        *,
+        target_message_id: int | None = None,
+    ) -> str:
+        scheduled = [
+            item for item in publications if item.get("status") == "scheduled"
+        ]
+        scheduled_times = [
+            value
+            for item in scheduled
+            if (value := self._publication_scheduled_at(item)) is not None
+        ]
+        status = self._draft_status_for_publications(publications)
+        fields: dict[str, Any] = {
+            "publications_json": json.dumps(publications, ensure_ascii=False),
+            "status": status,
+            "scheduled_at": (
+                min(scheduled_times).isoformat() if scheduled_times else None
+            ),
+            "schedule_attempts": max(
+                (int(item.get("attempts") or 0) for item in publications),
+                default=0,
+            ),
+            "schedule_error": next(
+                (
+                    str(item["error"])
+                    for item in publications
+                    if item.get("error")
+                ),
+                None,
+            ),
+        }
+        if scheduled:
+            fields["target_chat_id"] = int(scheduled[0]["target_chat_id"])
+        if target_message_id is not None:
+            fields["target_message_id"] = target_message_id
+        await self.repository.update_draft(draft_id, **fields)
+        if status == "published":
+            draft = await self.repository.get_draft(draft_id)
+            if draft and draft["editor_chat_id"] and draft["editor_message_id"]:
+                try:
+                    await self.bot.edit_message_reply_markup(
+                        chat_id=draft["editor_chat_id"],
+                        message_id=draft["editor_message_id"],
+                        reply_markup=None,
+                    )
+                except TelegramBadRequest:
+                    logger.warning(
+                        "Could not clear editor keyboard for draft %s",
+                        draft_id,
+                    )
+        else:
+            await self._set_editor_keyboard(draft_id)
+        self.schedule_wakeup.set()
+        return status
+
+    async def _schedule_draft_at_times(
+        self,
+        draft: dict[str, Any],
+        owner_id: int,
+        schedule: dict[int, datetime],
+    ) -> bool:
+        if not schedule:
+            await self.bot.send_message(
+                owner_id,
+                "Не выбрано ни одного канала публикации.",
+            )
+            return False
+        now = datetime.now(UTC)
+        normalized = {
+            channel_id: value.astimezone(UTC)
+            for channel_id, value in schedule.items()
+        }
+        if any(value <= now for value in normalized.values()):
+            await self.bot.send_message(
+                owner_id,
+                "Время публикации должно быть в будущем.",
+            )
+            return False
+        publications = [dict(item) for item in draft.get("publications", [])]
+        for channel_id, scheduled_at in normalized.items():
+            existing = next(
+                (
+                    item
+                    for item in publications
+                    if int(item.get("target_chat_id") or 0) == channel_id
+                ),
+                None,
+            )
+            values = {
+                "target_chat_id": channel_id,
+                "scheduled_at": scheduled_at.isoformat(),
+                "status": "scheduled",
+                "attempts": 0,
+                "error": None,
+                "target_message_id": None,
+            }
+            if existing is None:
+                publications.append(values)
+            elif existing.get("status") != "published":
+                existing.update(values)
+        await self._save_draft_publications(int(draft["id"]), publications)
+        lines = [f"Черновик #{draft['id']} запланирован:"]
+        for channel_id, scheduled_at in normalized.items():
+            label = await self._channel_label(channel_id)
+            formatted = format_publish_time(
+                scheduled_at,
+                self.settings.publish_schedule_utc_offset_hours,
+            )
+            lines.append(f"• {label} — {formatted}")
+        await self.bot.send_message(owner_id, "\n".join(lines))
+        return True
+
     async def schedule_draft(
         self,
         draft_id: int,
@@ -2833,64 +3102,61 @@ class EditorBot:
         if not draft:
             await self.bot.send_message(owner_id, "Черновик не найден.")
             return False
-        if draft["status"] == "published":
-            await self.bot.send_message(owner_id, "Этот материал уже опубликован.")
-            return False
-        active_target = await self.repository.get_setting("target_chat_id")
-        target_chat_id = (
-            int(draft["target_chat_id"])
-            if draft.get("status") == "scheduled" and draft.get("target_chat_id")
-            else int(active_target) if active_target else None
-        )
-        if target_chat_id is None:
-            await self.bot.send_message(
-                owner_id,
-                "Канал публикации не настроен. Используй /setup.",
-            )
-            return False
-        scheduled_at = scheduled_at.astimezone(UTC)
-        if scheduled_at <= datetime.now(UTC):
-            await self.bot.send_message(
-                owner_id,
-                "Время публикации должно быть в будущем.",
-            )
-            return False
-        await self.repository.update_draft(
-            draft_id,
-            status="scheduled",
-            target_chat_id=target_chat_id,
-            scheduled_at=scheduled_at.isoformat(),
-            schedule_attempts=0,
-            schedule_error=None,
-        )
-        await self._set_editor_keyboard(draft_id)
-        self.schedule_wakeup.set()
-        formatted = format_publish_time(
-            scheduled_at,
-            self.settings.publish_schedule_utc_offset_hours,
-        )
-        await self.bot.send_message(
+        channel_ids = await self._draft_publication_channel_ids(draft)
+        return await self._schedule_draft_at_times(
+            draft,
             owner_id,
-            f"Черновик #{draft_id} запланирован на {formatted}.",
+            {channel_id: scheduled_at for channel_id in channel_ids},
         )
-        return True
+
+    async def schedule_draft_in_next_slots(
+        self,
+        draft_id: int,
+        owner_id: int,
+    ) -> bool:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft:
+            await self.bot.send_message(owner_id, "Черновик не найден.")
+            return False
+        channel_ids = await self._draft_publication_channel_ids(draft)
+        schedule: dict[int, datetime] = {}
+        missing: list[str] = []
+        for channel_id in channel_ids:
+            slots = await self._upcoming_slots_for_channel(
+                draft,
+                channel_id,
+                exclude_current=True,
+            )
+            if slots:
+                schedule[channel_id] = slots[0]
+            else:
+                missing.append(await self._channel_label(channel_id))
+        if missing:
+            await self.bot.send_message(
+                owner_id,
+                "Нет свободных окон в расписании: " + ", ".join(missing),
+            )
+            return False
+        return await self._schedule_draft_at_times(draft, owner_id, schedule)
 
     async def unschedule_draft(self, draft_id: int, owner_id: int) -> None:
         draft = await self.repository.get_draft(draft_id)
-        if not draft or draft["status"] != "scheduled":
+        if not draft or not any(
+            item.get("status") == "scheduled"
+            for item in draft.get("publications", [])
+        ):
             await self.bot.send_message(owner_id, "Черновик не стоит в расписании.")
             return
-        await self.repository.update_draft(
-            draft_id,
-            status="draft",
-            target_chat_id=None,
-            scheduled_at=None,
-            schedule_attempts=0,
-            schedule_error=None,
+        publications = [
+            item
+            for item in draft.get("publications", [])
+            if item.get("status") != "scheduled"
+        ]
+        await self._save_draft_publications(draft_id, publications)
+        await self.bot.send_message(
+            owner_id,
+            f"Черновик #{draft_id} снят со всех запланированных публикаций.",
         )
-        await self._set_editor_keyboard(draft_id)
-        self.schedule_wakeup.set()
-        await self.bot.send_message(owner_id, f"Черновик #{draft_id} снят с расписания.")
 
     async def _set_editor_keyboard(self, draft_id: int) -> None:
         draft = await self.repository.get_draft(draft_id)
@@ -2912,12 +3178,21 @@ class EditorBot:
             due = await self.repository.due_scheduled_drafts(now)
             for draft in due:
                 draft_id = int(draft["id"])
+                target_chat_id = int(draft["publication_target_chat_id"])
                 owners = await self.repository.owner_ids()
                 owner_id = owners[0] if owners else None
                 try:
-                    published = await self.publish_draft(draft_id, owner_id)
+                    published = await self.publish_draft(
+                        draft_id,
+                        None,
+                        target_chat_id=target_chat_id,
+                    )
                 except Exception as error:
-                    logger.exception("Scheduled publication failed for draft %s", draft_id)
+                    logger.exception(
+                        "Scheduled publication failed for draft %s in channel %s",
+                        draft_id,
+                        target_chat_id,
+                    )
                     published = False
                     failure = f"{type(error).__name__}: {error}"
                 else:
@@ -2925,36 +3200,55 @@ class EditorBot:
                 if published:
                     continue
                 current = await self.repository.get_draft(draft_id)
-                if not current or current["status"] != "scheduled":
+                if not current:
                     continue
-                attempts = int(current.get("schedule_attempts") or 0) + 1
+                publications = [
+                    dict(item) for item in current.get("publications", [])
+                ]
+                publication = next(
+                    (
+                        item
+                        for item in publications
+                        if int(item.get("target_chat_id") or 0) == target_chat_id
+                    ),
+                    None,
+                )
+                if publication is None or publication.get("status") == "published":
+                    continue
+                attempts = int(publication.get("attempts") or 0) + 1
+                label = await self._channel_label(target_chat_id)
                 if attempts >= MAX_SCHEDULE_ATTEMPTS:
-                    await self.repository.update_draft(
-                        draft_id,
-                        status="draft",
-                        scheduled_at=None,
-                        schedule_attempts=attempts,
-                        schedule_error=failure,
+                    publication.update(
+                        status="failed",
+                        attempts=attempts,
+                        error=failure,
                     )
-                    await self._set_editor_keyboard(draft_id)
+                    await self._save_draft_publications(
+                        draft_id,
+                        publications,
+                    )
                     if owner_id is not None:
                         await self.bot.send_message(
                             owner_id,
                             f"Отложенная публикация #{draft_id} не удалась "
-                            "после трёх попыток. Черновик вернут на редактуру.",
+                            f"в канале {label} после трёх попыток.",
                         )
                 else:
                     retry_at = datetime.now(UTC) + SCHEDULE_RETRY_DELAY
-                    await self.repository.update_draft(
-                        draft_id,
+                    publication.update(
+                        status="scheduled",
                         scheduled_at=retry_at.isoformat(),
-                        schedule_attempts=attempts,
-                        schedule_error=failure,
+                        attempts=attempts,
+                        error=failure,
+                    )
+                    await self._save_draft_publications(
+                        draft_id,
+                        publications,
                     )
                     if owner_id is not None:
                         await self.bot.send_message(
                             owner_id,
-                            f"Публикация #{draft_id} не прошла. "
+                            f"Публикация #{draft_id} в {label} не прошла. "
                             "Повторю через 5 минут.",
                         )
 
@@ -2978,33 +3272,61 @@ class EditorBot:
             if stop_task in done and stop_event.is_set():
                 return
 
-    async def publish_draft(self, draft_id: int, owner_id: int | None) -> bool:
+    async def publish_draft(
+        self,
+        draft_id: int,
+        owner_id: int | None,
+        *,
+        target_chat_id: int | None = None,
+    ) -> bool:
         lock = self._publication_locks.setdefault(draft_id, asyncio.Lock())
         async with lock:
-            return await self._publish_draft_unlocked(draft_id, owner_id)
+            return await self._publish_draft_unlocked(
+                draft_id,
+                owner_id,
+                target_chat_id=target_chat_id,
+            )
 
     async def _publish_draft_unlocked(
         self,
         draft_id: int,
         owner_id: int | None,
+        *,
+        target_chat_id: int | None = None,
     ) -> bool:
         draft = await self.repository.get_draft(draft_id)
         if not draft:
             return False
-        if draft["status"] == "published":
-            if owner_id is not None:
-                await self.bot.send_message(owner_id, "Этот материал уже опубликован.")
-            return True
-        target_chat_id = draft.get("target_chat_id")
-        if target_chat_id is None:
-            target_chat_id = await self.repository.get_setting("target_chat_id")
-        if not target_chat_id:
+        publications = [dict(item) for item in draft.get("publications", [])]
+        published_channels = {
+            int(item["target_chat_id"])
+            for item in publications
+            if item.get("status") == "published"
+        }
+        if target_chat_id is not None:
+            target_chat_ids = [target_chat_id]
+        else:
+            target_chat_ids = [
+                int(item["target_chat_id"])
+                for item in publications
+                if item.get("status") == "scheduled"
+            ]
+            if not target_chat_ids:
+                target_chat_ids = await self._selected_publication_channel_ids()
+        target_chat_ids = list(
+            dict.fromkeys(
+                channel_id
+                for channel_id in target_chat_ids
+                if channel_id not in published_channels
+            )
+        )
+        if not target_chat_ids:
             if owner_id is not None:
                 await self.bot.send_message(
                     owner_id,
-                    "Канал публикации не настроен. Используй /setup.",
+                    "Нет выбранных каналов либо пост уже опубликован во всех из них.",
                 )
-            return False
+            return bool(published_channels)
         sources = [SourceDocument.from_dict(item) for item in draft["sources"]]
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
         rendered = render_post(post, sources, self.settings.max_post_chars)
@@ -3016,71 +3338,97 @@ class EditorBot:
                     "Публикация остановлена. У материала нет изображения.",
                 )
             return False
-        file_value = await self._media_input(media)
-        if not file_value:
-            if owner_id is not None:
+        succeeded: list[str] = []
+        failed: list[str] = []
+        for channel_id in target_chat_ids:
+            label = await self._channel_label(channel_id)
+            file_value = await self._media_input(media)
+            if not file_value:
+                failed.append(label)
+                continue
+            sent = None
+            try:
+                sent = await self.bot.send_rich_message(
+                    chat_id=channel_id,
+                    rich_message=self._rich_message(
+                        rendered.rich_html,
+                        file_value,
+                        str(media.get("type") or "photo"),
+                    ),
+                )
+            except TelegramBadRequest:
+                if rendered.char_count <= 1024:
+                    try:
+                        if media.get("type") == "video":
+                            sent = await self.bot.send_video(
+                                channel_id,
+                                video=file_value,
+                                caption=rendered.html,
+                            )
+                        else:
+                            sent = await self.bot.send_photo(
+                                channel_id,
+                                photo=file_value,
+                                caption=rendered.html,
+                            )
+                    except TelegramBadRequest:
+                        sent = None
+            publication = next(
+                (
+                    item
+                    for item in publications
+                    if int(item.get("target_chat_id") or 0) == channel_id
+                ),
+                None,
+            )
+            if sent is None:
+                logger.warning(
+                    "Rich media publication failed for draft %s in channel %s",
+                    draft_id,
+                    channel_id,
+                )
+                failed.append(label)
+                if target_chat_id is None:
+                    if publication is None:
+                        publication = {"target_chat_id": channel_id}
+                        publications.append(publication)
+                    publication.update(
+                        status="failed",
+                        error="Telegram rejected post",
+                    )
+                continue
+            if publication is None:
+                publication = {"target_chat_id": channel_id}
+                publications.append(publication)
+            publication.update(
+                status="published",
+                scheduled_at=None,
+                attempts=0,
+                error=None,
+                target_message_id=sent.message_id,
+            )
+            succeeded.append(label)
+            await self._save_draft_publications(
+                draft_id,
+                publications,
+                target_message_id=sent.message_id,
+            )
+        if failed and target_chat_id is None:
+            await self._save_draft_publications(draft_id, publications)
+        if owner_id is not None:
+            if succeeded:
                 await self.bot.send_message(
                     owner_id,
-                    "Публикация остановлена. Не удалось скачать изображение.",
+                    f"Черновик #{draft_id} опубликован: "
+                    + ", ".join(succeeded),
                 )
-            return False
-
-        try:
-            sent = await self.bot.send_rich_message(
-                chat_id=int(target_chat_id),
-                rich_message=self._rich_message(
-                    rendered.rich_html,
-                    file_value,
-                    str(media.get("type") or "photo"),
-                ),
-            )
-        except TelegramBadRequest:
-            if rendered.char_count <= 1024:
-                try:
-                    if media.get("type") == "video":
-                        sent = await self.bot.send_video(
-                            int(target_chat_id),
-                            video=file_value,
-                            caption=rendered.html,
-                        )
-                    else:
-                        sent = await self.bot.send_photo(
-                            int(target_chat_id),
-                            photo=file_value,
-                            caption=rendered.html,
-                        )
-                except TelegramBadRequest:
-                    sent = None
-            else:
-                sent = None
-            if sent is None:
-                logger.warning("Rich media publication failed for draft %s", draft_id)
-                if owner_id is not None:
-                    await self.bot.send_message(
-                        owner_id,
-                        "Публикация остановлена. Telegram не принял единый пост с изображением.",
-                    )
-                return False
-
-        await self.repository.update_draft(
-            draft_id,
-            status="published",
-            target_chat_id=int(target_chat_id),
-            target_message_id=sent.message_id,
-            target_media_message_id=None,
-            scheduled_at=None,
-            schedule_attempts=0,
-            schedule_error=None,
-        )
-        if draft["editor_chat_id"] and draft["editor_message_id"]:
-            await self.bot.edit_message_reply_markup(
-                chat_id=draft["editor_chat_id"],
-                message_id=draft["editor_message_id"],
-                reply_markup=None,
-            )
-        if owner_id is not None:
-            await self.bot.send_message(owner_id, f"Черновик #{draft_id} опубликован.")
-        return True
+            if failed:
+                await self.bot.send_message(
+                    owner_id,
+                    f"Не удалось опубликовать #{draft_id}: "
+                    + ", ".join(failed),
+                )
+        return not failed
 
     async def _send_sources(self, user_id: int, draft: dict[str, Any]) -> None:
         lines = [f"Источники черновика #{draft['id']}\n"]
@@ -3125,7 +3473,7 @@ class EditorBot:
                     callback_data=f"pubnow:{draft_id}",
                 ),
                 InlineKeyboardButton(
-                    text="Следующее окно",
+                    text="Следующие окна",
                     callback_data=f"pubnext:{draft_id}",
                 ),
             ],
