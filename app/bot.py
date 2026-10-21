@@ -1376,7 +1376,7 @@ class EditorBot:
         await message.answer(
             f"Лимит поста  {self.settings.max_post_chars}\n"
             f"Порог релевантности  {self.settings.relevance_threshold:.2f}\n"
-            "Проверка RSS  адаптивно\n"
+            "Проверка RSS и Telegram  адаптивно\n"
             f"В активные часы  каждые {self.settings.rss_poll_interval_seconds} секунд\n"
             "Вне активных часов  каждые "
             f"{self.settings.rss_offpeak_poll_interval_seconds} секунд\n"

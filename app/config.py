@@ -88,12 +88,12 @@ class Settings:
             solidot_rss_url=os.getenv(
                 "SOLIDOT_RSS_URL", "https://www.solidot.org/index.rss"
             ).strip(),
-            rss_poll_interval_seconds=int(os.getenv("RSS_POLL_INTERVAL_SECONDS", "120")),
+            rss_poll_interval_seconds=int(os.getenv("RSS_POLL_INTERVAL_SECONDS", "300")),
             rss_offpeak_poll_interval_seconds=int(
                 os.getenv("RSS_OFFPEAK_POLL_INTERVAL_SECONDS", "1800")
             ),
             rss_active_windows=_active_windows(
-                "RSS_ACTIVE_WINDOWS", "07:30-15:30,18:00-22:30"
+                "RSS_ACTIVE_WINDOWS", "05:00-23:00"
             ),
             rss_schedule_utc_offset_hours=int(
                 os.getenv("RSS_SCHEDULE_UTC_OFFSET_HOURS", "4")
