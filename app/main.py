@@ -10,14 +10,11 @@ from app.config import Settings
 from app.db import Repository
 from app.extractor import ArticleExtractor
 from app.llm import QwenClient
-from app.models import StoryCandidate
 from app.pipeline import ContentPipeline
-from app.rss import FeedEntry, SolidotFeed
+from app.rss_sources import RssSourceManager
 from app.telegram_sources import TelegramSourceManager
 
 logger = logging.getLogger(__name__)
-FEED_RETRY_DELAY = timedelta(minutes=30)
-MAX_FEED_ATTEMPTS = 3
 
 
 def rss_poll_delay_seconds(settings: Settings, now: datetime | None = None) -> int:
@@ -50,110 +47,31 @@ def rss_poll_delay_seconds(settings: Settings, now: datetime | None = None) -> i
     )
 
 
-async def _store_and_process(
-    entry: FeedEntry,
-    repository: Repository,
-    pipeline: ContentPipeline,
-) -> None:
-    item_id = await repository.add_feed_item(
-        SolidotFeed.source_key,
-        entry.external_id,
-        entry.link,
-        entry.title,
-        entry.published_at,
-        "processing",
-        entry.raw,
-    )
-    candidate = StoryCandidate(
-        origin_type="solidot_rss",
-        origin_ref=entry.link,
-        title=entry.title,
-        text=entry.summary,
-        urls=entry.urls,
-    )
-    await pipeline.process_feed_item(item_id, candidate)
-
-
-async def _retry_and_process(
-    item_id: int,
-    entry: FeedEntry,
-    repository: Repository,
-    pipeline: ContentPipeline,
-) -> None:
-    await repository.mark_feed_processing(item_id)
-    candidate = StoryCandidate(
-        origin_type="solidot_rss",
-        origin_ref=entry.link,
-        title=entry.title,
-        text=entry.summary,
-        urls=entry.urls,
-    )
-    await pipeline.process_feed_item(item_id, candidate)
-
-
-def _retryable_feed_item(state: dict[str, object], now: datetime | None = None) -> bool:
-    if state.get("status") != "failed":
-        return False
-    if not str(state.get("error") or "").startswith("ValueError"):
-        return False
-    if int(state.get("attempt_count") or 0) >= MAX_FEED_ATTEMPTS:
-        return False
-    try:
-        updated_at = datetime.fromisoformat(str(state["updated_at"]))
-    except (KeyError, TypeError, ValueError):
-        return False
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=UTC)
-    return (now or datetime.now(UTC)) - updated_at >= FEED_RETRY_DELAY
-
-
 async def rss_worker(
     settings: Settings,
-    repository: Repository,
-    pipeline: ContentPipeline,
+    manager: RssSourceManager,
     stop_event: asyncio.Event,
 ) -> None:
-    feed = SolidotFeed(settings.solidot_rss_url, settings.http_timeout_seconds)
     previous_delay: int | None = None
     while not stop_event.is_set():
         try:
-            entries = await feed.fetch()
-            has_history = await repository.feed_has_items(SolidotFeed.source_key)
-            unseen: list[FeedEntry] = []
-            retries: list[tuple[int, FeedEntry]] = []
-            for entry in entries:
-                state = await repository.get_feed_item_state(
-                    SolidotFeed.source_key,
-                    entry.external_id,
+            result = await manager.poll_all()
+            if result["found"] or result["errors"]:
+                logger.info(
+                    "RSS sources checked: sources=%s found=%s processed=%s "
+                    "drafts=%s errors=%s",
+                    result["sources"],
+                    result["found"],
+                    result["processed"],
+                    result["drafts"],
+                    result["errors"],
                 )
-                if state is None:
-                    unseen.append(entry)
-                elif _retryable_feed_item(state):
-                    retries.append((int(state["id"]), entry))
-            if not has_history and len(unseen) > settings.rss_bootstrap_items:
-                baseline = unseen[settings.rss_bootstrap_items :]
-                for entry in baseline:
-                    await repository.add_feed_item(
-                        SolidotFeed.source_key,
-                        entry.external_id,
-                        entry.link,
-                        entry.title,
-                        entry.published_at,
-                        "baseline",
-                        entry.raw,
-                    )
-                unseen = unseen[: settings.rss_bootstrap_items]
-            for entry in reversed(unseen):
-                await _store_and_process(entry, repository, pipeline)
-            for item_id, entry in reversed(retries):
-                logger.info("Retrying failed feed item %s", item_id)
-                await _retry_and_process(item_id, entry, repository, pipeline)
         except Exception:
-            logger.exception("Solidot RSS polling failed")
+            logger.exception("RSS source polling failed")
 
         delay = rss_poll_delay_seconds(settings)
         if delay != previous_delay:
-            logger.info("Next Solidot RSS check in %s seconds", delay)
+            logger.info("Next RSS source check in %s seconds", delay)
             previous_delay = delay
         try:
             await asyncio.wait_for(
@@ -223,7 +141,21 @@ async def main() -> None:
         pipeline,
         timeout=settings.http_timeout_seconds,
     )
-    editor_bot = EditorBot(settings, repository, pipeline, telegram_sources)
+    rss_sources = RssSourceManager(
+        repository,
+        pipeline,
+        timeout=settings.http_timeout_seconds,
+        builtin_url=settings.solidot_rss_url,
+        bootstrap_items=settings.rss_bootstrap_items,
+    )
+    await rss_sources.ensure_builtin()
+    editor_bot = EditorBot(
+        settings,
+        repository,
+        pipeline,
+        telegram_sources,
+        rss_sources,
+    )
     pipeline.set_delivery(editor_bot.deliver_draft)
     await editor_bot.initialize()
 
@@ -235,7 +167,7 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
-    feed_task = asyncio.create_task(rss_worker(settings, repository, pipeline, stop_event))
+    feed_task = asyncio.create_task(rss_worker(settings, rss_sources, stop_event))
     telegram_task = asyncio.create_task(
         telegram_source_worker(settings, telegram_sources, stop_event)
     )

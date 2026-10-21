@@ -129,6 +129,98 @@ def test_home_keyboard_opens_every_main_section() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sources_menu_reports_rss_and_telegram_separately() -> None:
+    editor = object.__new__(EditorBot)
+    editor.repository = SimpleNamespace(
+        content_sources=AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "id": 1,
+                        "kind": "rss",
+                        "source_key": "solidot",
+                        "title": "Solidot RSS",
+                        "url": "https://www.solidot.org/index.rss",
+                        "enabled": 1,
+                    }
+                ],
+                [
+                    {
+                        "id": 2,
+                        "kind": "telegram_web",
+                        "source_key": "telegram_web:example_channel",
+                        "title": "Example Channel",
+                        "url": "https://t.me/s/example_channel",
+                        "enabled": 1,
+                    }
+                ],
+            ]
+        )
+    )
+    editor._navigation_rows = AsyncMock(return_value=[])
+    editor.bot = SimpleNamespace(send_message=AsyncMock())
+
+    await editor._show_sources_menu(-1001, user_id=77)
+
+    text = editor.bot.send_message.await_args.args[1]
+    keyboard = editor.bot.send_message.await_args.kwargs["reply_markup"]
+    callbacks = {
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    }
+    assert "Подключено по RSS: 1" in text
+    assert "Solidot RSS" in text
+    assert "Подключено по Telegram: 1" in text
+    assert "Example Channel (@example_channel)" in text
+    assert "sourceaddrss:0" in callbacks
+    assert "sourceaddtelegram:0" in callbacks
+
+
+@pytest.mark.asyncio
+async def test_source_check_report_has_separate_rss_and_telegram_blocks() -> None:
+    editor = object.__new__(EditorBot)
+    editor.rss_sources = SimpleNamespace(
+        poll_all=AsyncMock(
+            return_value={
+                "sources": 2,
+                "found": 3,
+                "processed": 3,
+                "drafts": 1,
+                "errors": 0,
+            }
+        )
+    )
+    editor.telegram_sources = SimpleNamespace(
+        poll_all=AsyncMock(
+            return_value={
+                "sources": 1,
+                "found": 2,
+                "processed": 2,
+                "drafts": 1,
+                "errors": 0,
+            }
+        )
+    )
+    editor.repository = SimpleNamespace(
+        content_sources=AsyncMock(
+            side_effect=[
+                [{"title": "Solidot RSS"}, {"title": "Vendor Blog"}],
+                [{"title": "Example Channel"}],
+            ]
+        )
+    )
+    editor.bot = SimpleNamespace(send_message=AsyncMock())
+
+    await editor._run_source_check(-1001, None)
+
+    text = editor.bot.send_message.await_args.args[1]
+    assert "Подключено по RSS:</b> Solidot RSS, Vendor Blog" in text
+    assert "Подключено по Telegram:</b> Example Channel" in text
+    assert "Всего проверено конвейером: <b>5</b>" in text
+
+
+@pytest.mark.asyncio
 async def test_home_callback_replaces_service_screen_in_place() -> None:
     editor = object.__new__(EditorBot)
     editor._is_owner = AsyncMock(return_value=True)

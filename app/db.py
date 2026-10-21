@@ -133,6 +133,7 @@ class Repository:
                     chat_id INTEGER PRIMARY KEY,
                     user_id INTEGER NOT NULL,
                     prompt_message_id INTEGER,
+                    kind TEXT NOT NULL DEFAULT 'telegram_web',
                     created_at TEXT NOT NULL
                 );
                 """
@@ -207,6 +208,13 @@ class Repository:
             if "attempt_count" not in feed_columns:
                 await db.execute(
                     "ALTER TABLE feed_items ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            cursor = await db.execute("PRAGMA table_info(source_input_requests)")
+            source_request_columns = {str(row[1]) for row in await cursor.fetchall()}
+            if "kind" not in source_request_columns:
+                await db.execute(
+                    "ALTER TABLE source_input_requests "
+                    "ADD COLUMN kind TEXT NOT NULL DEFAULT 'telegram_web'"
                 )
             await db.commit()
 
@@ -796,19 +804,21 @@ class Repository:
         chat_id: int,
         user_id: int,
         prompt_message_id: int | None,
+        kind: str = "telegram_web",
     ) -> None:
         async with self.connect() as db:
             await db.execute(
                 """
                 INSERT INTO source_input_requests(
-                    chat_id, user_id, prompt_message_id, created_at
-                ) VALUES (?, ?, ?, ?)
+                    chat_id, user_id, prompt_message_id, kind, created_at
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     prompt_message_id = excluded.prompt_message_id,
+                    kind = excluded.kind,
                     created_at = excluded.created_at
                 """,
-                (chat_id, user_id, prompt_message_id, _now()),
+                (chat_id, user_id, prompt_message_id, kind, _now()),
             )
             await db.commit()
 

@@ -43,6 +43,8 @@ from app.renderer import (
     render_post,
     validate_post,
 )
+from app.rss import normalize_rss_url
+from app.rss_sources import RssSourceManager
 from app.telegram_sources import TelegramSourceManager, parse_public_channel_username
 
 logger = logging.getLogger(__name__)
@@ -307,11 +309,13 @@ class EditorBot:
         repository: Repository,
         pipeline: ContentPipeline,
         telegram_sources: TelegramSourceManager | None = None,
+        rss_sources: RssSourceManager | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.pipeline = pipeline
         self.telegram_sources = telegram_sources
+        self.rss_sources = rss_sources
         self.bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -978,8 +982,9 @@ class EditorBot:
             return
         text = (
             "IT Vibe Content Editor запущен.\n\n"
-            "Бот получает новости из Solidot RSS и пересланные сообщения, проверяет "
-            "источники и готовит черновики. Для привязки каналов используй /setup."
+            "Бот получает новости из RSS/Atom, публичных Telegram-каналов "
+            "и пересланных сообщений, проверяет источники и готовит черновики. "
+            "Для привязки каналов используй /setup."
         )
         await message.answer(
             text,
@@ -1117,31 +1122,48 @@ class EditorBot:
         user_id: int,
         message_id: int | None = None,
     ) -> None:
-        sources = await self.repository.content_sources(kind="telegram_web")
-        enabled = sum(bool(source["enabled"]) for source in sources)
+        rss_sources = await self.repository.content_sources(kind="rss")
+        telegram_sources = await self.repository.content_sources(kind="telegram_web")
+        rss_enabled = sum(bool(source["enabled"]) for source in rss_sources)
+        telegram_enabled = sum(bool(source["enabled"]) for source in telegram_sources)
         lines = [
             "<b>📰 Источники контента</b>",
-            (
-                "🟢 <b>Solidot RSS</b>\n"
-                f"<code>{html.escape(self.settings.solidot_rss_url)}</code>"
-            ),
-            (
-                f"Telegram-каналов: <b>{len(sources)}</b> · "
-                f"включено: <b>{enabled}</b>"
-            ),
-            (
-                "Бот читает только открытую веб-ленту <code>t.me/s/...</code>. "
-                "Закрытые каналы и обход ограничений не используются."
-            ),
+            f"<b>Подключено по RSS: {len(rss_sources)}</b> · включено: {rss_enabled}",
         ]
+        if rss_sources:
+            lines.extend(
+                f"{'🟢' if source['enabled'] else '⚪️'} "
+                f"{html.escape(str(source['title']))}\n"
+                f"<code>{html.escape(str(source['url']))}</code>"
+                for source in rss_sources
+            )
+        else:
+            lines.append("— RSS-лент пока нет")
+        lines.append(
+            f"<b>Подключено по Telegram: {len(telegram_sources)}</b> · "
+            f"включено: {telegram_enabled}"
+        )
+        if telegram_sources:
+            lines.extend(
+                f"{'🟢' if source['enabled'] else '⚪️'} "
+                f"{html.escape(str(source['title']))} "
+                f"(@{html.escape(str(source['source_key']).split(':', 1)[1])})"
+                for source in telegram_sources
+            )
+        else:
+            lines.append("— Telegram-каналов пока нет")
+        lines.append(
+            "RSS/Atom загружается по публичной ссылке. Telegram читается "
+            "только через открытую веб-ленту <code>t.me/s/...</code>."
+        )
         rows: list[list[InlineKeyboardButton]] = []
-        for source in sources:
+        for source in [*rss_sources, *telegram_sources]:
             marker = "🟢" if source["enabled"] else "⚪️"
-            username = str(source["source_key"]).split(":", 1)[1]
+            kind_label = "RSS" if source["kind"] == "rss" else "TG"
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"{marker} {source['title']} (@{username})"[:64],
+                        text=f"{marker} {kind_label} · {source['title']}"[:64],
                         callback_data=f"sourceitem:{source['id']}",
                     )
                 ]
@@ -1150,8 +1172,12 @@ class EditorBot:
             [
                 [
                     InlineKeyboardButton(
-                        text="➕ Добавить Telegram-канал",
-                        callback_data="sourceadd:0",
+                        text="➕ Добавить RSS",
+                        callback_data="sourceaddrss:0",
+                    ),
+                    InlineKeyboardButton(
+                        text="➕ Добавить Telegram",
+                        callback_data="sourceaddtelegram:0",
                     )
                 ],
                 [
@@ -1195,7 +1221,14 @@ class EditorBot:
         message_id: int,
         source: dict[str, Any],
     ) -> None:
-        username = str(source["source_key"]).split(":", 1)[1]
+        is_rss = source["kind"] == "rss"
+        if is_rss:
+            source_type = "RSS/Atom"
+            address = f"<code>{html.escape(str(source['url']))}</code>"
+        else:
+            source_type = "Telegram"
+            username = str(source["source_key"]).split(":", 1)[1]
+            address = f"@{html.escape(username)}"
         status = "🟢 включён" if source["enabled"] else "⚪️ выключен"
         error = (
             f"\nОшибка: <code>{html.escape(str(source['last_error']))}</code>"
@@ -1204,7 +1237,8 @@ class EditorBot:
         )
         text = (
             f"<b>{html.escape(str(source['title']))}</b>\n\n"
-            f"@{html.escape(username)}\n"
+            f"Тип: {source_type}\n"
+            f"{address}\n"
             f"Статус: {status}\n"
             f"Последний ID: <code>{html.escape(str(source.get('last_external_id') or '—'))}</code>\n"
             f"Проверено: {html.escape(str(source.get('last_checked_at') or 'ещё нет'))}"
@@ -1223,12 +1257,18 @@ class EditorBot:
                         callback_data=f"sourcecheck:{source['id']}",
                     ),
                 ],
-                [
-                    InlineKeyboardButton(
-                        text="🗑 Удалить источник",
-                        callback_data=f"sourcedelask:{source['id']}",
-                    )
-                ],
+                *(
+                    []
+                    if source["source_key"] == RssSourceManager.builtin_source_key
+                    else [
+                        [
+                            InlineKeyboardButton(
+                                text="🗑 Удалить источник",
+                                callback_data=f"sourcedelask:{source['id']}",
+                            )
+                        ]
+                    ]
+                ),
                 [
                     InlineKeyboardButton(
                         text="« Назад к источникам",
@@ -1250,36 +1290,76 @@ class EditorBot:
         chat_id: int,
         source_id: int | None,
     ) -> None:
-        if not self.telegram_sources:
-            await self.bot.send_message(chat_id, "Telegram-источники недоступны.")
+        if not self.telegram_sources and not self.rss_sources:
+            await self.bot.send_message(chat_id, "Источники сейчас недоступны.")
             return
         try:
             if source_id is None:
-                result = await self.telegram_sources.poll_all()
+                empty = {
+                    "sources": 0,
+                    "found": 0,
+                    "processed": 0,
+                    "drafts": 0,
+                    "errors": 0,
+                }
+                rss_result, telegram_result = await asyncio.gather(
+                    self.rss_sources.poll_all() if self.rss_sources else asyncio.sleep(0, result=empty),
+                    (
+                        self.telegram_sources.poll_all()
+                        if self.telegram_sources
+                        else asyncio.sleep(0, result=empty)
+                    ),
+                )
+                rss_sources = await self.repository.content_sources(kind="rss")
+                telegram_sources = await self.repository.content_sources(
+                    kind="telegram_web"
+                )
+                rss_names = ", ".join(str(source["title"]) for source in rss_sources) or "нет"
+                telegram_names = (
+                    ", ".join(str(source["title"]) for source in telegram_sources)
+                    or "нет"
+                )
                 text = (
                     "Проверка источников завершена.\n\n"
-                    f"Каналов: <b>{result['sources']}</b>\n"
-                    f"Новых постов: <b>{result['found']}</b>\n"
-                    f"Проверено конвейером: <b>{result['processed']}</b>\n"
-                    f"Создано черновиков: <b>{result['drafts']}</b>\n"
-                    f"Ошибок источников: <b>{result['errors']}</b>"
+                    f"<b>Подключено по RSS:</b> {html.escape(rss_names)}\n"
+                    f"Лент: <b>{rss_result['sources']}</b> · "
+                    f"новых материалов: <b>{rss_result['found']}</b> · "
+                    f"черновиков: <b>{rss_result['drafts']}</b> · "
+                    f"ошибок: <b>{rss_result['errors']}</b>\n\n"
+                    f"<b>Подключено по Telegram:</b> {html.escape(telegram_names)}\n"
+                    f"Каналов: <b>{telegram_result['sources']}</b> · "
+                    f"новых постов: <b>{telegram_result['found']}</b> · "
+                    f"черновиков: <b>{telegram_result['drafts']}</b> · "
+                    f"ошибок: <b>{telegram_result['errors']}</b>\n\n"
+                    "Всего проверено конвейером: "
+                    f"<b>{rss_result['processed'] + telegram_result['processed']}</b>"
                 )
             else:
                 source = await self.repository.get_content_source(source_id)
                 if not source:
                     await self.bot.send_message(chat_id, "Источник не найден.")
                     return
-                result = await self.telegram_sources.poll_source(source)
+                manager = (
+                    self.rss_sources
+                    if source["kind"] == RssSourceManager.kind
+                    else self.telegram_sources
+                )
+                if not manager:
+                    await self.bot.send_message(chat_id, "Этот тип источника недоступен.")
+                    return
+                result = await manager.poll_source(source)
+                source_type = "RSS" if source["kind"] == "rss" else "Telegram"
                 text = (
-                    f"Источник <b>{html.escape(str(source['title']))}</b> проверен.\n\n"
+                    f"{source_type}-источник "
+                    f"<b>{html.escape(str(source['title']))}</b> проверен.\n\n"
                     f"Новых постов: <b>{result['found']}</b>\n"
                     f"Проверено: <b>{result['processed']}</b>\n"
                     f"Создано черновиков: <b>{result['drafts']}</b>"
                 )
         except Exception as error:  # noqa: BLE001 - report background source failures in UI
-            logger.warning("Manual Telegram source check failed: %s", type(error).__name__)
+            logger.warning("Manual source check failed: %s", type(error).__name__)
             text = (
-                "Проверка Telegram-источника завершилась ошибкой.\n\n"
+                "Проверка источника завершилась ошибкой.\n\n"
                 f"<code>{html.escape(str(error))}</code>"
             )
         await self.bot.send_message(chat_id, text)
@@ -2386,7 +2466,8 @@ class EditorBot:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
         await message.answer(
-            "Перешли сюда пост из любого канала или дождись новой публикации Solidot. "
+            "Перешли сюда пост или дождись нового материала в одном из "
+            "подключённых RSS или Telegram-источников. "
             "Подготовленный материал появится в редакторском канале. Управление выполняется "
             "кнопками под черновиком. Текст можно изменить прямо через меню Telegram «⋯ → Изменить». "
             "Очередь публикаций и её настройки доступны "
@@ -2630,30 +2711,48 @@ class EditorBot:
         message: Message,
         request: dict[str, Any],
     ) -> None:
-        if not self.telegram_sources:
-            await message.answer("Telegram-источники сейчас недоступны.")
+        kind = str(request.get("kind") or "telegram_web")
+        manager = self.rss_sources if kind == "rss" else self.telegram_sources
+        if not manager:
+            await message.answer("Этот тип источников сейчас недоступен.")
             return
         value = (message.text or message.caption or "").strip()
         try:
-            parse_public_channel_username(value)
+            if kind == "rss":
+                normalize_rss_url(value)
+            else:
+                parse_public_channel_username(value)
         except ValueError as error:
             await message.answer(f"{html.escape(str(error))}. Попробуй ещё раз.")
             return
-        progress = await message.answer("Проверяю открытую веб-ленту Telegram…")
+        progress_text = (
+            "Проверяю RSS/Atom-ленту…"
+            if kind == "rss"
+            else "Проверяю открытую веб-ленту Telegram…"
+        )
+        progress = await message.answer(progress_text)
         try:
-            await self.telegram_sources.add(value)
+            await manager.add(value)
         except Exception as error:  # noqa: BLE001 - keep the input flow recoverable
-            logger.warning("Could not add Telegram source: %s", type(error).__name__)
+            logger.warning("Could not add content source: %s", type(error).__name__)
             try:
                 await self.bot.delete_message(progress.chat.id, progress.message_id)
             except TelegramBadRequest:
                 pass
-            await message.answer(
-                "Не удалось открыть публичную ленту.\n\n"
-                f"<code>{html.escape(str(error))}</code>\n\n"
-                "Проверь username и что адрес <code>t.me/s/username</code> "
-                "открывается без входа."
-            )
+            if kind == "rss":
+                await message.answer(
+                    "Не удалось подключить RSS/Atom-ленту.\n\n"
+                    f"<code>{html.escape(str(error))}</code>\n\n"
+                    "Проверь, что ссылка открывается без входа и "
+                    "возвращает RSS или Atom."
+                )
+            else:
+                await message.answer(
+                    "Не удалось открыть публичную ленту.\n\n"
+                    f"<code>{html.escape(str(error))}</code>\n\n"
+                    "Проверь username и что адрес <code>t.me/s/username</code> "
+                    "открывается без входа."
+                )
             return
 
         await self.repository.clear_source_input_request(message.chat.id)
@@ -3208,7 +3307,8 @@ class EditorBot:
         source_actions = {
             "sources",
             "sourceitem",
-            "sourceadd",
+            "sourceaddrss",
+            "sourceaddtelegram",
             "sourcecancel",
             "sourcecheck",
             "sourcecheckall",
@@ -3231,18 +3331,33 @@ class EditorBot:
                     message_id=None if source_draft else message_id,
                 )
                 return
-            if action == "sourceadd":
-                if not self.telegram_sources:
+            if action in {"sourceaddrss", "sourceaddtelegram"}:
+                kind = "rss" if action == "sourceaddrss" else "telegram_web"
+                manager = self.rss_sources if kind == "rss" else self.telegram_sources
+                if not manager:
                     await callback.answer("Функция недоступна", show_alert=True)
                     return
-                await callback.answer("Жду username")
+                await callback.answer(
+                    "Жду RSS-ссылку" if kind == "rss" else "Жду username"
+                )
+                if kind == "rss":
+                    prompt_text = (
+                        "<b>Добавление RSS/Atom-источника</b>\n\n"
+                        "Отправь следующим сообщением публичную ссылку "
+                        "на RSS или Atom, например:\n"
+                        "<code>https://example.com/feed.xml</code>"
+                    )
+                else:
+                    prompt_text = (
+                        "<b>Добавление Telegram-источника</b>\n\n"
+                        "Отправь следующим сообщением <code>@username</code> "
+                        "или <code>https://t.me/username</code>.\n\n"
+                        "Канал должен открываться по адресу "
+                        "<code>t.me/s/username</code> без входа."
+                    )
                 prompt = await self.bot.send_message(
                     chat_id,
-                    "<b>Добавление Telegram-источника</b>\n\n"
-                    "Отправь следующим сообщением <code>@username</code> "
-                    "или <code>https://t.me/username</code>.\n\n"
-                    "Канал должен открываться по адресу <code>t.me/s/username</code> "
-                    "без входа.",
+                    prompt_text,
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
                             [
@@ -3258,6 +3373,7 @@ class EditorBot:
                     chat_id,
                     callback.from_user.id,
                     prompt.message_id,
+                    kind,
                 )
                 return
             if action == "sourcecancel":
@@ -3297,6 +3413,12 @@ class EditorBot:
                 await self._show_source_item(chat_id, message_id, source)
                 return
             if action == "sourcedelask":
+                if source["source_key"] == RssSourceManager.builtin_source_key:
+                    await callback.answer(
+                        "Solidot можно выключить, но не удалить",
+                        show_alert=True,
+                    )
+                    return
                 await callback.answer("Нужно подтверждение")
                 await self.bot.edit_message_reply_markup(
                     chat_id=chat_id,
@@ -3318,6 +3440,12 @@ class EditorBot:
                 )
                 return
             if action == "sourcedel":
+                if source["source_key"] == RssSourceManager.builtin_source_key:
+                    await callback.answer(
+                        "Solidot можно выключить, но не удалить",
+                        show_alert=True,
+                    )
+                    return
                 await self.repository.delete_content_source(source_id)
                 await callback.answer("Источник удалён")
                 await self._show_sources_menu(

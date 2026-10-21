@@ -204,7 +204,7 @@ async def test_telegram_content_source_and_channel_input_round_trip(tmp_path: Pa
         url="https://t.me/s/example_channel",
         last_external_id="42",
     )
-    await repository.set_source_input_request(-100123, 77, 900)
+    await repository.set_source_input_request(-100123, 77, 900, "rss")
 
     source = await repository.get_content_source(source_id)
     request = await repository.get_source_input_request(-100123)
@@ -215,6 +215,7 @@ async def test_telegram_content_source_and_channel_input_round_trip(tmp_path: Pa
     assert request is not None
     assert request["user_id"] == 77
     assert request["prompt_message_id"] == 900
+    assert request["kind"] == "rss"
 
     await repository.update_content_source(source_id, enabled=0, last_external_id="43")
     updated = await repository.get_content_source_by_key("telegram_web:example_channel")
