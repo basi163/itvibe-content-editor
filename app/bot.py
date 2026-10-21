@@ -417,6 +417,9 @@ class EditorBot:
         chat_id: int,
         *,
         include_unpublished: bool = True,
+        back_callback: str | None = None,
+        back_label: str = "« Назад",
+        include_home: bool = True,
     ) -> list[list[InlineKeyboardButton]]:
         rows: list[list[InlineKeyboardButton]] = []
         if include_unpublished:
@@ -429,18 +432,43 @@ class EditorBot:
                     )
                 ]
             )
-        if user_id is None:
-            return rows
-        draft = await self.repository.get_navigation_context(user_id, chat_id)
-        if draft and (url := self._editor_message_url(draft)):
+        if user_id is not None:
+            draft = await self.repository.get_navigation_context(user_id, chat_id)
+            if draft and (url := self._editor_message_url(draft)):
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"↩️ Вернуться к посту #{draft['id']}",
+                            url=url,
+                        )
+                    ]
+                )
+        if back_callback == "home:0":
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"↩️ Вернуться к посту #{draft['id']}",
-                        url=url,
+                        text=back_label,
+                        callback_data="home:0",
                     )
                 ]
             )
+        elif back_callback or include_home:
+            menu_row: list[InlineKeyboardButton] = []
+            if back_callback:
+                menu_row.append(
+                    InlineKeyboardButton(
+                        text=back_label,
+                        callback_data=back_callback,
+                    )
+                )
+            if include_home:
+                menu_row.append(
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home:0",
+                    )
+                )
+            rows.append(menu_row)
         return rows
 
     async def _with_navigation(
@@ -450,6 +478,9 @@ class EditorBot:
         chat_id: int,
         *,
         include_unpublished: bool = True,
+        back_callback: str | None = None,
+        back_label: str = "« Назад",
+        include_home: bool = True,
     ) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
@@ -458,9 +489,70 @@ class EditorBot:
                     user_id,
                     chat_id,
                     include_unpublished=include_unpublished,
+                    back_callback=back_callback,
+                    back_label=back_label,
+                    include_home=include_home,
                 ),
             ]
         )
+
+    @staticmethod
+    def _home_keyboard(unpublished_count: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"🗂 Неопубликованные — {unpublished_count}",
+                        callback_data="unpublished:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📅 Контент-план",
+                        callback_data="plan:0",
+                    ),
+                    InlineKeyboardButton(
+                        text="🕓 Расписание",
+                        callback_data="schedule:0",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📣 Каналы публикации",
+                        callback_data="targetmenu:0",
+                    )
+                ],
+            ]
+        )
+
+    async def _show_home_menu(
+        self,
+        chat_id: int,
+        *,
+        message_id: int | None = None,
+    ) -> None:
+        unpublished_count = await self.repository.unpublished_draft_count()
+        target_label = await self._target_channel_label()
+        text = (
+            "<b>🏠 Главное меню</b>\n\n"
+            f"Неопубликованных постов: <b>{unpublished_count}</b>\n"
+            f"Каналы: <b>{html.escape(target_label)}</b>\n\n"
+            "Выбери раздел. На каждом следующем экране есть "
+            "кнопка возврата."
+        )
+        keyboard = self._home_keyboard(unpublished_count)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not open home menu in place; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
 
     async def _editor_keyboard_for(
         self,
@@ -519,14 +611,14 @@ class EditorBot:
         if page > 0:
             pagination.append(
                 InlineKeyboardButton(
-                    text="« Назад",
+                    text="‹ Предыдущая страница",
                     callback_data=f"unpublished:{page - 1}",
                 )
             )
         if page + 1 < page_count:
             pagination.append(
                 InlineKeyboardButton(
-                    text="Дальше »",
+                    text="Следующая страница ›",
                     callback_data=f"unpublished:{page + 1}",
                 )
             )
@@ -537,6 +629,8 @@ class EditorBot:
                 user_id,
                 chat_id,
                 include_unpublished=False,
+                back_callback="home:0",
+                back_label="« Назад в главное меню",
             )
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -807,7 +901,12 @@ class EditorBot:
             "Бот получает новости из Solidot RSS и пересланные сообщения, проверяет "
             "источники и готовит черновики. Для привязки каналов используй /setup."
         )
-        await message.answer(text)
+        await message.answer(
+            text,
+            reply_markup=self._home_keyboard(
+                await self.repository.unpublished_draft_count()
+            ),
+        )
 
     async def _setup(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
@@ -998,6 +1097,8 @@ class EditorBot:
             self._content_plan_keyboard(drafts, target_label),
             user_id,
             chat_id,
+            back_callback="home:0",
+            back_label="« Назад в главное меню",
         )
         if message_id is not None:
             try:
@@ -1109,6 +1210,8 @@ class EditorBot:
             InlineKeyboardMarkup(inline_keyboard=rows),
             user_id,
             chat_id,
+            back_callback="home:0",
+            back_label="« Назад в главное меню",
         )
         if message_id is not None:
             try:
@@ -1152,12 +1255,6 @@ class EditorBot:
                         callback_data="targetadd:0",
                     )
                 ],
-                [
-                    InlineKeyboardButton(
-                        text="« Назад к контент-плану",
-                        callback_data="planrefresh:0",
-                    )
-                ],
             ]
         )
         text = (
@@ -1168,6 +1265,8 @@ class EditorBot:
             InlineKeyboardMarkup(inline_keyboard=rows),
             user_id,
             chat_id,
+            back_callback="home:0",
+            back_label="« Назад в главное меню",
         )
         if message_id is not None:
             try:
@@ -1242,6 +1341,8 @@ class EditorBot:
             ),
             user_id,
             chat_id,
+            back_callback="schedulechannels:0",
+            back_label="« Назад",
         )
         if message_id is not None:
             try:
@@ -1446,15 +1547,30 @@ class EditorBot:
         chat_id: int,
         current_channel_id: int | None = None,
         user_id: int | None = None,
+        message_id: int | None = None,
     ) -> None:
         keyboard = await self._with_navigation(
             self._target_channel_add_keyboard(current_channel_id),
             user_id,
             chat_id,
+            back_callback="targetmenu:0",
+            back_label="« Назад к каналам",
         )
+        text = self._target_channel_instructions(include_picker_note=True)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not edit channel instructions; sending a new one")
         await self.bot.send_message(
             chat_id,
-            self._target_channel_instructions(include_picker_note=True),
+            text,
             reply_markup=keyboard,
         )
 
@@ -1463,11 +1579,13 @@ class EditorBot:
         chat_id: int,
         current_channel_id: int | None = None,
         user_id: int | None = None,
+        message_id: int | None = None,
     ) -> None:
         await self._show_target_channel_add_flow(
             chat_id,
             current_channel_id,
             user_id,
+            message_id,
         )
 
     @staticmethod
@@ -1490,12 +1608,6 @@ class EditorBot:
                     InlineKeyboardButton(
                         text="Выбрать другой канал",
                         callback_data="targetpicker:0",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Каналы публикации",
-                        callback_data="targetmenu:0",
                     )
                 ],
             ]
@@ -1715,12 +1827,6 @@ class EditorBot:
                         callback_data="schedulechannels:0",
                     )
                 ],
-                [
-                    InlineKeyboardButton(
-                        text="« Назад к контент-плану",
-                        callback_data="planrefresh:0",
-                    )
-                ],
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1744,7 +1850,11 @@ class EditorBot:
                 InlineKeyboardButton(
                     text="« Назад",
                     callback_data=f"schedulechannel:{channel_id}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home:0",
+                ),
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1775,7 +1885,11 @@ class EditorBot:
                     callback_data=f"scheduleadd:{channel_id}:{day}"
                     if mode == "a"
                     else f"scheduleinterval:{channel_id}:{day}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home:0",
+                ),
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1807,7 +1921,11 @@ class EditorBot:
                         callback_data=(
                             f"schedulehour:{mode}:{channel_id}:{day}:{hour}"
                         ),
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home:0",
+                    ),
                 ],
             ]
         )
@@ -1831,7 +1949,11 @@ class EditorBot:
                 InlineKeyboardButton(
                     text="« Назад",
                     callback_data=f"scheduleinterval:{channel_id}:{day}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home:0",
+                ),
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1879,7 +2001,11 @@ class EditorBot:
                             f"scheduleminute:i:{channel_id}:{day}:"
                             f"{start // 60}:{start % 60}"
                         ),
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home:0",
+                    ),
                 ],
             ]
         )
@@ -1909,7 +2035,11 @@ class EditorBot:
                     callback_data=(
                         f"schedulecount:{channel_id}:{day}:{start}:{count}"
                     ),
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home:0",
+                ),
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1940,7 +2070,11 @@ class EditorBot:
                     callback_data=(
                         f"schedulegapcustom:{channel_id}:{day}:{start}:{count}"
                     ),
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home:0",
+                ),
             ]
         )
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2378,11 +2512,7 @@ class EditorBot:
             chat_id = callback.message.chat.id if callback.message else callback.from_user.id
             if action == "schedule":
                 await callback.answer("Открываю расписание")
-                edit_message_id = None
-                if callback.message:
-                    current_text = str(getattr(callback.message, "text", "") or "")
-                    if current_text.startswith("Контент-план"):
-                        edit_message_id = message_id
+                edit_message_id = None if source_draft else message_id
                 await self._show_schedule_menu(
                     chat_id,
                     message_id=edit_message_id,
@@ -2711,20 +2841,27 @@ class EditorBot:
             await callback.answer("Некорректная команда", show_alert=True)
             return
 
+        if action == "home":
+            await callback.answer("Главное меню")
+            if callback.message:
+                await self._show_home_menu(
+                    callback.message.chat.id,
+                    message_id=(
+                        None if source_draft else callback.message.message_id
+                    ),
+                )
+            return
+
         if action == "unpublished":
             await callback.answer("Открываю неопубликованные посты")
             if callback.message:
-                current_text = str(getattr(callback.message, "text", "") or "")
-                edit_message_id = (
-                    callback.message.message_id
-                    if current_text.startswith("Неопубликованные посты")
-                    else None
-                )
                 await self._show_unpublished(
                     callback.message.chat.id,
                     callback.from_user.id,
                     page=int(parts[1]),
-                    message_id=edit_message_id,
+                    message_id=(
+                        None if source_draft else callback.message.message_id
+                    ),
                 )
             return
 
@@ -2733,7 +2870,7 @@ class EditorBot:
             if callback.message:
                 message_id = (
                     callback.message.message_id
-                    if action == "planrefresh"
+                    if action == "planrefresh" or source_draft is None
                     else None
                 )
                 await self._show_content_plan(
@@ -2747,6 +2884,9 @@ class EditorBot:
             if callback.message:
                 await self._show_target_channel_menu(
                     callback.message.chat.id,
+                    message_id=(
+                        None if source_draft else callback.message.message_id
+                    ),
                     user_id=callback.from_user.id,
                 )
             return
@@ -2762,6 +2902,7 @@ class EditorBot:
                     callback.message.chat.id,
                     current_channel_id,
                     callback.from_user.id,
+                    None if source_draft else callback.message.message_id,
                 )
             return
         if action == "targetadd":
@@ -2776,6 +2917,7 @@ class EditorBot:
                     callback.message.chat.id,
                     current_channel_id,
                     callback.from_user.id,
+                    None if source_draft else callback.message.message_id,
                 )
             return
         if action == "targetpicker":
@@ -3821,6 +3963,10 @@ class EditorBot:
                         text="Назад",
                         callback_data=back_callback or f"pubback:{draft_id}",
                     ),
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home:0",
+                    ),
                 ],
             ]
         )
@@ -3880,6 +4026,12 @@ class EditorBot:
                     InlineKeyboardButton(
                         text=unpublished_label,
                         callback_data="unpublished:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home:0",
                     )
                 ],
             ]
@@ -3945,6 +4097,12 @@ class EditorBot:
                     InlineKeyboardButton(
                         text=unpublished_label,
                         callback_data="unpublished:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🏠 Главное меню",
+                        callback_data="home:0",
                     )
                 ],
             ]

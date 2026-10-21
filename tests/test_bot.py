@@ -51,6 +51,7 @@ def test_draft_keyboard_describes_automatic_edits() -> None:
     assert "schedule:0" in callbacks
     assert "targetmenu:0" in callbacks
     assert "unpublished:0" in callbacks
+    assert "home:0" in callbacks
     assert "manualedit:7" in callbacks
     assert "media:7" not in callbacks
 
@@ -63,7 +64,13 @@ def test_publish_keyboard_offers_now_next_slot_and_custom_time() -> None:
         for button in row
     }
 
-    assert callbacks == {"pubnow:7", "pubnext:7", "pubtime:7", "pubback:7"}
+    assert callbacks == {
+        "pubnow:7",
+        "pubnext:7",
+        "pubtime:7",
+        "pubback:7",
+        "home:0",
+    }
 
 
 def test_publish_keyboard_offers_direct_editor_channel_slots() -> None:
@@ -98,7 +105,42 @@ def test_scheduled_keyboard_can_publish_reschedule_or_cancel() -> None:
         "targetmenu:0",
         "manualedit:7",
         "unpublished:0",
+        "home:0",
     }
+
+
+def test_home_keyboard_opens_every_main_section() -> None:
+    keyboard = EditorBot._home_keyboard(23)
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    labels = {button.text for button in buttons}
+    callbacks = {button.callback_data for button in buttons}
+
+    assert "🗂 Неопубликованные — 23" in labels
+    assert callbacks == {"unpublished:0", "plan:0", "schedule:0", "targetmenu:0"}
+
+
+@pytest.mark.asyncio
+async def test_home_callback_replaces_service_screen_in_place() -> None:
+    editor = object.__new__(EditorBot)
+    editor._is_owner = AsyncMock(return_value=True)
+    editor.repository = SimpleNamespace()
+    editor._show_home_menu = AsyncMock()
+    callback = SimpleNamespace(
+        from_user=SimpleNamespace(id=77),
+        data="home:0",
+        message=SimpleNamespace(
+            message_id=55,
+            chat=SimpleNamespace(id=-1009876543210),
+        ),
+        answer=AsyncMock(),
+    )
+
+    await editor._callback(callback)
+
+    editor._show_home_menu.assert_awaited_once_with(
+        -1009876543210,
+        message_id=55,
+    )
 
 
 def test_content_plan_keyboard_opens_posts_and_channel_settings() -> None:
@@ -188,7 +230,6 @@ def test_target_channel_add_flow_stays_visible_in_editorial_channel() -> None:
 
     assert "targetcurrent:-1001234567890" in callbacks
     assert "targetpicker:0" in callbacks
-    assert "targetmenu:0" in callbacks
 
 
 def test_private_editor_post_url_points_to_exact_message() -> None:
@@ -358,6 +399,9 @@ def test_schedule_picker_is_fully_button_driven() -> None:
     assert "schedulehour:i:-1001234567890:1:9" in hour_callbacks
     assert "scheduleminute:i:-1001234567890:1:9:30" in minute_callbacks
     assert "schedulecount:-1001234567890:1:570:12" in count_callbacks
+    assert "home:0" in hour_callbacks
+    assert "home:0" in minute_callbacks
+    assert "home:0" in count_callbacks
 
 
 def test_schedule_interval_picker_offers_presets_and_custom_values() -> None:
@@ -383,6 +427,8 @@ def test_schedule_interval_picker_offers_presets_and_custom_values() -> None:
     assert "scheduleintgap:-1001234567890:1:570:3:120" in gap_callbacks
     assert "schedulegapcustom:-1001234567890:1:570:3" in gap_callbacks
     assert "schedulegapminute:-1001234567890:1:570:3:2:15" in custom_callbacks
+    assert "home:0" in gap_callbacks
+    assert "home:0" in custom_callbacks
     assert all(len(value or "") <= 64 for value in gap_callbacks | custom_callbacks)
 
 
