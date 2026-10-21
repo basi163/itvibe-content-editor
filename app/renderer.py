@@ -32,9 +32,23 @@ BANNED_PHRASES = (
     "вот тут начинается самое интересное",
     "этот шаг показывает",
     "этот случай показывает",
+    "этот случай демонстрирует важность",
+    "этот случай наглядно демонстрирует важность",
+    "этот случай подчеркивает важность",
+    "это демонстрирует важность",
     "этот пример показывает",
     "это показывает",
     "мы наблюдаем классический пример",
+)
+IMPORTANCE_META_RE = re.compile(
+    r"(?P<prefix>^|(?<=[.!?\n])\s*)"
+    r"(?:"
+    r"(?:этот|данный)\s+(?:случай|пример|эпизод)"
+    r"|это"
+    r")\s+(?:наглядно\s+)?"
+    r"(?:демонстрирует|показывает|подчеркивает)\s+важность\s+"
+    r"(?P<subject>[^.!?\n]+)(?P<punct>[.!?])",
+    re.IGNORECASE,
 )
 META_LEAD_IN_RE = re.compile(
     r"(?P<prefix>^|(?<=[.!?\n])\s*)"
@@ -77,6 +91,16 @@ def _clean_visible_fragment(value: str) -> str:
     cleaned = RAW_URL_RE.sub("", cleaned)
     cleaned = SOURCE_MARKER_LIKE_RE.sub("", cleaned)
     cleaned = cleaned.replace("：", ",").replace(":", ",")
+    cleaned = IMPORTANCE_META_RE.sub(
+        lambda match: (
+            match.group("prefix")
+            + "Важность "
+            + match.group("subject").strip()
+            + " очевидна"
+            + match.group("punct")
+        ),
+        cleaned,
+    )
     cleaned = META_LEAD_IN_RE.sub(
         lambda match: match.group("prefix") + match.group("next").upper(),
         cleaned,

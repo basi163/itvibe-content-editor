@@ -152,6 +152,28 @@ def test_local_normalizer_removes_meta_commentary_lead_ins() -> None:
     assert validate_post(normalized, 2000) == []
 
 
+def test_local_normalizer_removes_importance_meta_commentary() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body=(
+            "Этот случай демонстрирует важность независимой космической программы. "
+            "Миссия продолжит работу в следующем году."
+        ),
+        hashtags=["#космос", "#наука", "#технологии"],
+    )
+
+    errors = validate_post(post, 2000)
+    assert any("демонстрирует важность" in error.casefold() for error in errors)
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert normalized.body.startswith(
+        "Важность независимой космической программы очевидна."
+    )
+    assert "Этот случай" not in normalized.body
+    assert validate_post(normalized, 2000) == []
+
+
 def test_manual_editor_can_keep_fewer_than_three_hashtags() -> None:
     post = GeneratedPost(
         title="Япония начала охоту за образцами с Фобоса",
