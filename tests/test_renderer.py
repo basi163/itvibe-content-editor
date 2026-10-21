@@ -167,9 +167,7 @@ def test_local_normalizer_removes_importance_meta_commentary() -> None:
 
     normalized = normalize_generated_post(post, 2000)
 
-    assert normalized.body.startswith(
-        "Важность независимой космической программы очевидна."
-    )
+    assert normalized.body == "Миссия продолжит работу в следующем году."
     assert "Этот случай" not in normalized.body
     assert validate_post(normalized, 2000) == []
 

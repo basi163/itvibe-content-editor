@@ -92,13 +92,7 @@ def _clean_visible_fragment(value: str) -> str:
     cleaned = SOURCE_MARKER_LIKE_RE.sub("", cleaned)
     cleaned = cleaned.replace("：", ",").replace(":", ",")
     cleaned = IMPORTANCE_META_RE.sub(
-        lambda match: (
-            match.group("prefix")
-            + "Важность "
-            + match.group("subject").strip()
-            + " очевидна"
-            + match.group("punct")
-        ),
+        lambda match: match.group("prefix"),
         cleaned,
     )
     cleaned = META_LEAD_IN_RE.sub(
