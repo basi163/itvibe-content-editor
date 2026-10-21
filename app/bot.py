@@ -159,38 +159,8 @@ def next_publish_slot(
     raise RuntimeError("Не удалось найти свободное окно публикации")
 
 
-def parse_clock_minutes(value: str) -> int:
-    cleaned = re.sub(r"\s+", "", value)
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})", cleaned)
-    if match is None:
-        match = re.fullmatch(r"(\d{2})(\d{2})", cleaned)
-    if match is None:
-        raise ValueError("Время нужно указать в формате ЧЧ:ММ или ЧЧММ")
-    hour, minute = (int(part) for part in match.groups())
-    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        raise ValueError("Укажи корректное время от 00:00 до 23:59")
-    return hour * 60 + minute
-
-
 def format_clock_minutes(value: int) -> str:
     return f"{value // 60:02d}:{value % 60:02d}"
-
-
-def parse_interval_minutes(value: str) -> int:
-    cleaned = value.strip()
-    if ":" in cleaned:
-        parts = cleaned.split(":", 1)
-        if not all(part.isdigit() for part in parts):
-            raise ValueError("Интервал нужно указать в минутах или как ЧЧ:ММ")
-        hours, minutes = (int(part) for part in parts)
-        interval = hours * 60 + minutes
-    elif cleaned.isdigit():
-        interval = int(cleaned)
-    else:
-        raise ValueError("Интервал нужно указать в минутах или как ЧЧ:ММ")
-    if not 15 <= interval <= 12 * 60:
-        raise ValueError("Интервал должен быть от 15 минут до 12 часов")
-    return interval
 
 
 def next_weekly_publish_slot(
@@ -307,7 +277,6 @@ class EditorBot:
         self.router = Router()
         self.schedule_wakeup = asyncio.Event()
         self._publication_locks: dict[int, asyncio.Lock] = {}
-        self._schedule_input_states: dict[int, dict[str, Any]] = {}
         self.dispatcher.include_router(self.router)
         self._register_handlers()
 
@@ -846,8 +815,8 @@ class EditorBot:
             f"Часовой пояс: <b>{offset_label}</b>\n"
             f"Выбранный день: <b>{WEEKDAY_NAMES[selected_day]}</b>\n"
             f"Публикаций: <b>{len(slots)}</b>\n\n"
-            "Нажми «Добавить время» и отправь его в формате "
-            "<code>03:12</code> или <code>0312</code>.\n"
+            "Все настройки выполняются кнопками прямо в этом чате.\n"
+            "Нажми «Добавить время» для выбора часа и минут.\n"
             "Нажатие на кнопку с временем удаляет это окно."
         )
         keyboard = self._schedule_keyboard(
@@ -868,6 +837,181 @@ class EditorBot:
             except TelegramBadRequest:
                 logger.info("Could not refresh schedule message; sending a new one")
         await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _replace_schedule_view(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        text: str,
+        keyboard: InlineKeyboardMarkup,
+    ) -> None:
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not edit schedule picker; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_schedule_hour_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        mode: str,
+    ) -> None:
+        purpose = "нового времени" if mode == "a" else "первой публикации"
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            (
+                f"<b>{WEEKDAY_NAMES[day].capitalize()}</b>\n\n"
+                f"Выбери час для {purpose}."
+            ),
+            self._schedule_hour_keyboard(mode, channel_id, day),
+        )
+
+    async def _show_schedule_minute_tens_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        mode: str,
+        hour: int,
+    ) -> None:
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            (
+                f"<b>{WEEKDAY_NAMES[day].capitalize()}</b>\n\n"
+                f"Выбран час <b>{hour:02d}</b>. Теперь выбери диапазон минут."
+            ),
+            self._schedule_minute_tens_keyboard(mode, channel_id, day, hour),
+        )
+
+    async def _show_schedule_minute_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        mode: str,
+        hour: int,
+        tens: int,
+    ) -> None:
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            (
+                f"<b>{WEEKDAY_NAMES[day].capitalize()}</b>\n\n"
+                f"Выбери точное время в диапазоне "
+                f"<b>{hour:02d}:{tens}0–{hour:02d}:{tens}9</b>."
+            ),
+            self._schedule_minute_keyboard(mode, channel_id, day, hour, tens),
+        )
+
+    async def _show_schedule_count_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        start: int,
+    ) -> None:
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            (
+                f"Первый пост: <b>{format_clock_minutes(start)}</b>\n\n"
+                "Сколько постов должно выходить в этот день?"
+            ),
+            self._schedule_count_keyboard(channel_id, day, start),
+        )
+
+    async def _show_schedule_gap_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+    ) -> None:
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            (
+                f"Первый пост: <b>{format_clock_minutes(start)}</b>\n"
+                f"Публикаций: <b>{count}</b>\n\n"
+                "Выбери равный интервал между постами."
+            ),
+            self._schedule_gap_keyboard(channel_id, day, start, count),
+        )
+
+    async def _show_schedule_gap_hour_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+    ) -> None:
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            "<b>Другой интервал</b>\n\nВыбери количество часов.",
+            self._schedule_gap_hour_keyboard(channel_id, day, start, count),
+        )
+
+    async def _show_schedule_gap_minute_picker(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+        hours: int,
+    ) -> None:
+        await self._replace_schedule_view(
+            chat_id,
+            message_id,
+            (
+                "<b>Другой интервал</b>\n\n"
+                f"Часы: <b>{hours}</b>. Выбери минуты."
+            ),
+            self._schedule_gap_minute_keyboard(
+                channel_id,
+                day,
+                start,
+                count,
+                hours,
+            ),
+        )
+
+    async def _save_equal_schedule(
+        self,
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+        gap: int,
+    ) -> str | None:
+        if not 15 <= gap <= 12 * 60:
+            return "Интервал должен быть от 15 минут до 12 часов"
+        slots = [start + index * gap for index in range(count)]
+        if slots[-1] >= 24 * 60:
+            return "Последний пост выходит на следующий день. Выбери меньший интервал"
+        await self._set_channel_day_schedule(channel_id, day, slots)
+        return None
 
     async def _send_target_channel_picker(self, user_id: int) -> None:
         await self.bot.send_message(
@@ -1071,6 +1215,226 @@ class EditorBot:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     @staticmethod
+    def _schedule_hour_keyboard(
+        mode: str,
+        channel_id: int,
+        day: int,
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{hour:02d}",
+                callback_data=f"schedulehour:{mode}:{channel_id}:{day}:{hour}",
+            )
+            for hour in range(24)
+        ]
+        rows = [buttons[index : index + 6] for index in range(0, len(buttons), 6)]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Назад",
+                    callback_data=f"scheduleday:{channel_id}:{day}",
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _schedule_minute_tens_keyboard(
+        mode: str,
+        channel_id: int,
+        day: int,
+        hour: int,
+    ) -> InlineKeyboardMarkup:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=f"{tens}0–{tens}9",
+                    callback_data=(
+                        f"scheduletens:{mode}:{channel_id}:{day}:{hour}:{tens}"
+                    ),
+                )
+                for tens in range(start, start + 3)
+            ]
+            for start in (0, 3)
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Назад к часам",
+                    callback_data=f"scheduleadd:{channel_id}:{day}"
+                    if mode == "a"
+                    else f"scheduleinterval:{channel_id}:{day}",
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _schedule_minute_keyboard(
+        mode: str,
+        channel_id: int,
+        day: int,
+        hour: int,
+        tens: int,
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{hour:02d}:{minute:02d}",
+                callback_data=(
+                    f"scheduleminute:{mode}:{channel_id}:{day}:{hour}:{minute}"
+                ),
+            )
+            for minute in range(tens * 10, tens * 10 + 10)
+        ]
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                buttons[:5],
+                buttons[5:],
+                [
+                    InlineKeyboardButton(
+                        text="« Назад к минутам",
+                        callback_data=(
+                            f"schedulehour:{mode}:{channel_id}:{day}:{hour}"
+                        ),
+                    )
+                ],
+            ]
+        )
+
+    @staticmethod
+    def _schedule_count_keyboard(
+        channel_id: int,
+        day: int,
+        start: int,
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(
+                text=str(count),
+                callback_data=f"schedulecount:{channel_id}:{day}:{start}:{count}",
+            )
+            for count in range(1, 13)
+        ]
+        rows = [buttons[index : index + 4] for index in range(0, len(buttons), 4)]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Назад",
+                    callback_data=f"scheduleinterval:{channel_id}:{day}",
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _schedule_gap_keyboard(
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+    ) -> InlineKeyboardMarkup:
+        choices = (
+            (30, "30 мин"),
+            (60, "1 ч"),
+            (90, "1 ч 30 мин"),
+            (120, "2 ч"),
+            (180, "3 ч"),
+            (240, "4 ч"),
+            (360, "6 ч"),
+        )
+        buttons = [
+            InlineKeyboardButton(
+                text=label,
+                callback_data=(
+                    f"scheduleintgap:{channel_id}:{day}:{start}:{count}:{minutes}"
+                ),
+            )
+            for minutes, label in choices
+        ]
+        rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Другой интервал",
+                        callback_data=(
+                            f"schedulegapcustom:{channel_id}:{day}:{start}:{count}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="« Назад",
+                        callback_data=(
+                            f"scheduleminute:i:{channel_id}:{day}:"
+                            f"{start // 60}:{start % 60}"
+                        ),
+                    )
+                ],
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _schedule_gap_hour_keyboard(
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(
+                text=str(hours),
+                callback_data=(
+                    f"schedulegaphour:{channel_id}:{day}:{start}:{count}:{hours}"
+                ),
+            )
+            for hours in range(13)
+        ]
+        rows = [buttons[index : index + 5] for index in range(0, len(buttons), 5)]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Назад",
+                    callback_data=(
+                        f"schedulecount:{channel_id}:{day}:{start}:{count}"
+                    ),
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _schedule_gap_minute_keyboard(
+        channel_id: int,
+        day: int,
+        start: int,
+        count: int,
+        hours: int,
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(
+                text=f"{minute:02d}",
+                callback_data=(
+                    f"schedulegapminute:{channel_id}:{day}:{start}:"
+                    f"{count}:{hours}:{minute}"
+                ),
+            )
+            for minute in range(0, 60, 5)
+        ]
+        rows = [buttons[index : index + 4] for index in range(0, len(buttons), 4)]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Назад к часам",
+                    callback_data=(
+                        f"schedulegapcustom:{channel_id}:{day}:{start}:{count}"
+                    ),
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
     def _content_plan_item_keyboard(draft_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1139,11 +1503,6 @@ class EditorBot:
         if message.text and message.text.startswith("/"):
             return
 
-        schedule_state = self._schedule_input_states.get(message.from_user.id)
-        if schedule_state:
-            await self._apply_schedule_input(message, schedule_state)
-            return
-
         pending = await self.repository.pop_pending_action(message.from_user.id)
         if pending:
             action, draft_id = pending
@@ -1164,84 +1523,6 @@ class EditorBot:
                 await message.answer("Материал отклонен фильтром или не удалось его обработать.")
 
         asyncio.create_task(process())
-
-    async def _apply_schedule_input(
-        self,
-        message: Message,
-        state: dict[str, Any],
-    ) -> None:
-        if not message.from_user:
-            return
-        user_id = message.from_user.id
-        text = (message.text or message.caption or "").strip()
-        channel_id = int(state["channel_id"])
-        day = int(state["day"])
-        mode = str(state["mode"])
-        if mode in {"add", "interval_start"}:
-            try:
-                minute = parse_clock_minutes(text)
-            except ValueError as error:
-                await message.answer(f"{error}. Попробуй ещё раз.")
-                return
-            if mode == "add":
-                weekly = await self._channel_weekly_schedule(channel_id)
-                await self._set_channel_day_schedule(
-                    channel_id,
-                    day,
-                    [*weekly[day], minute],
-                )
-                self._schedule_input_states.pop(user_id, None)
-                await message.answer(
-                    f"Время <b>{format_clock_minutes(minute)}</b> добавлено."
-                )
-                await self._show_schedule_menu(message.chat.id, channel_id, day)
-                return
-            state["start"] = minute
-            state["mode"] = "interval_count"
-            await message.answer(
-                "Сколько постов должно выходить в этот день?\n"
-                "Отправь число от <b>1</b> до <b>12</b>."
-            )
-            return
-
-        if mode == "interval_count":
-            if not text.isdigit() or not 1 <= int(text) <= 12:
-                await message.answer("Отправь целое число от 1 до 12.")
-                return
-            count = int(text)
-            state["count"] = count
-            if count == 1:
-                await self._set_channel_day_schedule(channel_id, day, [int(state["start"])])
-                self._schedule_input_states.pop(user_id, None)
-                await message.answer("Расписание на день обновлено.")
-                await self._show_schedule_menu(message.chat.id, channel_id, day)
-                return
-            state["mode"] = "interval_gap"
-            await message.answer(
-                "Отправь интервал между постами в минутах или в формате "
-                "<b>ЧЧ:ММ</b>.\nНапример: <code>240</code> или <code>04:00</code>."
-            )
-            return
-
-        if mode == "interval_gap":
-            try:
-                gap = parse_interval_minutes(text)
-            except ValueError as error:
-                await message.answer(f"{error}. Попробуй ещё раз.")
-                return
-            start = int(state["start"])
-            count = int(state["count"])
-            slots = [start + index * gap for index in range(count)]
-            if slots[-1] >= 24 * 60:
-                await message.answer(
-                    "Последний пост выходит уже на следующий день. "
-                    "Отправь меньший интервал."
-                )
-                return
-            await self._set_channel_day_schedule(channel_id, day, slots)
-            self._schedule_input_states.pop(user_id, None)
-            await message.answer("Расписание с равным интервалом сохранено.")
-            await self._show_schedule_menu(message.chat.id, channel_id, day)
 
     async def _apply_pending_edit(self, message: Message, action: str, draft_id: int) -> None:
         draft = await self.repository.get_draft(draft_id)
@@ -1336,6 +1617,14 @@ class EditorBot:
             "scheduleinterval",
             "schedulereset",
             "scheduledel",
+            "schedulehour",
+            "scheduletens",
+            "scheduleminute",
+            "schedulecount",
+            "scheduleintgap",
+            "schedulegapcustom",
+            "schedulegaphour",
+            "schedulegapminute",
         }
         if action in schedule_actions:
             if action in {"schedule", "schedulechannels"}:
@@ -1349,16 +1638,53 @@ class EditorBot:
                     and parts[2].isdigit()
                     and parts[3].isdigit()
                 )
-            else:
+            elif action in {
+                "scheduleday",
+                "scheduleadd",
+                "scheduleinterval",
+                "schedulereset",
+            }:
                 valid = (
                     len(parts) == 3
                     and parts[1].lstrip("-").isdigit()
                     and parts[2].isdigit()
                 )
+            elif action == "schedulehour":
+                valid = (
+                    len(parts) == 5
+                    and parts[1] in {"a", "i"}
+                    and parts[2].lstrip("-").isdigit()
+                    and parts[3].isdigit()
+                    and parts[4].isdigit()
+                )
+            elif action in {"scheduletens", "scheduleminute"}:
+                valid = (
+                    len(parts) == 6
+                    and parts[1] in {"a", "i"}
+                    and parts[2].lstrip("-").isdigit()
+                    and all(part.isdigit() for part in parts[3:])
+                )
+            elif action in {"schedulecount", "schedulegapcustom"}:
+                valid = (
+                    len(parts) == 5
+                    and parts[1].lstrip("-").isdigit()
+                    and all(part.isdigit() for part in parts[2:])
+                )
+            elif action in {"scheduleintgap", "schedulegaphour"}:
+                valid = (
+                    len(parts) == 6
+                    and parts[1].lstrip("-").isdigit()
+                    and all(part.isdigit() for part in parts[2:])
+                )
+            else:
+                valid = (
+                    len(parts) == 7
+                    and parts[1].lstrip("-").isdigit()
+                    and all(part.isdigit() for part in parts[2:])
+                )
             if not valid:
                 await callback.answer("Некорректная команда", show_alert=True)
                 return
-            self._schedule_input_states.pop(callback.from_user.id, None)
             message_id = callback.message.message_id if callback.message else None
             chat_id = callback.message.chat.id if callback.message else callback.from_user.id
             if action == "schedule":
@@ -1374,76 +1700,238 @@ class EditorBot:
                 await callback.answer("Выбери канал")
                 await self._show_schedule_channel_picker(chat_id, message_id)
                 return
-            channel_id = int(parts[1])
             if action == "schedulechannel":
+                channel_id = int(parts[1])
                 await callback.answer("Канал выбран")
                 await self._show_schedule_menu(chat_id, channel_id, message_id=message_id)
                 return
-            day = int(parts[2])
-            if not 0 <= day <= 6:
-                await callback.answer("Некорректный день", show_alert=True)
-                return
-            if action == "scheduleday":
-                await callback.answer(WEEKDAY_NAMES[day].capitalize())
-                await self._show_schedule_menu(chat_id, channel_id, day, message_id)
-                return
-            if action == "scheduledel":
-                slot = int(parts[3])
-                weekly = await self._channel_weekly_schedule(channel_id)
-                await self._set_channel_day_schedule(
+            if action in {
+                "scheduleday",
+                "scheduledel",
+                "schedulereset",
+                "scheduleadd",
+                "scheduleinterval",
+            }:
+                channel_id = int(parts[1])
+                day = int(parts[2])
+                if not 0 <= day <= 6:
+                    await callback.answer("Некорректный день", show_alert=True)
+                    return
+                if action == "scheduleday":
+                    await callback.answer(WEEKDAY_NAMES[day].capitalize())
+                    await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                    return
+                if action == "scheduledel":
+                    slot = int(parts[3])
+                    weekly = await self._channel_weekly_schedule(channel_id)
+                    await self._set_channel_day_schedule(
+                        channel_id,
+                        day,
+                        [value for value in weekly[day] if value != slot],
+                    )
+                    await callback.answer(f"{format_clock_minutes(slot)} удалено")
+                    await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                    return
+                if action == "schedulereset":
+                    await self._set_channel_day_schedule(channel_id, day, [])
+                    await callback.answer("Время на этот день сброшено")
+                    await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                    return
+                await self.repository.pop_pending_action(callback.from_user.id)
+                mode = "a" if action == "scheduleadd" else "i"
+                await callback.answer("Выбери час")
+                await self._show_schedule_hour_picker(
+                    chat_id,
+                    message_id,
                     channel_id,
                     day,
-                    [value for value in weekly[day] if value != slot],
+                    mode,
                 )
-                await callback.answer(f"{format_clock_minutes(slot)} удалено")
-                await self._show_schedule_menu(chat_id, channel_id, day, message_id)
                 return
-            if action == "schedulereset":
-                await self._set_channel_day_schedule(channel_id, day, [])
-                await callback.answer("Время на этот день сброшено")
-                await self._show_schedule_menu(chat_id, channel_id, day, message_id)
-                return
-            await self.repository.pop_pending_action(callback.from_user.id)
-            if action == "scheduleadd":
-                self._schedule_input_states[callback.from_user.id] = {
-                    "mode": "add",
-                    "channel_id": channel_id,
-                    "day": day,
-                }
-                prompt = (
-                    f"Добавляем время на <b>{WEEKDAY_NAMES[day]}</b>.\n\n"
-                    "Отправь его в формате <code>03:12</code> или <code>0312</code>."
+            if action == "schedulehour":
+                mode = parts[1]
+                channel_id = int(parts[2])
+                day = int(parts[3])
+                hour = int(parts[4])
+                if not 0 <= day <= 6 or not 0 <= hour <= 23:
+                    await callback.answer("Некорректное время", show_alert=True)
+                    return
+                await callback.answer(f"Час {hour:02d}")
+                await self._show_schedule_minute_tens_picker(
+                    chat_id,
+                    message_id,
+                    channel_id,
+                    day,
+                    mode,
+                    hour,
                 )
-                answer_text = "Жду время в личном чате с ботом"
+                return
+            if action == "scheduletens":
+                mode = parts[1]
+                channel_id = int(parts[2])
+                day, hour, tens = (int(value) for value in parts[3:])
+                if not 0 <= day <= 6 or not 0 <= hour <= 23 or not 0 <= tens <= 5:
+                    await callback.answer("Некорректное время", show_alert=True)
+                    return
+                await callback.answer("Выбери точные минуты")
+                await self._show_schedule_minute_picker(
+                    chat_id,
+                    message_id,
+                    channel_id,
+                    day,
+                    mode,
+                    hour,
+                    tens,
+                )
+                return
+            if action == "scheduleminute":
+                mode = parts[1]
+                channel_id = int(parts[2])
+                day, hour, minute = (int(value) for value in parts[3:])
+                if not 0 <= day <= 6 or not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                    await callback.answer("Некорректное время", show_alert=True)
+                    return
+                slot = hour * 60 + minute
+                if mode == "a":
+                    weekly = await self._channel_weekly_schedule(channel_id)
+                    await self._set_channel_day_schedule(
+                        channel_id,
+                        day,
+                        [*weekly[day], slot],
+                    )
+                    await callback.answer(f"{format_clock_minutes(slot)} добавлено")
+                    await self._show_schedule_menu(
+                        chat_id,
+                        channel_id,
+                        day,
+                        message_id,
+                    )
+                    return
+                await callback.answer("Выбери количество постов")
+                await self._show_schedule_count_picker(
+                    chat_id,
+                    message_id,
+                    channel_id,
+                    day,
+                    slot,
+                )
+                return
+            if action == "schedulecount":
+                channel_id = int(parts[1])
+                day, start, count = (int(value) for value in parts[2:])
+                if (
+                    not 0 <= day <= 6
+                    or not 0 <= start < 24 * 60
+                    or not 1 <= count <= 12
+                ):
+                    await callback.answer("Некорректные параметры", show_alert=True)
+                    return
+                if count == 1:
+                    await self._set_channel_day_schedule(channel_id, day, [start])
+                    await callback.answer("Расписание сохранено")
+                    await self._show_schedule_menu(
+                        chat_id,
+                        channel_id,
+                        day,
+                        message_id,
+                    )
+                    return
+                await callback.answer("Выбери интервал")
+                await self._show_schedule_gap_picker(
+                    chat_id,
+                    message_id,
+                    channel_id,
+                    day,
+                    start,
+                    count,
+                )
+                return
+            if action == "schedulegapcustom":
+                channel_id = int(parts[1])
+                day, start, count = (int(value) for value in parts[2:])
+                if (
+                    not 0 <= day <= 6
+                    or not 0 <= start < 24 * 60
+                    or not 2 <= count <= 12
+                ):
+                    await callback.answer("Некорректные параметры", show_alert=True)
+                    return
+                await callback.answer("Выбери часы")
+                await self._show_schedule_gap_hour_picker(
+                    chat_id,
+                    message_id,
+                    channel_id,
+                    day,
+                    start,
+                    count,
+                )
+                return
+            if action == "schedulegaphour":
+                channel_id = int(parts[1])
+                day, start, count, hours = (int(value) for value in parts[2:])
+                if (
+                    not 0 <= day <= 6
+                    or not 0 <= start < 24 * 60
+                    or not 2 <= count <= 12
+                    or not 0 <= hours <= 12
+                ):
+                    await callback.answer("Некорректные параметры", show_alert=True)
+                    return
+                await callback.answer("Выбери минуты")
+                await self._show_schedule_gap_minute_picker(
+                    chat_id,
+                    message_id,
+                    channel_id,
+                    day,
+                    start,
+                    count,
+                    hours,
+                )
+                return
+            if action == "schedulegapminute":
+                channel_id = int(parts[1])
+                day, start, count, hours, minutes = (
+                    int(value) for value in parts[2:]
+                )
+                if (
+                    not 0 <= day <= 6
+                    or not 0 <= start < 24 * 60
+                    or not 2 <= count <= 12
+                    or not 0 <= hours <= 12
+                    or minutes not in range(0, 60, 5)
+                ):
+                    await callback.answer("Некорректные параметры", show_alert=True)
+                    return
+                gap = hours * 60 + minutes
             else:
-                self._schedule_input_states[callback.from_user.id] = {
-                    "mode": "interval_start",
-                    "channel_id": channel_id,
-                    "day": day,
-                }
-                prompt = (
-                    "Отправь время, в которое должен выйти первый пост, "
-                    "в формате <code>09:30</code> или <code>0930</code>."
-                )
-                answer_text = "Настройка интервала отправлена в бот"
-            await callback.answer(answer_text)
-            await self.bot.send_message(
-                callback.from_user.id,
-                prompt,
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="« Назад",
-                                callback_data=f"scheduleday:{channel_id}:{day}",
-                            )
-                        ]
-                    ]
-                ),
+                channel_id = int(parts[1])
+                day, start, count, gap = (int(value) for value in parts[2:])
+                if (
+                    not 0 <= day <= 6
+                    or not 0 <= start < 24 * 60
+                    or not 2 <= count <= 12
+                ):
+                    await callback.answer("Некорректные параметры", show_alert=True)
+                    return
+            error = await self._save_equal_schedule(
+                channel_id,
+                day,
+                start,
+                count,
+                gap,
+            )
+            if error:
+                await callback.answer(error, show_alert=True)
+                return
+            await callback.answer("Расписание с интервалом сохранено")
+            await self._show_schedule_menu(
+                chat_id,
+                channel_id,
+                day,
+                message_id,
             )
             return
 
-        self._schedule_input_states.pop(callback.from_user.id, None)
         is_slot_action = action == "pubslot"
         if is_slot_action:
             valid = len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()

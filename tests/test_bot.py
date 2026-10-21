@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.types import InputMediaPhoto, InputMediaVideo
@@ -7,8 +9,6 @@ from app.bot import (
     EditorBot,
     next_publish_slot,
     next_weekly_publish_slot,
-    parse_clock_minutes,
-    parse_interval_minutes,
     parse_publish_time,
     publish_slot_label,
     upcoming_publish_slots,
@@ -177,17 +177,99 @@ def test_parse_publish_time_uses_samara_time_and_rolls_clock_to_tomorrow() -> No
     assert scheduled == datetime(2026, 10, 20, 14, 30, tzinfo=UTC)
 
 
-def test_schedule_clock_parser_accepts_colon_and_compact_formats() -> None:
-    assert parse_clock_minutes("03:12") == 192
-    assert parse_clock_minutes("0312") == 192
-    assert parse_interval_minutes("240") == 240
-    assert parse_interval_minutes("04:00") == 240
+def test_schedule_picker_is_fully_button_driven() -> None:
+    hour_keyboard = EditorBot._schedule_hour_keyboard("i", -1001234567890, 1)
+    hour_callbacks = {
+        button.callback_data
+        for row in hour_keyboard.inline_keyboard
+        for button in row
+    }
+    minute_keyboard = EditorBot._schedule_minute_keyboard(
+        "i",
+        -1001234567890,
+        1,
+        9,
+        3,
+    )
+    minute_callbacks = {
+        button.callback_data
+        for row in minute_keyboard.inline_keyboard
+        for button in row
+    }
+    count_keyboard = EditorBot._schedule_count_keyboard(-1001234567890, 1, 570)
+    count_callbacks = {
+        button.callback_data
+        for row in count_keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert "schedulehour:i:-1001234567890:1:9" in hour_callbacks
+    assert "scheduleminute:i:-1001234567890:1:9:30" in minute_callbacks
+    assert "schedulecount:-1001234567890:1:570:12" in count_callbacks
 
 
-@pytest.mark.parametrize("value", ["24:00", "1260", "3.12", "nope"])
-def test_schedule_clock_parser_rejects_invalid_values(value: str) -> None:
-    with pytest.raises(ValueError):
-        parse_clock_minutes(value)
+def test_schedule_interval_picker_offers_presets_and_custom_values() -> None:
+    gap_keyboard = EditorBot._schedule_gap_keyboard(-1001234567890, 1, 570, 3)
+    gap_callbacks = {
+        button.callback_data
+        for row in gap_keyboard.inline_keyboard
+        for button in row
+    }
+    custom_keyboard = EditorBot._schedule_gap_minute_keyboard(
+        -1001234567890,
+        1,
+        570,
+        3,
+        2,
+    )
+    custom_callbacks = {
+        button.callback_data
+        for row in custom_keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert "scheduleintgap:-1001234567890:1:570:3:120" in gap_callbacks
+    assert "schedulegapcustom:-1001234567890:1:570:3" in gap_callbacks
+    assert "schedulegapminute:-1001234567890:1:570:3:2:15" in custom_callbacks
+    assert all(len(value or "") <= 64 for value in gap_callbacks | custom_callbacks)
+
+
+@pytest.mark.asyncio
+async def test_schedule_interval_callback_stays_in_editorial_chat() -> None:
+    editor = object.__new__(EditorBot)
+    editor._is_owner = AsyncMock(return_value=True)
+    editor.repository = SimpleNamespace(pop_pending_action=AsyncMock())
+    editor._show_schedule_hour_picker = AsyncMock()
+    callback = SimpleNamespace(
+        from_user=SimpleNamespace(id=77),
+        data="scheduleinterval:-1001234567890:1",
+        message=SimpleNamespace(
+            message_id=55,
+            chat=SimpleNamespace(id=-1009876543210),
+        ),
+        answer=AsyncMock(),
+    )
+
+    await editor._callback(callback)
+
+    editor._show_schedule_hour_picker.assert_awaited_once_with(
+        -1009876543210,
+        55,
+        -1001234567890,
+        1,
+        "i",
+    )
+
+
+@pytest.mark.asyncio
+async def test_equal_schedule_rejects_rollover_to_next_day() -> None:
+    editor = object.__new__(EditorBot)
+    editor._set_channel_day_schedule = AsyncMock()
+
+    error = await editor._save_equal_schedule(-1001234567890, 1, 23 * 60, 2, 60)
+
+    assert "следующий день" in str(error)
+    editor._set_channel_day_schedule.assert_not_awaited()
 
 
 def test_parse_publish_time_accepts_tomorrow_and_full_date() -> None:
