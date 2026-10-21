@@ -65,6 +65,11 @@ def is_solidot_url(url: str) -> bool:
     return host in SOLIDOT_HOSTS or host.endswith(".solidot.org")
 
 
+def is_telegram_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").casefold().removeprefix("www.")
+    return host in {"t.me", "telegram.me", "telegram.dog"}
+
+
 def is_known_secondary_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").casefold().removeprefix("www.")
     return any(host == blocked or host.endswith(f".{blocked}") for blocked in SECONDARY_SOURCE_HOSTS)

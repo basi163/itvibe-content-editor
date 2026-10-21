@@ -13,6 +13,7 @@ from app.llm import QwenClient
 from app.models import StoryCandidate
 from app.pipeline import ContentPipeline
 from app.rss import FeedEntry, SolidotFeed
+from app.telegram_sources import TelegramSourceManager
 
 logger = logging.getLogger(__name__)
 FEED_RETRY_DELAY = timedelta(minutes=30)
@@ -163,6 +164,38 @@ async def rss_worker(
             pass
 
 
+async def telegram_source_worker(
+    settings: Settings,
+    manager: TelegramSourceManager,
+    stop_event: asyncio.Event,
+) -> None:
+    previous_delay: int | None = None
+    while not stop_event.is_set():
+        try:
+            result = await manager.poll_all()
+            if result["found"] or result["errors"]:
+                logger.info(
+                    "Telegram sources checked: sources=%s found=%s processed=%s "
+                    "drafts=%s errors=%s",
+                    result["sources"],
+                    result["found"],
+                    result["processed"],
+                    result["drafts"],
+                    result["errors"],
+                )
+        except Exception:
+            logger.exception("Telegram source polling failed")
+
+        delay = rss_poll_delay_seconds(settings)
+        if delay != previous_delay:
+            logger.info("Next Telegram source check in %s seconds", delay)
+            previous_delay = delay
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -185,7 +218,12 @@ async def main() -> None:
         extractor=extractor,
         llm=llm,
     )
-    editor_bot = EditorBot(settings, repository, pipeline)
+    telegram_sources = TelegramSourceManager(
+        repository,
+        pipeline,
+        timeout=settings.http_timeout_seconds,
+    )
+    editor_bot = EditorBot(settings, repository, pipeline, telegram_sources)
     pipeline.set_delivery(editor_bot.deliver_draft)
     await editor_bot.initialize()
 
@@ -198,6 +236,9 @@ async def main() -> None:
             pass
 
     feed_task = asyncio.create_task(rss_worker(settings, repository, pipeline, stop_event))
+    telegram_task = asyncio.create_task(
+        telegram_source_worker(settings, telegram_sources, stop_event)
+    )
     publish_task = asyncio.create_task(editor_bot.scheduled_publish_worker(stop_event))
     try:
         await editor_bot.start_polling()
@@ -205,8 +246,14 @@ async def main() -> None:
         stop_event.set()
         editor_bot.schedule_wakeup.set()
         feed_task.cancel()
+        telegram_task.cancel()
         publish_task.cancel()
-        await asyncio.gather(feed_task, publish_task, return_exceptions=True)
+        await asyncio.gather(
+            feed_task,
+            telegram_task,
+            publish_task,
+            return_exceptions=True,
+        )
         await extractor.close()
         await editor_bot.close()
 

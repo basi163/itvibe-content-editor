@@ -12,6 +12,7 @@ from app.extractor import (
     ArticleExtractor,
     is_known_secondary_url,
     is_solidot_url,
+    is_telegram_url,
     normalize_url,
 )
 from app.llm import QwenClient
@@ -78,6 +79,8 @@ class ContentPipeline:
         sources = await self.extractor.collect_sources(candidate.urls)
         if candidate.origin_type == "solidot_rss":
             sources = [source for source in sources if not is_solidot_url(source.url)]
+        elif candidate.origin_type == "telegram_web":
+            sources = [source for source in sources if not is_telegram_url(source.url)]
         if not sources:
             sources = [
                 SourceDocument(
@@ -85,6 +88,7 @@ class ContentPipeline:
                         candidate.origin_ref
                         if candidate.origin_ref.startswith("http")
                         and not is_solidot_url(candidate.origin_ref)
+                        and not is_telegram_url(candidate.origin_ref)
                         else ""
                     ),
                     title=candidate.title,
@@ -109,6 +113,7 @@ class ContentPipeline:
             source.linkable = (
                 index in requested_linkable
                 and not is_solidot_url(source.url)
+                and not is_telegram_url(source.url)
                 and not is_known_secondary_url(source.url)
             )
         triage.linkable_source_indices = [
@@ -287,6 +292,16 @@ class ContentPipeline:
                     "image_url": None,
                 }
             )
+        for image_url in candidate.media_urls:
+            item = {
+                "type": "photo",
+                "telegram_file_id": None,
+                "page_url": candidate.origin_ref,
+                "image_url": image_url,
+                "provider": "telegram_public_web",
+            }
+            if item not in media:
+                media.append(item)
         ordered = sorted(
             range(len(sources)),
             key=lambda index: (

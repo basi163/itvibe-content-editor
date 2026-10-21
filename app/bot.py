@@ -43,6 +43,7 @@ from app.renderer import (
     render_post,
     validate_post,
 )
+from app.telegram_sources import TelegramSourceManager, parse_public_channel_username
 
 logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -305,10 +306,12 @@ class EditorBot:
         settings: Settings,
         repository: Repository,
         pipeline: ContentPipeline,
+        telegram_sources: TelegramSourceManager | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.pipeline = pipeline
+        self.telegram_sources = telegram_sources
         self.bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -374,6 +377,7 @@ class EditorBot:
         self.router.message.register(self._help, Command("help"))
         self.router.message.register(self._chat_shared, F.chat_shared)
         self.router.callback_query.register(self._callback, F.data)
+        self.router.channel_post.register(self._editor_channel_post)
         self.router.edited_channel_post.register(self._edited_editor_post)
         self.router.message.register(self._private_message, F.chat.type == ChatType.PRIVATE)
 
@@ -520,6 +524,12 @@ class EditorBot:
                     InlineKeyboardButton(
                         text="📣 Каналы публикации",
                         callback_data="targetmenu:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📰 Источники контента",
+                        callback_data="sources:0",
                     )
                 ],
                 [
@@ -1098,11 +1108,181 @@ class EditorBot:
     async def _sources(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
-        await message.answer(
-            "Активный источник\n\n"
-            f"Solidot RSS\n<code>{html.escape(self.settings.solidot_rss_url)}</code>\n\n"
-            "Также можно переслать боту любой доступный пост из другого канала."
+        await self._show_sources_menu(message.chat.id, user_id=message.from_user.id)
+
+    async def _show_sources_menu(
+        self,
+        chat_id: int,
+        *,
+        user_id: int,
+        message_id: int | None = None,
+    ) -> None:
+        sources = await self.repository.content_sources(kind="telegram_web")
+        enabled = sum(bool(source["enabled"]) for source in sources)
+        lines = [
+            "<b>📰 Источники контента</b>",
+            (
+                "🟢 <b>Solidot RSS</b>\n"
+                f"<code>{html.escape(self.settings.solidot_rss_url)}</code>"
+            ),
+            (
+                f"Telegram-каналов: <b>{len(sources)}</b> · "
+                f"включено: <b>{enabled}</b>"
+            ),
+            (
+                "Бот читает только открытую веб-ленту <code>t.me/s/...</code>. "
+                "Закрытые каналы и обход ограничений не используются."
+            ),
+        ]
+        rows: list[list[InlineKeyboardButton]] = []
+        for source in sources:
+            marker = "🟢" if source["enabled"] else "⚪️"
+            username = str(source["source_key"]).split(":", 1)[1]
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{marker} {source['title']} (@{username})"[:64],
+                        callback_data=f"sourceitem:{source['id']}",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="➕ Добавить Telegram-канал",
+                        callback_data="sourceadd:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Проверить все сейчас",
+                        callback_data="sourcecheckall:0",
+                    )
+                ],
+            ]
         )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                *rows,
+                *await self._navigation_rows(
+                    user_id,
+                    chat_id,
+                    include_unpublished=False,
+                    back_callback="home:0",
+                    back_label="« Назад в главное меню",
+                    include_home=False,
+                ),
+            ]
+        )
+        text = "\n\n".join(lines)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not refresh source menu in place")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_source_item(
+        self,
+        chat_id: int,
+        message_id: int,
+        source: dict[str, Any],
+    ) -> None:
+        username = str(source["source_key"]).split(":", 1)[1]
+        status = "🟢 включён" if source["enabled"] else "⚪️ выключен"
+        error = (
+            f"\nОшибка: <code>{html.escape(str(source['last_error']))}</code>"
+            if source.get("last_error")
+            else ""
+        )
+        text = (
+            f"<b>{html.escape(str(source['title']))}</b>\n\n"
+            f"@{html.escape(username)}\n"
+            f"Статус: {status}\n"
+            f"Последний ID: <code>{html.escape(str(source.get('last_external_id') or '—'))}</code>\n"
+            f"Проверено: {html.escape(str(source.get('last_checked_at') or 'ещё нет'))}"
+            f"{error}"
+        )
+        toggle_label = "⚪️ Выключить" if source["enabled"] else "🟢 Включить"
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=toggle_label,
+                        callback_data=f"sourcetoggle:{source['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        text="🔄 Проверить",
+                        callback_data=f"sourcecheck:{source['id']}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🗑 Удалить источник",
+                        callback_data=f"sourcedelask:{source['id']}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="« Назад к источникам",
+                        callback_data="sources:0",
+                    ),
+                    InlineKeyboardButton(text="🏠 Меню", callback_data="home:0"),
+                ],
+            ]
+        )
+        await self.bot.edit_message_text(
+            text=text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=keyboard,
+        )
+
+    async def _run_source_check(
+        self,
+        chat_id: int,
+        source_id: int | None,
+    ) -> None:
+        if not self.telegram_sources:
+            await self.bot.send_message(chat_id, "Telegram-источники недоступны.")
+            return
+        try:
+            if source_id is None:
+                result = await self.telegram_sources.poll_all()
+                text = (
+                    "Проверка источников завершена.\n\n"
+                    f"Каналов: <b>{result['sources']}</b>\n"
+                    f"Новых постов: <b>{result['found']}</b>\n"
+                    f"Проверено конвейером: <b>{result['processed']}</b>\n"
+                    f"Создано черновиков: <b>{result['drafts']}</b>\n"
+                    f"Ошибок источников: <b>{result['errors']}</b>"
+                )
+            else:
+                source = await self.repository.get_content_source(source_id)
+                if not source:
+                    await self.bot.send_message(chat_id, "Источник не найден.")
+                    return
+                result = await self.telegram_sources.poll_source(source)
+                text = (
+                    f"Источник <b>{html.escape(str(source['title']))}</b> проверен.\n\n"
+                    f"Новых постов: <b>{result['found']}</b>\n"
+                    f"Проверено: <b>{result['processed']}</b>\n"
+                    f"Создано черновиков: <b>{result['drafts']}</b>"
+                )
+        except Exception as error:  # noqa: BLE001 - report background source failures in UI
+            logger.warning("Manual Telegram source check failed: %s", type(error).__name__)
+            text = (
+                "Проверка Telegram-источника завершилась ошибкой.\n\n"
+                f"<code>{html.escape(str(error))}</code>"
+            )
+        await self.bot.send_message(chat_id, text)
 
     async def _settings(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
@@ -2436,10 +2616,71 @@ class EditorBot:
     async def _edited_editor_post(self, message: Message) -> None:
         await self._sync_editor_post(message, notify_on_error=True)
 
+    async def _editor_channel_post(self, message: Message) -> None:
+        editor_chat_id = await self.repository.get_setting("editor_chat_id")
+        if not editor_chat_id or message.chat.id != int(editor_chat_id):
+            return
+        request = await self.repository.get_source_input_request(message.chat.id)
+        if not request or message.message_id == request.get("prompt_message_id"):
+            return
+        await self._consume_source_input(message, request)
+
+    async def _consume_source_input(
+        self,
+        message: Message,
+        request: dict[str, Any],
+    ) -> None:
+        if not self.telegram_sources:
+            await message.answer("Telegram-источники сейчас недоступны.")
+            return
+        value = (message.text or message.caption or "").strip()
+        try:
+            parse_public_channel_username(value)
+        except ValueError as error:
+            await message.answer(f"{html.escape(str(error))}. Попробуй ещё раз.")
+            return
+        progress = await message.answer("Проверяю открытую веб-ленту Telegram…")
+        try:
+            await self.telegram_sources.add(value)
+        except Exception as error:  # noqa: BLE001 - keep the input flow recoverable
+            logger.warning("Could not add Telegram source: %s", type(error).__name__)
+            try:
+                await self.bot.delete_message(progress.chat.id, progress.message_id)
+            except TelegramBadRequest:
+                pass
+            await message.answer(
+                "Не удалось открыть публичную ленту.\n\n"
+                f"<code>{html.escape(str(error))}</code>\n\n"
+                "Проверь username и что адрес <code>t.me/s/username</code> "
+                "открывается без входа."
+            )
+            return
+
+        await self.repository.clear_source_input_request(message.chat.id)
+        if message.chat.type == ChatType.CHANNEL:
+            try:
+                await self.bot.delete_message(message.chat.id, message.message_id)
+            except TelegramBadRequest:
+                logger.info("Could not delete source username post from editor channel")
+        try:
+            await self.bot.delete_message(progress.chat.id, progress.message_id)
+        except TelegramBadRequest:
+            pass
+        await self._show_sources_menu(
+            message.chat.id,
+            user_id=int(request["user_id"]),
+            message_id=request.get("prompt_message_id"),
+        )
+
     async def _private_message(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
         if message.text and message.text.startswith("/"):
+            return
+
+        source_request = await self.repository.get_source_input_request(message.chat.id)
+        if source_request and int(source_request["user_id"]) == message.from_user.id:
+            await self._consume_source_input(message, source_request)
             return
 
         pending = await self.repository.pop_pending_action(message.from_user.id)
@@ -2963,6 +3204,128 @@ class EditorBot:
         if not valid:
             await callback.answer("Некорректная команда", show_alert=True)
             return
+
+        source_actions = {
+            "sources",
+            "sourceitem",
+            "sourceadd",
+            "sourcecancel",
+            "sourcecheck",
+            "sourcecheckall",
+            "sourcetoggle",
+            "sourcedelask",
+            "sourcedel",
+        }
+        if action in source_actions:
+            if not callback.message:
+                await callback.answer("Сообщение меню не найдено", show_alert=True)
+                return
+            chat_id = callback.message.chat.id
+            message_id = callback.message.message_id
+            source_id = int(parts[1])
+            if action == "sources":
+                await callback.answer("Открываю источники")
+                await self._show_sources_menu(
+                    chat_id,
+                    user_id=callback.from_user.id,
+                    message_id=None if source_draft else message_id,
+                )
+                return
+            if action == "sourceadd":
+                if not self.telegram_sources:
+                    await callback.answer("Функция недоступна", show_alert=True)
+                    return
+                await callback.answer("Жду username")
+                prompt = await self.bot.send_message(
+                    chat_id,
+                    "<b>Добавление Telegram-источника</b>\n\n"
+                    "Отправь следующим сообщением <code>@username</code> "
+                    "или <code>https://t.me/username</code>.\n\n"
+                    "Канал должен открываться по адресу <code>t.me/s/username</code> "
+                    "без входа.",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="Отмена",
+                                    callback_data="sourcecancel:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                await self.repository.set_source_input_request(
+                    chat_id,
+                    callback.from_user.id,
+                    prompt.message_id,
+                )
+                return
+            if action == "sourcecancel":
+                await self.repository.clear_source_input_request(chat_id)
+                await callback.answer("Добавление отменено")
+                await self._show_sources_menu(
+                    chat_id,
+                    user_id=callback.from_user.id,
+                    message_id=message_id,
+                )
+                return
+            if action in {"sourcecheck", "sourcecheckall"}:
+                await callback.answer("Проверяю в фоновом режиме")
+                asyncio.create_task(
+                    self._run_source_check(
+                        chat_id,
+                        None if action == "sourcecheckall" else source_id,
+                    )
+                )
+                return
+            source = await self.repository.get_content_source(source_id)
+            if not source:
+                await callback.answer("Источник не найден", show_alert=True)
+                return
+            if action == "sourceitem":
+                await callback.answer("Открываю источник")
+                await self._show_source_item(chat_id, message_id, source)
+                return
+            if action == "sourcetoggle":
+                enabled = not bool(source["enabled"])
+                await self.repository.update_content_source(
+                    source_id,
+                    enabled=int(enabled),
+                )
+                source["enabled"] = int(enabled)
+                await callback.answer("Источник включён" if enabled else "Источник выключен")
+                await self._show_source_item(chat_id, message_id, source)
+                return
+            if action == "sourcedelask":
+                await callback.answer("Нужно подтверждение")
+                await self.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="✅ Удалить",
+                                    callback_data=f"sourcedel:{source_id}",
+                                ),
+                                InlineKeyboardButton(
+                                    text="Отмена",
+                                    callback_data=f"sourceitem:{source_id}",
+                                ),
+                            ]
+                        ]
+                    ),
+                )
+                return
+            if action == "sourcedel":
+                await self.repository.delete_content_source(source_id)
+                await callback.answer("Источник удалён")
+                await self._show_sources_menu(
+                    chat_id,
+                    user_id=callback.from_user.id,
+                    message_id=message_id,
+                )
+                return
 
         if action == "home":
             await callback.answer("Главное меню")

@@ -27,6 +27,26 @@ def test_article_image_is_preferred_over_official_site_card() -> None:
     assert media[0]["image_url"] == "https://www.zdnet.com/wp-content/hero.jpg"
 
 
+def test_telegram_public_image_is_available_to_the_existing_media_pipeline() -> None:
+    image_url = "https://cdn.example.org/channel-image.jpg"
+    candidate = StoryCandidate(
+        "telegram_web",
+        "https://t.me/example_channel/42",
+        "Title",
+        "Text",
+        media_urls=[image_url],
+    )
+
+    media = ContentPipeline._media_candidates(
+        candidate,
+        [],
+        TriageDecision(True, 0.9, "technology", "relevant"),
+    )
+
+    assert media[0]["image_url"] == image_url
+    assert media[0]["provider"] == "telegram_public_web"
+
+
 @pytest.mark.asyncio
 async def test_story_without_image_is_not_created() -> None:
     class Extractor:

@@ -193,6 +193,43 @@ async def test_pending_manual_edits_can_be_cleared(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_telegram_content_source_and_channel_input_round_trip(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+
+    source_id = await repository.create_content_source(
+        kind="telegram_web",
+        source_key="telegram_web:example_channel",
+        title="Example Channel",
+        url="https://t.me/s/example_channel",
+        last_external_id="42",
+    )
+    await repository.set_source_input_request(-100123, 77, 900)
+
+    source = await repository.get_content_source(source_id)
+    request = await repository.get_source_input_request(-100123)
+
+    assert source is not None
+    assert source["enabled"] == 1
+    assert source["last_external_id"] == "42"
+    assert request is not None
+    assert request["user_id"] == 77
+    assert request["prompt_message_id"] == 900
+
+    await repository.update_content_source(source_id, enabled=0, last_external_id="43")
+    updated = await repository.get_content_source_by_key("telegram_web:example_channel")
+    assert updated is not None
+    assert updated["enabled"] == 0
+    assert updated["last_external_id"] == "43"
+
+    await repository.clear_source_input_request(-100123)
+    assert await repository.get_source_input_request(-100123) is None
+
+    await repository.delete_content_source(source_id)
+    assert await repository.get_content_source(source_id) is None
+
+
+@pytest.mark.asyncio
 async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
     repository = Repository(tmp_path / "editor.sqlite3")
     await repository.initialize()

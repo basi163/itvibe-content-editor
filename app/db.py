@@ -113,6 +113,28 @@ class Repository:
                     PRIMARY KEY(user_id, chat_id),
                     FOREIGN KEY(draft_id) REFERENCES drafts(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS content_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    source_key TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_external_id TEXT,
+                    last_checked_at TEXT,
+                    last_success_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS source_input_requests (
+                    chat_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    prompt_message_id INTEGER,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             cursor = await db.execute("PRAGMA table_info(drafts)")
@@ -666,6 +688,145 @@ class Repository:
     async def clear_pending_actions(self) -> None:
         async with self.connect() as db:
             await db.execute("DELETE FROM pending_actions")
+            await db.commit()
+
+    async def create_content_source(
+        self,
+        *,
+        kind: str,
+        source_key: str,
+        title: str,
+        url: str,
+        last_external_id: str | None,
+    ) -> int:
+        now = _now()
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO content_sources(
+                    kind, source_key, title, url, enabled, last_external_id,
+                    last_checked_at, last_success_at, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    kind,
+                    source_key,
+                    title,
+                    url,
+                    last_external_id,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def content_sources(
+        self,
+        *,
+        kind: str | None = None,
+        enabled_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if kind:
+            conditions.append("kind = ?")
+            parameters.append(kind)
+        if enabled_only:
+            conditions.append("enabled = 1")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        async with self.connect() as db:
+            cursor = await db.execute(
+                f"SELECT * FROM content_sources {where} ORDER BY title, id",
+                tuple(parameters),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_content_source(self, source_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                "SELECT * FROM content_sources WHERE id = ?",
+                (source_id,),
+            )
+            return dict(row) if row else None
+
+    async def get_content_source_by_key(self, source_key: str) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                "SELECT * FROM content_sources WHERE source_key = ?",
+                (source_key,),
+            )
+            return dict(row) if row else None
+
+    async def update_content_source(self, source_id: int, **fields: Any) -> None:
+        allowed = {
+            "title",
+            "url",
+            "enabled",
+            "last_external_id",
+            "last_checked_at",
+            "last_success_at",
+            "last_error",
+        }
+        invalid = set(fields) - allowed
+        if invalid:
+            raise ValueError(f"Unsupported source fields: {sorted(invalid)}")
+        if not fields:
+            return
+        fields["updated_at"] = _now()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        async with self.connect() as db:
+            await db.execute(
+                f"UPDATE content_sources SET {assignments} WHERE id = ?",
+                (*fields.values(), source_id),
+            )
+            await db.commit()
+
+    async def delete_content_source(self, source_id: int) -> None:
+        async with self.connect() as db:
+            await db.execute("DELETE FROM content_sources WHERE id = ?", (source_id,))
+            await db.commit()
+
+    async def set_source_input_request(
+        self,
+        chat_id: int,
+        user_id: int,
+        prompt_message_id: int | None,
+    ) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                """
+                INSERT INTO source_input_requests(
+                    chat_id, user_id, prompt_message_id, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    prompt_message_id = excluded.prompt_message_id,
+                    created_at = excluded.created_at
+                """,
+                (chat_id, user_id, prompt_message_id, _now()),
+            )
+            await db.commit()
+
+    async def get_source_input_request(self, chat_id: int) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                "SELECT * FROM source_input_requests WHERE chat_id = ?",
+                (chat_id,),
+            )
+            return dict(row) if row else None
+
+    async def clear_source_input_request(self, chat_id: int) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                "DELETE FROM source_input_requests WHERE chat_id = ?",
+                (chat_id,),
+            )
             await db.commit()
 
     async def stats(self) -> dict[str, int]:

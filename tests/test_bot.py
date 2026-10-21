@@ -124,6 +124,7 @@ def test_home_keyboard_opens_every_main_section() -> None:
         "plan:0",
         "schedule:0",
         "targetmenu:0",
+        "sources:0",
     }
 
 

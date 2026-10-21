@@ -30,6 +30,7 @@ class StoryCandidate:
     title: str
     text: str
     urls: list[str] = field(default_factory=list)
+    media_urls: list[str] = field(default_factory=list)
     telegram_file_id: str | None = None
     telegram_media_type: str | None = None
 
