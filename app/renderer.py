@@ -200,7 +200,12 @@ def _body_to_rich_html(body: str, sources: list[SourceDocument]) -> str:
     return "<br>".join(blocks)
 
 
-def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
+def validate_post(
+    post: GeneratedPost,
+    max_chars: int,
+    *,
+    required_hashtag_count: int | None = 3,
+) -> list[str]:
     errors: list[str] = []
     title = post.title.strip()
     body = visible_body(normalize_body_spacing(post.body))
@@ -221,9 +226,9 @@ def validate_post(post: GeneratedPost, max_chars: int) -> list[str]:
     for phrase in BANNED_PHRASES:
         if phrase in lowered:
             errors.append(f"Запрещенный шаблон: {phrase}")
-    if len(hashtags) != 3:
-        errors.append("Нужно ровно три хэштега")
-    elif any(not TAG_RE.match(tag) for tag in hashtags):
+    if required_hashtag_count is not None and len(hashtags) != required_hashtag_count:
+        errors.append(f"Нужно ровно {required_hashtag_count} хэштега")
+    if any(not TAG_RE.match(tag) for tag in hashtags):
         errors.append("Некорректный формат хэштегов")
     total_visible_length = len(visible) + 2 + len(SIGNATURE_TEXT)
     if total_visible_length > max_chars:

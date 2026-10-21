@@ -2279,6 +2279,7 @@ class EditorBot:
         *,
         draft: dict[str, Any] | None = None,
         notify_on_error: bool = False,
+        verify_origin: bool = True,
     ) -> tuple[bool, str | None]:
         if draft is None:
             draft = await self.repository.get_draft_by_editor_message(
@@ -2295,7 +2296,7 @@ class EditorBot:
             )
             if message_id is not None
         }
-        if (
+        if verify_origin and (
             int(draft.get("editor_chat_id") or 0) != message.chat.id
             or message.message_id not in editor_message_ids
         ):
@@ -2304,7 +2305,11 @@ class EditorBot:
         if not text:
             return False, None
         post = parse_editor_post_text(text, str(draft.get("body") or ""))
-        errors = validate_post(post, self.settings.max_post_chars)
+        errors = validate_post(
+            post,
+            self.settings.max_post_chars,
+            required_hashtag_count=None,
+        )
         if errors:
             error = "; ".join(errors)
             if notify_on_error:
@@ -2379,6 +2384,54 @@ class EditorBot:
         await self.repository.update_draft(int(draft["id"]), **fields)
         logger.info("Synced native Telegram edit for draft %s", draft["id"])
         return True, None
+
+    async def _sync_current_editor_post(
+        self,
+        draft: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        editor_chat_id = draft.get("editor_chat_id")
+        editor_message_id = draft.get("editor_message_id")
+        if not editor_chat_id or not editor_message_id:
+            return False, None
+        owners = await self.repository.owner_ids()
+        if not owners:
+            return False, "не найден владелец для проверки ручной правки"
+
+        snapshot: Message | None = None
+        try:
+            snapshot = await self.bot.forward_message(
+                chat_id=owners[0],
+                from_chat_id=int(editor_chat_id),
+                message_id=int(editor_message_id),
+                disable_notification=True,
+            )
+            synced, error = await self._sync_editor_post(
+                snapshot,
+                draft=draft,
+                verify_origin=False,
+            )
+            if not synced and error is None:
+                return False, "не удалось прочитать текущую версию поста"
+            return synced, error
+        except TelegramBadRequest as error:
+            logger.warning(
+                "Could not fetch current Telegram version for draft %s: %s",
+                draft["id"],
+                error,
+            )
+            return False, "не удалось проверить текущую версию поста"
+        finally:
+            if snapshot is not None:
+                try:
+                    await self.bot.delete_message(
+                        chat_id=snapshot.chat.id,
+                        message_id=snapshot.message_id,
+                    )
+                except TelegramBadRequest:
+                    logger.warning(
+                        "Could not remove temporary snapshot for draft %s",
+                        draft["id"],
+                    )
 
     async def _edited_editor_post(self, message: Message) -> None:
         await self._sync_editor_post(message, notify_on_error=True)
@@ -3817,6 +3870,18 @@ class EditorBot:
         *,
         target_chat_id: int | None = None,
     ) -> bool:
+        draft = await self.repository.get_draft(draft_id)
+        if not draft:
+            return False
+        _, sync_error = await self._sync_current_editor_post(draft)
+        if sync_error:
+            if owner_id is not None:
+                await self.bot.send_message(
+                    owner_id,
+                    f"Публикация #{draft_id} остановлена: "
+                    f"{sync_error}.",
+                )
+            return False
         draft = await self.repository.get_draft(draft_id)
         if not draft:
             return False

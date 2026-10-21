@@ -152,6 +152,20 @@ def test_local_normalizer_removes_meta_commentary_lead_ins() -> None:
     assert validate_post(normalized, 2000) == []
 
 
+def test_manual_editor_can_keep_fewer_than_three_hashtags() -> None:
+    post = GeneratedPost(
+        title="Япония начала охоту за образцами с Фобоса",
+        body="Текст новости.",
+        hashtags=["#космос", "#Марс"],
+    )
+
+    assert validate_post(
+        post,
+        2000,
+        required_hashtag_count=None,
+    ) == []
+
+
 def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
     prompt = render_writer_system_prompt(2000)
 

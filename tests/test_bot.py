@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -366,6 +367,61 @@ async def test_native_telegram_edit_updates_stored_draft() -> None:
     assert fields["title"] == "Новый заголовок"
     assert fields["body"] == "Новый текст публикации."
     assert fields["editor_touched_at"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_publish_reads_current_editor_post_before_sending() -> None:
+    editor = object.__new__(EditorBot)
+    draft = {
+        "id": 31,
+        "status": "scheduled",
+        "title": "Япония начала охоту за образцами с Фобоса",
+        "body": "Текст новости.",
+        "hashtags": ["#космос", "#JAXA", "#Марс"],
+        "media": [],
+        "editor_chat_id": -1001234567890,
+        "editor_message_id": 42,
+        "editor_media_message_id": None,
+    }
+    snapshot = SimpleNamespace(
+        chat=SimpleNamespace(id=77),
+        message_id=999,
+        text=(
+            "Япония начала охоту за образцами с Фобоса\n\n"
+            "Текст новости.\n\n#космос #Марс\n\n🔳 IT Vibe News"
+        ),
+        caption=None,
+        rich_message=None,
+        photo=[],
+        video=None,
+    )
+    editor.repository = SimpleNamespace(
+        owner_ids=AsyncMock(return_value=[77]),
+        update_draft=AsyncMock(),
+    )
+    editor.settings = SimpleNamespace(max_post_chars=2000)
+    editor.bot = SimpleNamespace(
+        forward_message=AsyncMock(return_value=snapshot),
+        delete_message=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+
+    synced, error = await editor._sync_current_editor_post(draft)
+
+    assert synced
+    assert error is None
+    fields = editor.repository.update_draft.await_args.kwargs
+    assert json.loads(fields["hashtags_json"]) == ["#космос", "#Марс"]
+    editor.bot.forward_message.assert_awaited_once_with(
+        chat_id=77,
+        from_chat_id=-1001234567890,
+        message_id=42,
+        disable_notification=True,
+    )
+    editor.bot.delete_message.assert_awaited_once_with(
+        chat_id=77,
+        message_id=999,
+    )
 
 
 @pytest.mark.asyncio
