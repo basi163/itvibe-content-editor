@@ -92,6 +92,7 @@ class Repository:
                     schedule_attempts INTEGER NOT NULL DEFAULT 0,
                     schedule_error TEXT,
                     publications_json TEXT NOT NULL DEFAULT '[]',
+                    editor_touched_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -101,6 +102,15 @@ class Repository:
                     action TEXT NOT NULL,
                     draft_id INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
+                    FOREIGN KEY(draft_id) REFERENCES drafts(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS navigation_contexts (
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    draft_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, chat_id),
                     FOREIGN KEY(draft_id) REFERENCES drafts(id) ON DELETE CASCADE
                 );
                 """
@@ -114,6 +124,7 @@ class Repository:
                 "schedule_attempts": "INTEGER NOT NULL DEFAULT 0",
                 "schedule_error": "TEXT",
                 "publications_json": "TEXT NOT NULL DEFAULT '[]'",
+                "editor_touched_at": "TEXT",
             }
             for column, definition in draft_migrations.items():
                 if column not in columns:
@@ -376,6 +387,7 @@ class Repository:
             "schedule_attempts",
             "schedule_error",
             "publications_json",
+            "editor_touched_at",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -396,6 +408,78 @@ class Repository:
                 (limit,),
             )
             return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
+
+    async def unpublished_draft_count(self) -> int:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                """
+                SELECT COUNT(*) AS count
+                FROM drafts
+                WHERE status IN ('draft', 'scheduled')
+                """,
+            )
+            return int(row["count"]) if row else 0
+
+    async def unpublished_drafts(
+        self,
+        *,
+        limit: int = 8,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM drafts
+                WHERE status IN ('draft', 'scheduled')
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+            return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
+
+    async def set_navigation_context(
+        self,
+        user_id: int,
+        chat_id: int,
+        draft_id: int,
+    ) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                """
+                INSERT INTO navigation_contexts(
+                    user_id, chat_id, draft_id, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, chat_id) DO UPDATE SET
+                    draft_id = excluded.draft_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, chat_id, draft_id, _now()),
+            )
+            await db.commit()
+
+    async def get_navigation_context(
+        self,
+        user_id: int,
+        chat_id: int,
+    ) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                """
+                SELECT drafts.*
+                FROM navigation_contexts
+                JOIN drafts ON drafts.id = navigation_contexts.draft_id
+                WHERE navigation_contexts.user_id = ?
+                  AND navigation_contexts.chat_id = ?
+                """,
+                (user_id, chat_id),
+            )
+            if not row:
+                return None
+            return self._decode_draft(dict(row))
 
     async def due_scheduled_drafts(
         self,

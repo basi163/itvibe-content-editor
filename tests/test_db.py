@@ -33,6 +33,7 @@ async def test_draft_round_trip(tmp_path: Path) -> None:
     assert draft["target_media_message_id"] is None
     assert draft["scheduled_at"] is None
     assert draft["schedule_attempts"] == 0
+    assert draft["editor_touched_at"] is None
 
     await repository.update_draft(
         draft_id,
@@ -42,6 +43,49 @@ async def test_draft_round_trip(tmp_path: Path) -> None:
     by_message = await repository.get_draft_by_editor_message(-1001234567890, 55)
     assert by_message is not None
     assert by_message["id"] == draft_id
+
+
+@pytest.mark.asyncio
+async def test_unpublished_queue_and_navigation_context(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    draft_ids: list[int] = []
+    for index in range(3):
+        draft_ids.append(
+            await repository.create_draft(
+                origin_type="test",
+                origin_ref=f"story-{index}",
+                title=f"Заголовок {index}",
+                body="Текст",
+                hashtags=["#ИИ", "#наука", "#технологии"],
+                sources=[],
+                media=[],
+                material={},
+                triage={},
+            )
+        )
+    await repository.update_draft(
+        draft_ids[0],
+        status="published",
+    )
+    await repository.update_draft(
+        draft_ids[1],
+        status="scheduled",
+        editor_chat_id=-1001234567890,
+        editor_message_id=55,
+        editor_touched_at=datetime.now(UTC).isoformat(),
+    )
+
+    assert await repository.unpublished_draft_count() == 2
+    unpublished = await repository.unpublished_drafts(limit=1, offset=0)
+    assert [draft["id"] for draft in unpublished] == [draft_ids[2]]
+
+    await repository.set_navigation_context(77, -1001234567890, draft_ids[1])
+    context = await repository.get_navigation_context(77, -1001234567890)
+
+    assert context is not None
+    assert context["id"] == draft_ids[1]
+    assert context["editor_touched_at"] is not None
 
 
 @pytest.mark.asyncio

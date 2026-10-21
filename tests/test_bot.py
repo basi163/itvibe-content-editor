@@ -45,10 +45,12 @@ def test_draft_keyboard_describes_automatic_edits() -> None:
     assert "Контент-план" in labels
     assert "Расписание" in labels
     assert "Канал публикации" in labels
+    assert "🗂 Неопубликованные" in labels
     assert "image:7" in callbacks
     assert "plan:0" in callbacks
     assert "schedule:0" in callbacks
     assert "targetmenu:0" in callbacks
+    assert "unpublished:0" in callbacks
     assert "manualedit:7" in callbacks
     assert "media:7" not in callbacks
 
@@ -95,6 +97,7 @@ def test_scheduled_keyboard_can_publish_reschedule_or_cancel() -> None:
         "schedule:0",
         "targetmenu:0",
         "manualedit:7",
+        "unpublished:0",
     }
 
 
@@ -188,6 +191,17 @@ def test_target_channel_add_flow_stays_visible_in_editorial_channel() -> None:
     assert "targetmenu:0" in callbacks
 
 
+def test_private_editor_post_url_points_to_exact_message() -> None:
+    url = EditorBot._editor_message_url(
+        {
+            "editor_chat_id": -1001234567890,
+            "editor_message_id": 55,
+        }
+    )
+
+    assert url == "https://t.me/c/1234567890/55"
+
+
 def test_native_telegram_edit_is_parsed_and_keeps_source_marker() -> None:
     post = parse_editor_post_text(
         "Новый заголовок\n\n"
@@ -259,6 +273,7 @@ async def test_native_telegram_edit_updates_stored_draft() -> None:
     fields = editor.repository.update_draft.await_args.kwargs
     assert fields["title"] == "Новый заголовок"
     assert fields["body"] == "Новый текст публикации."
+    assert fields["editor_touched_at"]
 
 
 @pytest.mark.asyncio
@@ -426,6 +441,7 @@ async def test_weekday_button_adds_day_to_multi_selection() -> None:
         -1009876543210,
         -1001234567890,
         message_id=55,
+        user_id=77,
     )
 
 

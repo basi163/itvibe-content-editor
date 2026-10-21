@@ -64,6 +64,7 @@ WEEKDAY_NAMES = (
     "воскресенье",
 )
 WEEKDAY_SHORT_NAMES = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+UNPUBLISHED_PAGE_SIZE = 8
 
 
 def _publish_timezone(utc_offset_hours: int) -> timezone:
@@ -379,6 +380,179 @@ class EditorBot:
     async def _is_owner(self, user_id: int) -> bool:
         return await self.repository.is_owner(user_id)
 
+    @staticmethod
+    def _editor_message_url(draft: dict[str, Any]) -> str | None:
+        chat_id = str(draft.get("editor_chat_id") or "")
+        message_id = draft.get("editor_message_id")
+        if not chat_id.startswith("-100") or not message_id:
+            return None
+        return f"https://t.me/c/{chat_id[4:]}/{int(message_id)}"
+
+    async def _remember_navigation_from_callback(
+        self,
+        callback: CallbackQuery,
+    ) -> dict[str, Any] | None:
+        if not callback.message:
+            return None
+        repository = getattr(self, "repository", None)
+        get_draft = getattr(repository, "get_draft_by_editor_message", None)
+        set_context = getattr(repository, "set_navigation_context", None)
+        if get_draft is None or set_context is None:
+            return None
+        draft = await get_draft(
+            callback.message.chat.id,
+            callback.message.message_id,
+        )
+        if draft:
+            await set_context(
+                callback.from_user.id,
+                callback.message.chat.id,
+                int(draft["id"]),
+            )
+        return draft
+
+    async def _navigation_rows(
+        self,
+        user_id: int | None,
+        chat_id: int,
+        *,
+        include_unpublished: bool = True,
+    ) -> list[list[InlineKeyboardButton]]:
+        rows: list[list[InlineKeyboardButton]] = []
+        if include_unpublished:
+            count = await self.repository.unpublished_draft_count()
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"🗂 Неопубликованные — {count}",
+                        callback_data="unpublished:0",
+                    )
+                ]
+            )
+        if user_id is None:
+            return rows
+        draft = await self.repository.get_navigation_context(user_id, chat_id)
+        if draft and (url := self._editor_message_url(draft)):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"↩️ Вернуться к посту #{draft['id']}",
+                        url=url,
+                    )
+                ]
+            )
+        return rows
+
+    async def _with_navigation(
+        self,
+        keyboard: InlineKeyboardMarkup,
+        user_id: int | None,
+        chat_id: int,
+        *,
+        include_unpublished: bool = True,
+    ) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                *keyboard.inline_keyboard,
+                *await self._navigation_rows(
+                    user_id,
+                    chat_id,
+                    include_unpublished=include_unpublished,
+                ),
+            ]
+        )
+
+    async def _editor_keyboard_for(
+        self,
+        draft: dict[str, Any],
+    ) -> InlineKeyboardMarkup:
+        return self._editor_keyboard(
+            draft,
+            unpublished_count=await self.repository.unpublished_draft_count(),
+        )
+
+    async def _show_unpublished(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        page: int = 0,
+        message_id: int | None = None,
+    ) -> None:
+        total = await self.repository.unpublished_draft_count()
+        page_count = max(1, (total + UNPUBLISHED_PAGE_SIZE - 1) // UNPUBLISHED_PAGE_SIZE)
+        page = min(max(0, page), page_count - 1)
+        drafts = await self.repository.unpublished_drafts(
+            limit=UNPUBLISHED_PAGE_SIZE,
+            offset=page * UNPUBLISHED_PAGE_SIZE,
+        )
+        text = (
+            f"<b>Неопубликованные посты · {total}</b>\n\n"
+            "🆕 новый  ·  ✏️ изменён  ·  ⏳ запланирован  ·  "
+            "⚠️ не доставлен\n\n"
+            "Нажми на заголовок, чтобы вернуться к посту."
+        )
+        rows: list[list[InlineKeyboardButton]] = []
+        for draft in drafts:
+            if not draft.get("editor_message_id"):
+                marker = "⚠️"
+            elif draft.get("status") == "scheduled":
+                marker = "⏳"
+            elif draft.get("editor_touched_at"):
+                marker = "✏️"
+            else:
+                marker = "🆕"
+            label = f"{marker} #{draft['id']}  {str(draft['title'])[:42]}"
+            url = self._editor_message_url(draft)
+            button = (
+                InlineKeyboardButton(text=label, url=url)
+                if url
+                else InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"undelivered:{draft['id']}",
+                )
+            )
+            rows.append([button])
+        if total == 0:
+            text += "\n\nВсе посты обработаны."
+        pagination: list[InlineKeyboardButton] = []
+        if page > 0:
+            pagination.append(
+                InlineKeyboardButton(
+                    text="« Назад",
+                    callback_data=f"unpublished:{page - 1}",
+                )
+            )
+        if page + 1 < page_count:
+            pagination.append(
+                InlineKeyboardButton(
+                    text="Дальше »",
+                    callback_data=f"unpublished:{page + 1}",
+                )
+            )
+        if pagination:
+            rows.append(pagination)
+        rows.extend(
+            await self._navigation_rows(
+                user_id,
+                chat_id,
+                include_unpublished=False,
+            )
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not refresh unpublished list; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
     async def _publication_channels(self) -> list[dict[str, Any]]:
         raw = await self.repository.get_setting(PUBLICATION_CHANNELS_SETTING)
         if not raw:
@@ -682,12 +856,12 @@ class EditorBot:
     async def _plan(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
-        await self._show_content_plan(message.chat.id)
+        await self._show_content_plan(message.chat.id, user_id=message.from_user.id)
 
     async def _schedule(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
             return
-        await self._show_schedule_menu(message.chat.id)
+        await self._show_schedule_menu(message.chat.id, user_id=message.from_user.id)
 
     async def _chat_shared(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
@@ -786,6 +960,7 @@ class EditorBot:
         self,
         chat_id: int,
         message_id: int | None = None,
+        user_id: int | None = None,
     ) -> None:
         drafts = await self.repository.scheduled_drafts()
         target_label = await self._target_channel_label()
@@ -819,7 +994,11 @@ class EditorBot:
         else:
             lines.append("Запланированных постов пока нет.")
         text = "\n\n".join(lines)
-        keyboard = self._content_plan_keyboard(drafts, target_label)
+        keyboard = await self._with_navigation(
+            self._content_plan_keyboard(drafts, target_label),
+            user_id,
+            chat_id,
+        )
         if message_id is not None:
             try:
                 await self.bot.edit_message_text(
@@ -838,6 +1017,7 @@ class EditorBot:
         chat_id: int,
         message_id: int,
         draft: dict[str, Any],
+        user_id: int | None = None,
     ) -> None:
         publication_lines: list[str] = []
         for publication in draft.get("publications", []):
@@ -865,17 +1045,23 @@ class EditorBot:
             f"<b>{html.escape(str(draft['title']))}</b>\n\n"
             + "\n".join(publication_lines)
         )
+        keyboard = await self._with_navigation(
+            self._content_plan_item_keyboard(int(draft["id"])),
+            user_id,
+            chat_id,
+        )
         await self.bot.edit_message_text(
             text=text,
             chat_id=chat_id,
             message_id=message_id,
-            reply_markup=self._content_plan_item_keyboard(int(draft["id"])),
+            reply_markup=keyboard,
         )
 
     async def _show_target_channel_menu(
         self,
         chat_id: int,
         message_id: int | None = None,
+        user_id: int | None = None,
     ) -> None:
         channels = await self._publication_channels()
         selected = set(await self._selected_publication_channel_ids())
@@ -919,7 +1105,11 @@ class EditorBot:
             "Можно включить несколько каналов. 🟢 означает, что канал "
             "получит итоговый пост. У каждого канала своё расписание."
         )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        keyboard = await self._with_navigation(
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            user_id,
+            chat_id,
+        )
         if message_id is not None:
             try:
                 await self.bot.edit_message_text(
@@ -937,6 +1127,7 @@ class EditorBot:
         self,
         chat_id: int,
         message_id: int | None = None,
+        user_id: int | None = None,
     ) -> None:
         channels = await self._publication_channels()
         selected = set(await self._selected_publication_channel_ids())
@@ -973,7 +1164,11 @@ class EditorBot:
             "<b>Расписание публикаций</b>\n\n"
             "Выбери канал, для которого нужно настроить время."
         )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        keyboard = await self._with_navigation(
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            user_id,
+            chat_id,
+        )
         if message_id is not None:
             try:
                 await self.bot.edit_message_text(
@@ -992,15 +1187,20 @@ class EditorBot:
         chat_id: int,
         channel_id: int | None = None,
         message_id: int | None = None,
+        user_id: int | None = None,
     ) -> None:
         if channel_id is None:
             selected = await self._selected_publication_channel_ids()
             if len(await self._publication_channels()) > 1:
-                await self._show_schedule_channel_picker(chat_id, message_id)
+                await self._show_schedule_channel_picker(
+                    chat_id,
+                    message_id,
+                    user_id,
+                )
                 return
             channel_id = selected[0] if selected else None
         if channel_id is None:
-            await self._show_schedule_channel_picker(chat_id, message_id)
+            await self._show_schedule_channel_picker(chat_id, message_id, user_id)
             return
         weekly = await self._channel_stored_weekly_schedule(channel_id)
         enabled_days = await self._channel_enabled_days(channel_id, weekly)
@@ -1033,11 +1233,15 @@ class EditorBot:
                 "\n\nСейчас время по дням различается. Следующая настройка "
                 "времени синхронизирует все зелёные дни."
             )
-        keyboard = self._schedule_keyboard(
-            channel_id,
-            enabled_days,
-            slots,
-            channel_label,
+        keyboard = await self._with_navigation(
+            self._schedule_keyboard(
+                channel_id,
+                enabled_days,
+                slots,
+                channel_label,
+            ),
+            user_id,
+            chat_id,
         )
         if message_id is not None:
             try:
@@ -1241,19 +1445,30 @@ class EditorBot:
         self,
         chat_id: int,
         current_channel_id: int | None = None,
+        user_id: int | None = None,
     ) -> None:
+        keyboard = await self._with_navigation(
+            self._target_channel_add_keyboard(current_channel_id),
+            user_id,
+            chat_id,
+        )
         await self.bot.send_message(
             chat_id,
             self._target_channel_instructions(include_picker_note=True),
-            reply_markup=self._target_channel_add_keyboard(current_channel_id),
+            reply_markup=keyboard,
         )
 
     async def _show_target_channel_help(
         self,
         chat_id: int,
         current_channel_id: int | None = None,
+        user_id: int | None = None,
     ) -> None:
-        await self._show_target_channel_add_flow(chat_id, current_channel_id)
+        await self._show_target_channel_add_flow(
+            chat_id,
+            current_channel_id,
+            user_id,
+        )
 
     @staticmethod
     def _target_channel_add_keyboard(
@@ -1896,6 +2111,11 @@ class EditorBot:
                 )
             return False, error
 
+        editor_changed = (
+            post.title.strip() != str(draft.get("title") or "")
+            or post.body != str(draft.get("body") or "")
+            or post.hashtags != list(draft.get("hashtags") or [])
+        )
         fields: dict[str, Any] = {
             "title": post.title.strip(),
             "body": post.body,
@@ -1904,6 +2124,10 @@ class EditorBot:
         }
         if message.photo:
             file_id = message.photo[-1].file_id
+            selected_media = self._selected_media(draft)
+            editor_changed = editor_changed or not selected_media or (
+                selected_media.get("telegram_file_id") != file_id
+            )
             media = [
                 item
                 for item in draft["media"]
@@ -1924,6 +2148,10 @@ class EditorBot:
             fields["preview_index"] = 0
         elif message.video:
             file_id = message.video.file_id
+            selected_media = self._selected_media(draft)
+            editor_changed = editor_changed or not selected_media or (
+                selected_media.get("telegram_file_id") != file_id
+            )
             media = [
                 item
                 for item in draft["media"]
@@ -1942,6 +2170,8 @@ class EditorBot:
                 ensure_ascii=False,
             )
             fields["preview_index"] = 0
+        if editor_changed:
+            fields["editor_touched_at"] = datetime.now(UTC).isoformat()
         await self.repository.update_draft(int(draft["id"]), **fields)
         logger.info("Synced native Telegram edit for draft %s", draft["id"])
         return True, None
@@ -2018,6 +2248,7 @@ class EditorBot:
                 draft_id,
                 media_json=json.dumps(media, ensure_ascii=False),
                 preview_index=0,
+                editor_touched_at=datetime.now(UTC).isoformat(),
             )
             await self.refresh_draft(
                 draft_id,
@@ -2037,7 +2268,11 @@ class EditorBot:
                 await self.repository.set_pending_action(message.from_user.id, action, draft_id)
                 await message.answer("Не удалось применить заголовок. " + "; ".join(errors))
                 return
-            await self.repository.update_draft(draft_id, title=text)
+            await self.repository.update_draft(
+                draft_id,
+                title=text,
+                editor_touched_at=datetime.now(UTC).isoformat(),
+            )
         elif action == "hashtags":
             tags = [part.strip() for part in re.split(r"[\s,]+", text) if part.strip()]
             tags = [tag if tag.startswith("#") else f"#{tag}" for tag in tags]
@@ -2050,6 +2285,7 @@ class EditorBot:
             await self.repository.update_draft(
                 draft_id,
                 hashtags_json=json.dumps(tags, ensure_ascii=False),
+                editor_touched_at=datetime.now(UTC).isoformat(),
             )
         await self.refresh_draft(draft_id)
         await message.answer("Изменения сохранены.")
@@ -2058,6 +2294,7 @@ class EditorBot:
         if not callback.from_user or not await self._is_owner(callback.from_user.id):
             await callback.answer("Недостаточно прав", show_alert=True)
             return
+        source_draft = await self._remember_navigation_from_callback(callback)
         parts = (callback.data or "").split(":")
         action = parts[0]
         schedule_actions = {
@@ -2146,16 +2383,29 @@ class EditorBot:
                     current_text = str(getattr(callback.message, "text", "") or "")
                     if current_text.startswith("Контент-план"):
                         edit_message_id = message_id
-                await self._show_schedule_menu(chat_id, message_id=edit_message_id)
+                await self._show_schedule_menu(
+                    chat_id,
+                    message_id=edit_message_id,
+                    user_id=callback.from_user.id,
+                )
                 return
             if action == "schedulechannels":
                 await callback.answer("Выбери канал")
-                await self._show_schedule_channel_picker(chat_id, message_id)
+                await self._show_schedule_channel_picker(
+                    chat_id,
+                    message_id,
+                    callback.from_user.id,
+                )
                 return
             if action == "schedulechannel":
                 channel_id = int(parts[1])
                 await callback.answer("Канал выбран")
-                await self._show_schedule_menu(chat_id, channel_id, message_id=message_id)
+                await self._show_schedule_menu(
+                    chat_id,
+                    channel_id,
+                    message_id=message_id,
+                    user_id=callback.from_user.id,
+                )
                 return
             if action in {
                 "scheduleday",
@@ -2185,6 +2435,7 @@ class EditorBot:
                         chat_id,
                         channel_id,
                         message_id=message_id,
+                        user_id=callback.from_user.id,
                     )
                     return
                 if action == "scheduledel":
@@ -2208,6 +2459,7 @@ class EditorBot:
                         chat_id,
                         channel_id,
                         message_id=message_id,
+                        user_id=callback.from_user.id,
                     )
                     return
                 if action == "schedulereset":
@@ -2224,6 +2476,7 @@ class EditorBot:
                         chat_id,
                         channel_id,
                         message_id=message_id,
+                        user_id=callback.from_user.id,
                     )
                     return
                 enabled_days = await self._channel_enabled_days(channel_id)
@@ -2308,6 +2561,7 @@ class EditorBot:
                         chat_id,
                         channel_id,
                         message_id=message_id,
+                        user_id=callback.from_user.id,
                     )
                     return
                 await callback.answer("Выбери количество постов")
@@ -2347,6 +2601,7 @@ class EditorBot:
                         chat_id,
                         channel_id,
                         message_id=message_id,
+                        user_id=callback.from_user.id,
                     )
                     return
                 await callback.answer("Выбери интервал")
@@ -2441,6 +2696,7 @@ class EditorBot:
                 chat_id,
                 channel_id,
                 message_id=message_id,
+                user_id=callback.from_user.id,
             )
             return
 
@@ -2455,6 +2711,23 @@ class EditorBot:
             await callback.answer("Некорректная команда", show_alert=True)
             return
 
+        if action == "unpublished":
+            await callback.answer("Открываю неопубликованные посты")
+            if callback.message:
+                current_text = str(getattr(callback.message, "text", "") or "")
+                edit_message_id = (
+                    callback.message.message_id
+                    if current_text.startswith("Неопубликованные посты")
+                    else None
+                )
+                await self._show_unpublished(
+                    callback.message.chat.id,
+                    callback.from_user.id,
+                    page=int(parts[1]),
+                    message_id=edit_message_id,
+                )
+            return
+
         if action in {"plan", "planrefresh"}:
             await callback.answer("Открываю контент-план")
             if callback.message:
@@ -2463,12 +2736,19 @@ class EditorBot:
                     if action == "planrefresh"
                     else None
                 )
-                await self._show_content_plan(callback.message.chat.id, message_id)
+                await self._show_content_plan(
+                    callback.message.chat.id,
+                    message_id,
+                    callback.from_user.id,
+                )
             return
         if action == "targetmenu":
             await callback.answer("Выбери канал")
             if callback.message:
-                await self._show_target_channel_menu(callback.message.chat.id)
+                await self._show_target_channel_menu(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                )
             return
         if action == "targethelp":
             await callback.answer("Открываю инструкцию")
@@ -2481,6 +2761,7 @@ class EditorBot:
                 await self._show_target_channel_help(
                     callback.message.chat.id,
                     current_channel_id,
+                    callback.from_user.id,
                 )
             return
         if action == "targetadd":
@@ -2494,6 +2775,7 @@ class EditorBot:
                 await self._show_target_channel_add_flow(
                     callback.message.chat.id,
                     current_channel_id,
+                    callback.from_user.id,
                 )
             return
         if action == "targetpicker":
@@ -2531,7 +2813,10 @@ class EditorBot:
             )
             await self._select_publication_channel(channel_id)
             await callback.answer("Канал добавлен и включён", show_alert=True)
-            await self._show_target_channel_menu(callback.message.chat.id)
+            await self._show_target_channel_menu(
+                callback.message.chat.id,
+                user_id=callback.from_user.id,
+            )
             return
         if action == "target":
             channel_id = int(parts[1])
@@ -2556,6 +2841,7 @@ class EditorBot:
                 await self._show_target_channel_menu(
                     callback.message.chat.id,
                     callback.message.message_id,
+                    callback.from_user.id,
                 )
             return
 
@@ -2563,6 +2849,19 @@ class EditorBot:
         draft = await self.repository.get_draft(draft_id)
         if not draft:
             await callback.answer("Черновик не найден", show_alert=True)
+            return
+        if callback.message and source_draft is None:
+            await self.repository.set_navigation_context(
+                callback.from_user.id,
+                callback.message.chat.id,
+                draft_id,
+            )
+
+        if action == "undelivered":
+            await callback.answer(
+                "Этот черновик создан, но ещё не доставлен в редакционный канал.",
+                show_alert=True,
+            )
             return
 
         if action == "manualedit":
@@ -2640,7 +2939,7 @@ class EditorBot:
                 await self.bot.edit_message_reply_markup(
                     chat_id=callback.message.chat.id,
                     message_id=callback.message.message_id,
-                    reply_markup=self._editor_keyboard(draft),
+                    reply_markup=await self._editor_keyboard_for(draft),
                 )
             return
 
@@ -2651,6 +2950,7 @@ class EditorBot:
                     callback.message.chat.id,
                     callback.message.message_id,
                     draft,
+                    callback.from_user.id,
                 )
             return
         if action == "planreschedule":
@@ -2708,6 +3008,10 @@ class EditorBot:
         elif action == "regen":
             await callback.answer("Переписываю материал")
             if await self.pipeline.regenerate(draft_id):
+                await self.repository.update_draft(
+                    draft_id,
+                    editor_touched_at=datetime.now(UTC).isoformat(),
+                )
                 await self.refresh_draft(draft_id)
                 await self.bot.send_message(callback.from_user.id, f"Черновик #{draft_id} переписан.")
             else:
@@ -2769,6 +3073,10 @@ class EditorBot:
                     f"Не удалось подобрать другой вариант для #{draft_id}.",
                 )
                 return
+            await self.repository.update_draft(
+                draft_id,
+                editor_touched_at=datetime.now(UTC).isoformat(),
+            )
             await self.refresh_draft(
                 draft_id,
                 replace_message=component == "image",
@@ -2798,6 +3106,7 @@ class EditorBot:
         await self._show_content_plan(
             callback.message.chat.id,
             callback.message.message_id,
+            callback.from_user.id,
         )
 
     async def deliver_draft(self, draft_id: int) -> None:
@@ -2847,6 +3156,7 @@ class EditorBot:
         old_media_message_id = draft.get("editor_media_message_id")
         media = self._selected_media(draft)
         file_value = await self._media_input(media)
+        keyboard = await self._editor_keyboard_for(draft)
         if file_value and not replace_message:
             try:
                 edited = await self.bot.edit_message_text(
@@ -2860,7 +3170,7 @@ class EditorBot:
                         file_value,
                         str(media.get("type") or "photo"),
                     ),
-                    reply_markup=self._editor_keyboard(draft),
+                    reply_markup=keyboard,
                 )
                 if isinstance(edited, Message):
                     if old_media_message_id and int(old_media_message_id) != old_message_id:
@@ -2921,6 +3231,7 @@ class EditorBot:
     ) -> tuple[Message, int | None]:
         media = self._selected_media(draft)
         file_value = await self._media_input(media)
+        keyboard = await self._editor_keyboard_for(draft)
         if file_value:
             try:
                 message = await self.bot.send_rich_message(
@@ -2930,7 +3241,7 @@ class EditorBot:
                         file_value,
                         str(media.get("type") or "photo"),
                     ),
-                    reply_markup=self._editor_keyboard(draft),
+                    reply_markup=keyboard,
                 )
                 return message, None
             except TelegramBadRequest:
@@ -2944,14 +3255,14 @@ class EditorBot:
                             chat_id,
                             video=file_value,
                             caption=text,
-                            reply_markup=self._editor_keyboard(draft),
+                            reply_markup=keyboard,
                         )
                     else:
                         message = await self.bot.send_photo(
                             chat_id,
                             photo=file_value,
                             caption=text,
-                            reply_markup=self._editor_keyboard(draft),
+                            reply_markup=keyboard,
                         )
                     return message, None
                 if not preview_url:
@@ -2961,7 +3272,7 @@ class EditorBot:
         message = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
-            reply_markup=self._editor_keyboard(draft),
+            reply_markup=keyboard,
             link_preview_options=self._preview_options(preview_url),
         )
         return message, None
@@ -3166,7 +3477,7 @@ class EditorBot:
             await self.bot.edit_message_reply_markup(
                 chat_id=int(draft["editor_chat_id"]),
                 message_id=int(draft["editor_message_id"]),
-                reply_markup=self._editor_keyboard(draft),
+                reply_markup=await self._editor_keyboard_for(draft),
             )
         except TelegramBadRequest:
             logger.warning("Could not update schedule keyboard for draft %s", draft_id)
@@ -3451,11 +3762,15 @@ class EditorBot:
         await self.bot.send_message(user_id, text[:4000], link_preview_options=LinkPreviewOptions(is_disabled=True))
 
     @classmethod
-    def _editor_keyboard(cls, draft: dict[str, Any]) -> InlineKeyboardMarkup:
+    def _editor_keyboard(
+        cls,
+        draft: dict[str, Any],
+        unpublished_count: int | None = None,
+    ) -> InlineKeyboardMarkup:
         draft_id = int(draft["id"])
         if draft.get("status") == "scheduled":
-            return cls._scheduled_keyboard(draft_id)
-        return cls._draft_keyboard(draft_id)
+            return cls._scheduled_keyboard(draft_id, unpublished_count)
+        return cls._draft_keyboard(draft_id, unpublished_count)
 
     @staticmethod
     def _publish_options_keyboard(
@@ -3514,7 +3829,13 @@ class EditorBot:
         )
 
     @staticmethod
-    def _scheduled_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+    def _scheduled_keyboard(
+        draft_id: int,
+        unpublished_count: int | None = None,
+    ) -> InlineKeyboardMarkup:
+        unpublished_label = "🗂 Неопубликованные"
+        if unpublished_count is not None:
+            unpublished_label += f" — {unpublished_count}"
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -3555,11 +3876,23 @@ class EditorBot:
                         callback_data="targetmenu:0",
                     ),
                 ],
+                [
+                    InlineKeyboardButton(
+                        text=unpublished_label,
+                        callback_data="unpublished:0",
+                    )
+                ],
             ]
         )
 
     @staticmethod
-    def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+    def _draft_keyboard(
+        draft_id: int,
+        unpublished_count: int | None = None,
+    ) -> InlineKeyboardMarkup:
+        unpublished_label = "🗂 Неопубликованные"
+        if unpublished_count is not None:
+            unpublished_label += f" — {unpublished_count}"
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -3607,6 +3940,12 @@ class EditorBot:
                         text="Канал публикации",
                         callback_data="targetmenu:0",
                     ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=unpublished_label,
+                        callback_data="unpublished:0",
+                    )
                 ],
             ]
         )
