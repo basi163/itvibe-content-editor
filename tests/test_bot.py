@@ -116,7 +116,7 @@ def test_content_plan_keyboard_opens_posts_and_channel_settings() -> None:
 def test_schedule_keyboard_has_weekdays_times_and_management_actions() -> None:
     keyboard = EditorBot._schedule_keyboard(
         -1001234567890,
-        1,
+        (1, 3),
         [12 * 60 + 10, 20 * 60 + 10],
         "IT Vibe News",
     )
@@ -125,6 +125,9 @@ def test_schedule_keyboard_has_weekdays_times_and_management_actions() -> None:
     callbacks = {button.callback_data for button in buttons}
 
     assert "🟢 вт" in labels
+    assert "🟢 чт" in labels
+    assert "пн" in labels
+    assert "🟢 пн" not in labels
     assert "✕ 12:10" in labels
     assert "✕ 20:10" in labels
     assert "Настроить интервал" in labels
@@ -239,6 +242,7 @@ async def test_schedule_interval_callback_stays_in_editorial_chat() -> None:
     editor = object.__new__(EditorBot)
     editor._is_owner = AsyncMock(return_value=True)
     editor.repository = SimpleNamespace(pop_pending_action=AsyncMock())
+    editor._channel_enabled_days = AsyncMock(return_value=(1, 3))
     editor._show_schedule_hour_picker = AsyncMock()
     callback = SimpleNamespace(
         from_user=SimpleNamespace(id=77),
@@ -262,14 +266,76 @@ async def test_schedule_interval_callback_stays_in_editorial_chat() -> None:
 
 
 @pytest.mark.asyncio
+async def test_weekday_button_adds_day_to_multi_selection() -> None:
+    editor = object.__new__(EditorBot)
+    editor._is_owner = AsyncMock(return_value=True)
+    editor._channel_enabled_days = AsyncMock(return_value=(0, 4))
+    editor._set_channel_enabled_days = AsyncMock()
+    editor._show_schedule_menu = AsyncMock()
+    callback = SimpleNamespace(
+        from_user=SimpleNamespace(id=77),
+        data="scheduleday:-1001234567890:2",
+        message=SimpleNamespace(
+            message_id=55,
+            chat=SimpleNamespace(id=-1009876543210),
+        ),
+        answer=AsyncMock(),
+    )
+
+    await editor._callback(callback)
+
+    editor._set_channel_enabled_days.assert_awaited_once_with(
+        -1001234567890,
+        {0, 2, 4},
+    )
+    editor._show_schedule_menu.assert_awaited_once_with(
+        -1009876543210,
+        -1001234567890,
+        message_id=55,
+    )
+
+
+@pytest.mark.asyncio
+async def test_disabled_weekdays_are_excluded_from_publication_slots() -> None:
+    editor = object.__new__(EditorBot)
+    editor._channel_stored_weekly_schedule = AsyncMock(
+        return_value={day: (9 * 60,) for day in range(7)}
+    )
+    editor._channel_enabled_days = AsyncMock(return_value=(1, 3, 5))
+
+    weekly = await editor._channel_weekly_schedule(-1001234567890)
+
+    assert weekly[0] == ()
+    assert weekly[1] == (540,)
+    assert weekly[2] == ()
+    assert weekly[3] == (540,)
+
+
+@pytest.mark.asyncio
 async def test_equal_schedule_rejects_rollover_to_next_day() -> None:
     editor = object.__new__(EditorBot)
-    editor._set_channel_day_schedule = AsyncMock()
+    editor._set_channel_days_schedule = AsyncMock()
 
     error = await editor._save_equal_schedule(-1001234567890, 1, 23 * 60, 2, 60)
 
     assert "следующий день" in str(error)
-    editor._set_channel_day_schedule.assert_not_awaited()
+    editor._set_channel_days_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_equal_schedule_applies_to_every_enabled_day() -> None:
+    editor = object.__new__(EditorBot)
+    editor._channel_enabled_days = AsyncMock(return_value=(0, 2, 4))
+    editor._set_channel_days_schedule = AsyncMock()
+
+    error = await editor._save_equal_schedule(-1001234567890, 0, 9 * 60, 3, 120)
+
+    assert error is None
+    editor._set_channel_days_schedule.assert_awaited_once_with(
+        -1001234567890,
+        (0, 2, 4),
+        [540, 660, 780],
+    )
 
 
 def test_parse_publish_time_accepts_tomorrow_and_full_date() -> None:

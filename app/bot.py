@@ -46,6 +46,7 @@ SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
 MAX_SCHEDULE_ATTEMPTS = 3
 PUBLICATION_CHANNELS_SETTING = "publication_channels"
 PUBLICATION_SCHEDULES_SETTING = "publication_schedules"
+PUBLICATION_SCHEDULE_DAYS_SETTING = "publication_schedule_days"
 WEEKDAY_NAMES = (
     "понедельник",
     "вторник",
@@ -398,13 +399,36 @@ class EditorBot:
             schedules[str(channel_id)] = normalized_days
         return schedules
 
+    async def _publication_schedule_days(self) -> dict[str, list[int]]:
+        raw = await self.repository.get_setting(PUBLICATION_SCHEDULE_DAYS_SETTING)
+        if not raw:
+            return {}
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(values, dict):
+            return {}
+        result: dict[str, list[int]] = {}
+        for channel_id, days in values.items():
+            if not isinstance(days, list):
+                continue
+            result[str(channel_id)] = sorted(
+                {
+                    int(day)
+                    for day in days
+                    if isinstance(day, int) and 0 <= day <= 6
+                }
+            )
+        return result
+
     def _default_weekly_schedule(self) -> dict[int, tuple[int, ...]]:
         return {
             day: tuple(self.settings.publish_schedule_slots)
             for day in range(7)
         }
 
-    async def _channel_weekly_schedule(
+    async def _channel_stored_weekly_schedule(
         self,
         channel_id: int,
     ) -> dict[int, tuple[int, ...]]:
@@ -416,15 +440,65 @@ class EditorBot:
             for day in range(7)
         }
 
+    async def _channel_enabled_days(
+        self,
+        channel_id: int,
+        weekly: dict[int, tuple[int, ...]] | None = None,
+    ) -> tuple[int, ...]:
+        stored = await self._publication_schedule_days()
+        channel_key = str(channel_id)
+        if channel_key in stored:
+            return tuple(stored[channel_key])
+        current = weekly or await self._channel_stored_weekly_schedule(channel_id)
+        return tuple(day for day in range(7) if current[day])
+
+    async def _set_channel_enabled_days(
+        self,
+        channel_id: int,
+        days: list[int] | tuple[int, ...] | set[int],
+    ) -> None:
+        schedules = await self._publication_schedule_days()
+        schedules[str(channel_id)] = sorted(
+            {int(day) for day in days if 0 <= int(day) <= 6}
+        )
+        await self.repository.set_setting(
+            PUBLICATION_SCHEDULE_DAYS_SETTING,
+            json.dumps(schedules, ensure_ascii=False, sort_keys=True),
+        )
+
+    async def _channel_weekly_schedule(
+        self,
+        channel_id: int,
+    ) -> dict[int, tuple[int, ...]]:
+        weekly = await self._channel_stored_weekly_schedule(channel_id)
+        enabled = set(await self._channel_enabled_days(channel_id, weekly))
+        return {
+            day: weekly[day] if day in enabled else ()
+            for day in range(7)
+        }
+
     async def _set_channel_day_schedule(
         self,
         channel_id: int,
         day: int,
         slots: list[int],
     ) -> None:
+        await self._set_channel_days_schedule(channel_id, [day], slots)
+
+    async def _set_channel_days_schedule(
+        self,
+        channel_id: int,
+        days: list[int] | tuple[int, ...] | set[int],
+        slots: list[int],
+    ) -> None:
         schedules = await self._publication_schedules()
-        channel_schedule = await self._channel_weekly_schedule(channel_id)
-        channel_schedule[day] = tuple(sorted(set(slots)))
+        channel_schedule = await self._channel_stored_weekly_schedule(channel_id)
+        normalized_slots = tuple(
+            sorted({int(slot) for slot in slots if 0 <= int(slot) < 24 * 60})
+        )
+        for day in days:
+            if 0 <= int(day) <= 6:
+                channel_schedule[int(day)] = normalized_slots
         schedules[str(channel_id)] = {
             str(day_index): list(channel_schedule[day_index])
             for day_index in range(7)
@@ -789,7 +863,6 @@ class EditorBot:
         self,
         chat_id: int,
         channel_id: int | None = None,
-        day: int | None = None,
         message_id: int | None = None,
     ) -> None:
         if channel_id is None:
@@ -798,14 +871,17 @@ class EditorBot:
         if channel_id is None:
             await self._show_schedule_channel_picker(chat_id, message_id)
             return
-        local_now = datetime.now(UTC).astimezone(
-            _publish_timezone(self.settings.publish_schedule_utc_offset_hours)
+        weekly = await self._channel_stored_weekly_schedule(channel_id)
+        enabled_days = await self._channel_enabled_days(channel_id, weekly)
+        slots = list(weekly[enabled_days[0]]) if enabled_days else []
+        selected_label = (
+            ", ".join(WEEKDAY_SHORT_NAMES[day] for day in enabled_days)
+            if enabled_days
+            else "не выбраны"
         )
-        selected_day = local_now.weekday() if day is None else day
-        if not 0 <= selected_day <= 6:
-            selected_day = local_now.weekday()
-        weekly = await self._channel_weekly_schedule(channel_id)
-        slots = list(weekly[selected_day])
+        schedules_are_equal = not enabled_days or all(
+            weekly[day] == tuple(slots) for day in enabled_days
+        )
         channel_label = await self._channel_label(channel_id)
         offset = self.settings.publish_schedule_utc_offset_hours
         offset_label = f"UTC{'+' if offset >= 0 else ''}{offset}"
@@ -813,15 +889,22 @@ class EditorBot:
             "<b>Расписание публикаций</b>\n\n"
             f"Канал: <b>{html.escape(channel_label)}</b>\n"
             f"Часовой пояс: <b>{offset_label}</b>\n"
-            f"Выбранный день: <b>{WEEKDAY_NAMES[selected_day]}</b>\n"
-            f"Публикаций: <b>{len(slots)}</b>\n\n"
+            f"Дни публикации: <b>{selected_label}</b>\n"
+            f"Публикаций в день: <b>{len(slots)}</b>\n\n"
+            "Зелёный день включён, серый выключен. Для публикаций "
+            "каждый день включи все семь дней.\n"
             "Все настройки выполняются кнопками прямо в этом чате.\n"
-            "Нажми «Добавить время» для выбора часа и минут.\n"
+            "Время и интервал применяются ко всем зелёным дням.\n"
             "Нажатие на кнопку с временем удаляет это окно."
         )
+        if not schedules_are_equal:
+            text += (
+                "\n\nСейчас время по дням различается. Следующая настройка "
+                "времени синхронизирует все зелёные дни."
+            )
         keyboard = self._schedule_keyboard(
             channel_id,
-            selected_day,
+            enabled_days,
             slots,
             channel_label,
         )
@@ -871,7 +954,7 @@ class EditorBot:
             chat_id,
             message_id,
             (
-                f"<b>{WEEKDAY_NAMES[day].capitalize()}</b>\n\n"
+                "<b>Выбранные дни публикации</b>\n\n"
                 f"Выбери час для {purpose}."
             ),
             self._schedule_hour_keyboard(mode, channel_id, day),
@@ -890,7 +973,7 @@ class EditorBot:
             chat_id,
             message_id,
             (
-                f"<b>{WEEKDAY_NAMES[day].capitalize()}</b>\n\n"
+                "<b>Выбранные дни публикации</b>\n\n"
                 f"Выбран час <b>{hour:02d}</b>. Теперь выбери диапазон минут."
             ),
             self._schedule_minute_tens_keyboard(mode, channel_id, day, hour),
@@ -910,7 +993,7 @@ class EditorBot:
             chat_id,
             message_id,
             (
-                f"<b>{WEEKDAY_NAMES[day].capitalize()}</b>\n\n"
+                "<b>Выбранные дни публикации</b>\n\n"
                 f"Выбери точное время в диапазоне "
                 f"<b>{hour:02d}:{tens}0–{hour:02d}:{tens}9</b>."
             ),
@@ -930,7 +1013,7 @@ class EditorBot:
             message_id,
             (
                 f"Первый пост: <b>{format_clock_minutes(start)}</b>\n\n"
-                "Сколько постов должно выходить в этот день?"
+                "Сколько постов должно выходить в каждый выбранный день?"
             ),
             self._schedule_count_keyboard(channel_id, day, start),
         )
@@ -1010,7 +1093,10 @@ class EditorBot:
         slots = [start + index * gap for index in range(count)]
         if slots[-1] >= 24 * 60:
             return "Последний пост выходит на следующий день. Выбери меньший интервал"
-        await self._set_channel_day_schedule(channel_id, day, slots)
+        enabled_days = await self._channel_enabled_days(channel_id)
+        if not enabled_days:
+            return "Сначала выбери хотя бы один день публикации"
+        await self._set_channel_days_schedule(channel_id, enabled_days, slots)
         return None
 
     async def _send_target_channel_picker(self, user_id: int) -> None:
@@ -1156,14 +1242,15 @@ class EditorBot:
     @staticmethod
     def _schedule_keyboard(
         channel_id: int,
-        selected_day: int,
+        enabled_days: tuple[int, ...],
         slots: list[int],
         channel_label: str,
     ) -> InlineKeyboardMarkup:
+        anchor_day = enabled_days[0] if enabled_days else 0
         rows: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton(
-                    text=("🟢 " if day == selected_day else "") + WEEKDAY_SHORT_NAMES[day],
+                    text=("🟢 " if day in enabled_days else "") + WEEKDAY_SHORT_NAMES[day],
                     callback_data=f"scheduleday:{channel_id}:{day}",
                 )
                 for day in range(7)
@@ -1172,7 +1259,7 @@ class EditorBot:
         time_buttons = [
             InlineKeyboardButton(
                 text=f"✕ {format_clock_minutes(slot)}",
-                callback_data=f"scheduledel:{channel_id}:{selected_day}:{slot}",
+                callback_data=f"scheduledel:{channel_id}:{anchor_day}:{slot}",
             )
             for slot in slots
         ]
@@ -1185,17 +1272,17 @@ class EditorBot:
                 [
                     InlineKeyboardButton(
                         text="➕ Добавить время",
-                        callback_data=f"scheduleadd:{channel_id}:{selected_day}",
+                        callback_data=f"scheduleadd:{channel_id}:{anchor_day}",
                     ),
                     InlineKeyboardButton(
                         text="Настроить интервал",
-                        callback_data=f"scheduleinterval:{channel_id}:{selected_day}",
+                        callback_data=f"scheduleinterval:{channel_id}:{anchor_day}",
                     ),
                 ],
                 [
                     InlineKeyboardButton(
                         text="Сбросить время",
-                        callback_data=f"schedulereset:{channel_id}:{selected_day}",
+                        callback_data=f"schedulereset:{channel_id}:{anchor_day}",
                     )
                 ],
                 [
@@ -1232,7 +1319,7 @@ class EditorBot:
             [
                 InlineKeyboardButton(
                     text="« Назад",
-                    callback_data=f"scheduleday:{channel_id}:{day}",
+                    callback_data=f"schedulechannel:{channel_id}",
                 )
             ]
         )
@@ -1718,27 +1805,72 @@ class EditorBot:
                     await callback.answer("Некорректный день", show_alert=True)
                     return
                 if action == "scheduleday":
-                    await callback.answer(WEEKDAY_NAMES[day].capitalize())
-                    await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                    enabled_days = set(await self._channel_enabled_days(channel_id))
+                    if day in enabled_days:
+                        enabled_days.remove(day)
+                        state = "выключен"
+                    else:
+                        enabled_days.add(day)
+                        state = "включён"
+                    await self._set_channel_enabled_days(channel_id, enabled_days)
+                    await callback.answer(
+                        f"{WEEKDAY_NAMES[day].capitalize()}: {state}"
+                    )
+                    await self._show_schedule_menu(
+                        chat_id,
+                        channel_id,
+                        message_id=message_id,
+                    )
                     return
                 if action == "scheduledel":
                     slot = int(parts[3])
-                    weekly = await self._channel_weekly_schedule(channel_id)
-                    await self._set_channel_day_schedule(
+                    enabled_days = await self._channel_enabled_days(channel_id)
+                    if not enabled_days:
+                        await callback.answer(
+                            "Сначала выбери хотя бы один день",
+                            show_alert=True,
+                        )
+                        return
+                    weekly = await self._channel_stored_weekly_schedule(channel_id)
+                    slots = [value for value in weekly[enabled_days[0]] if value != slot]
+                    await self._set_channel_days_schedule(
                         channel_id,
-                        day,
-                        [value for value in weekly[day] if value != slot],
+                        enabled_days,
+                        slots,
                     )
                     await callback.answer(f"{format_clock_minutes(slot)} удалено")
-                    await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                    await self._show_schedule_menu(
+                        chat_id,
+                        channel_id,
+                        message_id=message_id,
+                    )
                     return
                 if action == "schedulereset":
-                    await self._set_channel_day_schedule(channel_id, day, [])
-                    await callback.answer("Время на этот день сброшено")
-                    await self._show_schedule_menu(chat_id, channel_id, day, message_id)
+                    enabled_days = await self._channel_enabled_days(channel_id)
+                    if not enabled_days:
+                        await callback.answer(
+                            "Сначала выбери хотя бы один день",
+                            show_alert=True,
+                        )
+                        return
+                    await self._set_channel_days_schedule(channel_id, enabled_days, [])
+                    await callback.answer("Время для выбранных дней сброшено")
+                    await self._show_schedule_menu(
+                        chat_id,
+                        channel_id,
+                        message_id=message_id,
+                    )
+                    return
+                enabled_days = await self._channel_enabled_days(channel_id)
+                if not enabled_days:
+                    await callback.answer(
+                        "Сначала выбери хотя бы один день публикации",
+                        show_alert=True,
+                    )
                     return
                 await self.repository.pop_pending_action(callback.from_user.id)
                 mode = "a" if action == "scheduleadd" else "i"
+                day = enabled_days[0]
                 await callback.answer("Выбери час")
                 await self._show_schedule_hour_picker(
                     chat_id,
@@ -1793,18 +1925,24 @@ class EditorBot:
                     return
                 slot = hour * 60 + minute
                 if mode == "a":
-                    weekly = await self._channel_weekly_schedule(channel_id)
-                    await self._set_channel_day_schedule(
+                    enabled_days = await self._channel_enabled_days(channel_id)
+                    if not enabled_days:
+                        await callback.answer(
+                            "Сначала выбери хотя бы один день",
+                            show_alert=True,
+                        )
+                        return
+                    weekly = await self._channel_stored_weekly_schedule(channel_id)
+                    await self._set_channel_days_schedule(
                         channel_id,
-                        day,
-                        [*weekly[day], slot],
+                        enabled_days,
+                        [*weekly[enabled_days[0]], slot],
                     )
                     await callback.answer(f"{format_clock_minutes(slot)} добавлено")
                     await self._show_schedule_menu(
                         chat_id,
                         channel_id,
-                        day,
-                        message_id,
+                        message_id=message_id,
                     )
                     return
                 await callback.answer("Выбери количество постов")
@@ -1827,13 +1965,23 @@ class EditorBot:
                     await callback.answer("Некорректные параметры", show_alert=True)
                     return
                 if count == 1:
-                    await self._set_channel_day_schedule(channel_id, day, [start])
+                    enabled_days = await self._channel_enabled_days(channel_id)
+                    if not enabled_days:
+                        await callback.answer(
+                            "Сначала выбери хотя бы один день",
+                            show_alert=True,
+                        )
+                        return
+                    await self._set_channel_days_schedule(
+                        channel_id,
+                        enabled_days,
+                        [start],
+                    )
                     await callback.answer("Расписание сохранено")
                     await self._show_schedule_menu(
                         chat_id,
                         channel_id,
-                        day,
-                        message_id,
+                        message_id=message_id,
                     )
                     return
                 await callback.answer("Выбери интервал")
@@ -1927,8 +2075,7 @@ class EditorBot:
             await self._show_schedule_menu(
                 chat_id,
                 channel_id,
-                day,
-                message_id,
+                message_id=message_id,
             )
             return
 
