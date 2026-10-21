@@ -3307,6 +3307,7 @@ class EditorBot:
         source_actions = {
             "sources",
             "sourceitem",
+            "sourceadd",
             "sourceaddrss",
             "sourceaddtelegram",
             "sourcecancel",
@@ -3331,7 +3332,7 @@ class EditorBot:
                     message_id=None if source_draft else message_id,
                 )
                 return
-            if action in {"sourceaddrss", "sourceaddtelegram"}:
+            if action in {"sourceadd", "sourceaddrss", "sourceaddtelegram"}:
                 kind = "rss" if action == "sourceaddrss" else "telegram_web"
                 manager = self.rss_sources if kind == "rss" else self.telegram_sources
                 if not manager:
