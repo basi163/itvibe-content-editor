@@ -308,6 +308,27 @@ class Repository:
                 return None
             return self._decode_draft(dict(row))
 
+    async def get_draft_by_editor_message(
+        self,
+        chat_id: int,
+        message_id: int,
+    ) -> dict[str, Any] | None:
+        async with self.connect() as db:
+            row = await self._fetchone(
+                db,
+                """
+                SELECT * FROM drafts
+                WHERE editor_chat_id = ?
+                  AND (editor_message_id = ? OR editor_media_message_id = ?)
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (chat_id, message_id, message_id),
+            )
+            if not row:
+                return None
+            return self._decode_draft(dict(row))
+
     async def update_draft(self, draft_id: int, **fields: Any) -> None:
         allowed = {
             "title",

@@ -33,6 +33,15 @@ async def test_draft_round_trip(tmp_path: Path) -> None:
     assert draft["scheduled_at"] is None
     assert draft["schedule_attempts"] == 0
 
+    await repository.update_draft(
+        draft_id,
+        editor_chat_id=-1001234567890,
+        editor_message_id=55,
+    )
+    by_message = await repository.get_draft_by_editor_message(-1001234567890, 55)
+    assert by_message is not None
+    assert by_message["id"] == draft_id
+
 
 @pytest.mark.asyncio
 async def test_first_user_claims_owner(tmp_path: Path) -> None:

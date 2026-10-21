@@ -9,6 +9,7 @@ from app.bot import (
     EditorBot,
     next_publish_slot,
     next_weekly_publish_slot,
+    parse_editor_post_text,
     parse_publish_time,
     publish_slot_label,
     upcoming_publish_slots,
@@ -48,6 +49,7 @@ def test_draft_keyboard_describes_automatic_edits() -> None:
     assert "plan:0" in callbacks
     assert "schedule:0" in callbacks
     assert "targetmenu:0" in callbacks
+    assert "manualedit:7" in callbacks
     assert "media:7" not in callbacks
 
 
@@ -92,6 +94,7 @@ def test_scheduled_keyboard_can_publish_reschedule_or_cancel() -> None:
         "plan:0",
         "schedule:0",
         "targetmenu:0",
+        "manualedit:7",
     }
 
 
@@ -170,6 +173,92 @@ def test_target_channel_instructions_are_step_by_step() -> None:
     assert "@itvibe_editor_bot" in text
     assert "Публикация сообщений" in text
     assert "системный выбор Telegram" in text
+
+
+def test_target_channel_add_flow_stays_visible_in_editorial_channel() -> None:
+    keyboard = EditorBot._target_channel_add_keyboard(-1001234567890)
+    callbacks = {
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    }
+
+    assert "targetcurrent:-1001234567890" in callbacks
+    assert "targetpicker:0" in callbacks
+    assert "targetmenu:0" in callbacks
+
+
+def test_native_telegram_edit_is_parsed_and_keeps_source_marker() -> None:
+    post = parse_editor_post_text(
+        "Новый заголовок\n\n"
+        "Первый абзац.\n\n"
+        "Официальный отчёт подтверждает данные.\n\n"
+        "#ИИ #бизнес #технологии\n\n"
+        "🔳 IT Vibe News",
+        "Первый абзац.\n\n"
+        "[[source:0|Официальный отчёт]] подтверждает данные.",
+    )
+
+    assert post.title == "Новый заголовок"
+    assert post.hashtags == ["#ИИ", "#бизнес", "#технологии"]
+    assert "[[source:0|Официальный отчёт]]" in post.body
+
+
+def test_plain_text_can_be_extracted_from_rich_telegram_blocks() -> None:
+    message = SimpleNamespace(
+        text=None,
+        caption=None,
+        rich_message=SimpleNamespace(
+            blocks=[
+                {"type": "paragraph", "text": {"type": "bold", "text": "Заголовок"}},
+                {"type": "paragraph", "text": "Текст новости"},
+                {"type": "paragraph", "text": "#ИИ #новости #IT"},
+            ]
+        ),
+    )
+
+    assert EditorBot._editor_message_text(message) == (
+        "Заголовок\n\nТекст новости\n\n#ИИ #новости #IT"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_telegram_edit_updates_stored_draft() -> None:
+    editor = object.__new__(EditorBot)
+    draft = {
+        "id": 7,
+        "status": "draft",
+        "editor_chat_id": -1001234567890,
+        "editor_message_id": 55,
+        "body": "Старый текст",
+        "media": [],
+    }
+    editor.repository = SimpleNamespace(
+        get_draft_by_editor_message=AsyncMock(return_value=draft),
+        update_draft=AsyncMock(),
+    )
+    editor.settings = SimpleNamespace(max_post_chars=2000)
+    editor.bot = SimpleNamespace(send_message=AsyncMock())
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001234567890),
+        message_id=55,
+        text=(
+            "Новый заголовок\n\nНовый текст публикации.\n\n"
+            "#ИИ #новости #IT\n\n🔳 IT Vibe News"
+        ),
+        caption=None,
+        rich_message=None,
+        photo=[],
+        video=None,
+    )
+
+    updated, error = await editor._sync_editor_post(message)
+
+    assert updated
+    assert error is None
+    fields = editor.repository.update_draft.await_args.kwargs
+    assert fields["title"] == "Новый заголовок"
+    assert fields["body"] == "Новый текст публикации."
 
 
 def test_parse_publish_time_uses_samara_time_and_rolls_clock_to_tomorrow() -> None:

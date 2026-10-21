@@ -36,7 +36,13 @@ from app.config import Settings
 from app.db import Repository
 from app.models import GeneratedPost, SourceDocument, StoryCandidate
 from app.pipeline import ContentPipeline
-from app.renderer import EMOJI_RE, render_post, validate_post
+from app.renderer import (
+    EMOJI_RE,
+    SIGNATURE_TEXT,
+    SOURCE_MARKER_RE,
+    render_post,
+    validate_post,
+)
 
 logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -162,6 +168,37 @@ def next_publish_slot(
 
 def format_clock_minutes(value: int) -> str:
     return f"{value // 60:02d}:{value % 60:02d}"
+
+
+def parse_editor_post_text(value: str, original_body: str) -> GeneratedPost:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", normalized)
+        if paragraph.strip()
+    ]
+    if paragraphs and paragraphs[-1] == SIGNATURE_TEXT:
+        paragraphs.pop()
+
+    hashtag_index: int | None = None
+    hashtags: list[str] = []
+    for index in range(len(paragraphs) - 1, 0, -1):
+        candidate = re.findall(r"#[\wА-Яа-яЁё]+", paragraphs[index], re.UNICODE)
+        remainder = re.sub(r"#[\wА-Яа-яЁё]+", "", paragraphs[index]).strip()
+        if candidate and not remainder:
+            hashtag_index = index
+            hashtags = candidate
+            break
+
+    title = paragraphs[0] if paragraphs else ""
+    body_end = hashtag_index if hashtag_index is not None else len(paragraphs)
+    body = "\n\n".join(paragraphs[1:body_end]).strip()
+    for match in SOURCE_MARKER_RE.finditer(original_body):
+        marker = match.group(0)
+        anchor = match.group(2).strip()
+        if anchor and marker not in body and anchor in body:
+            body = body.replace(anchor, marker, 1)
+    return GeneratedPost(title=title, body=body, hashtags=hashtags)
 
 
 def next_weekly_publish_slot(
@@ -318,7 +355,6 @@ class EditorBot:
                     str(target_chat.title or target_chat_id),
                     target_chat.username,
                 )
-
     async def start_polling(self) -> None:
         await self.dispatcher.start_polling(self.bot, allowed_updates=self.dispatcher.resolve_used_update_types())
 
@@ -336,6 +372,7 @@ class EditorBot:
         self.router.message.register(self._help, Command("help"))
         self.router.message.register(self._chat_shared, F.chat_shared)
         self.router.callback_query.register(self._callback, F.data)
+        self.router.edited_channel_post.register(self._edited_editor_post)
         self.router.message.register(self._private_message, F.chat.type == ChatType.PRIVATE)
 
     async def _is_owner(self, user_id: int) -> bool:
@@ -1106,27 +1143,55 @@ class EditorBot:
             reply_markup=self._channel_request_keyboard(target_only=True),
         )
 
-    async def _show_target_channel_help(self, chat_id: int) -> None:
+    async def _show_target_channel_add_flow(
+        self,
+        chat_id: int,
+        current_channel_id: int | None = None,
+    ) -> None:
         await self.bot.send_message(
             chat_id,
             self._target_channel_instructions(include_picker_note=True),
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Перейти к выбору канала в боте",
-                            callback_data="targetadd:0",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Каналы публикации",
-                            callback_data="targetmenu:0",
-                        )
-                    ],
-                ]
-            ),
+            reply_markup=self._target_channel_add_keyboard(current_channel_id),
         )
+
+    async def _show_target_channel_help(
+        self,
+        chat_id: int,
+        current_channel_id: int | None = None,
+    ) -> None:
+        await self._show_target_channel_add_flow(chat_id, current_channel_id)
+
+    @staticmethod
+    def _target_channel_add_keyboard(
+        current_channel_id: int | None,
+    ) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        if current_channel_id is not None:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Добавить этот канал",
+                        callback_data=f"targetcurrent:{current_channel_id}",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Выбрать другой канал",
+                        callback_data="targetpicker:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Каналы публикации",
+                        callback_data="targetmenu:0",
+                    )
+                ],
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     @staticmethod
     def _target_channel_instructions(*, include_picker_note: bool = False) -> str:
@@ -1142,9 +1207,10 @@ class EditorBot:
             "3. Нажми <b>Добавить администратора</b> и найди "
             "<code>@itvibe_editor_bot</code>.\n"
             "4. Включи для бота право <b>Публикация сообщений</b> и сохрани изменения.\n"
-            "5. Вернись в чат с ботом и нажми "
-            "<b>Выбрать канал публикации</b>.\n"
-            "6. Выбери канал в системном окне Telegram.\n"
+            "5. Если инструкция открыта в нужном канале, нажми "
+            "<b>Добавить этот канал</b>.\n"
+            "6. Для другого канала нажми <b>Выбрать другой канал</b> "
+            "и выбери его в системном окне Telegram.\n"
             "7. Дождись сообщения «Канал публикации переключён». После этого канал появится в контент-плане."
             f"{picker_note}"
         )
@@ -1580,9 +1646,165 @@ class EditorBot:
         await message.answer(
             "Перешли сюда пост из любого канала или дождись новой публикации Solidot. "
             "Подготовленный материал появится в редакторском канале. Управление выполняется "
-            "кнопками под черновиком. Очередь публикаций и её настройки доступны "
+            "кнопками под черновиком. Текст можно изменить прямо через меню Telegram «⋯ → Изменить». "
+            "Очередь публикаций и её настройки доступны "
             "через /plan, /schedule и кнопки под черновиком."
         )
+
+    @classmethod
+    def _rich_text_plain(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)):
+            return "".join(cls._rich_text_plain(item) for item in value)
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(exclude_none=True)
+        if not isinstance(value, dict):
+            return ""
+        if "text" in value:
+            return cls._rich_text_plain(value["text"])
+        for key in ("children", "content"):
+            if key in value:
+                return cls._rich_text_plain(value[key])
+        return ""
+
+    @classmethod
+    def _rich_block_plain(cls, value: Any) -> str:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(exclude_none=True)
+        if not isinstance(value, dict):
+            return cls._rich_text_plain(value)
+        for key in ("text", "caption"):
+            if key in value:
+                text = cls._rich_text_plain(value[key]).strip()
+                if text:
+                    return text
+        nested: list[str] = []
+        for key in ("blocks", "items"):
+            children = value.get(key)
+            if isinstance(children, list):
+                nested.extend(
+                    part
+                    for child in children
+                    if (part := cls._rich_block_plain(child).strip())
+                )
+        return "\n".join(nested)
+
+    @classmethod
+    def _editor_message_text(cls, message: Message) -> str:
+        plain = str(
+            getattr(message, "text", None)
+            or getattr(message, "caption", None)
+            or ""
+        ).strip()
+        if plain:
+            return plain
+        rich_message = getattr(message, "rich_message", None)
+        blocks = getattr(rich_message, "blocks", None)
+        if not isinstance(blocks, list):
+            return ""
+        return "\n\n".join(
+            part
+            for block in blocks
+            if (part := cls._rich_block_plain(block).strip())
+        )
+
+    async def _sync_editor_post(
+        self,
+        message: Message,
+        *,
+        draft: dict[str, Any] | None = None,
+        notify_on_error: bool = False,
+    ) -> tuple[bool, str | None]:
+        if draft is None:
+            draft = await self.repository.get_draft_by_editor_message(
+                message.chat.id,
+                message.message_id,
+            )
+        if not draft or draft.get("status") == "published":
+            return False, None
+        editor_message_ids = {
+            int(message_id)
+            for message_id in (
+                draft.get("editor_message_id"),
+                draft.get("editor_media_message_id"),
+            )
+            if message_id is not None
+        }
+        if (
+            int(draft.get("editor_chat_id") or 0) != message.chat.id
+            or message.message_id not in editor_message_ids
+        ):
+            return False, None
+        text = self._editor_message_text(message)
+        if not text:
+            return False, None
+        post = parse_editor_post_text(text, str(draft.get("body") or ""))
+        errors = validate_post(post, self.settings.max_post_chars)
+        if errors:
+            error = "; ".join(errors)
+            if notify_on_error:
+                await self.bot.send_message(
+                    message.chat.id,
+                    f"Ручная правка черновика #{draft['id']} не сохранена. "
+                    f"{html.escape(error)}.",
+                )
+            return False, error
+
+        fields: dict[str, Any] = {
+            "title": post.title.strip(),
+            "body": post.body,
+            "hashtags_json": json.dumps(post.hashtags, ensure_ascii=False),
+            "schedule_error": None,
+        }
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            media = [
+                item
+                for item in draft["media"]
+                if item.get("telegram_file_id") != file_id
+            ]
+            fields["media_json"] = json.dumps(
+                [
+                    {
+                        "type": "photo",
+                        "telegram_file_id": file_id,
+                        "page_url": None,
+                        "image_url": None,
+                    },
+                    *media,
+                ],
+                ensure_ascii=False,
+            )
+            fields["preview_index"] = 0
+        elif message.video:
+            file_id = message.video.file_id
+            media = [
+                item
+                for item in draft["media"]
+                if item.get("telegram_file_id") != file_id
+            ]
+            fields["media_json"] = json.dumps(
+                [
+                    {
+                        "type": "video",
+                        "telegram_file_id": file_id,
+                        "page_url": None,
+                        "image_url": None,
+                    },
+                    *media,
+                ],
+                ensure_ascii=False,
+            )
+            fields["preview_index"] = 0
+        await self.repository.update_draft(int(draft["id"]), **fields)
+        logger.info("Synced native Telegram edit for draft %s", draft["id"])
+        return True, None
+
+    async def _edited_editor_post(self, message: Message) -> None:
+        await self._sync_editor_post(message, notify_on_error=True)
 
     async def _private_message(self, message: Message) -> None:
         if not message.from_user or not await self._is_owner(message.from_user.id):
@@ -2082,7 +2304,7 @@ class EditorBot:
         is_slot_action = action == "pubslot"
         if is_slot_action:
             valid = len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit()
-        elif action == "target":
+        elif action in {"target", "targetcurrent"}:
             valid = len(parts) == 2 and parts[1].lstrip("-").isdigit()
         else:
             valid = len(parts) == 2 and parts[1].isdigit()
@@ -2108,11 +2330,65 @@ class EditorBot:
         if action == "targethelp":
             await callback.answer("Открываю инструкцию")
             if callback.message:
-                await self._show_target_channel_help(callback.message.chat.id)
+                current_channel_id = (
+                    callback.message.chat.id
+                    if callback.message.chat.type == ChatType.CHANNEL
+                    else None
+                )
+                await self._show_target_channel_help(
+                    callback.message.chat.id,
+                    current_channel_id,
+                )
             return
         if action == "targetadd":
-            await callback.answer("Выбор канала отправлен в бот")
+            await callback.answer("Показываю инструкцию")
+            if callback.message:
+                current_channel_id = (
+                    callback.message.chat.id
+                    if callback.message.chat.type == ChatType.CHANNEL
+                    else None
+                )
+                await self._show_target_channel_add_flow(
+                    callback.message.chat.id,
+                    current_channel_id,
+                )
+            return
+        if action == "targetpicker":
+            await callback.answer("Системный выбор открыт в личном боте")
             await self._send_target_channel_picker(callback.from_user.id)
+            return
+        if action == "targetcurrent":
+            channel_id = int(parts[1])
+            if not callback.message or callback.message.chat.id != channel_id:
+                await callback.answer("Канал не совпадает", show_alert=True)
+                return
+            try:
+                me = await self.bot.get_me()
+                member = await self.bot.get_chat_member(channel_id, me.id)
+                selected_chat = await self.bot.get_chat(channel_id)
+            except TelegramBadRequest:
+                await callback.answer(
+                    "Не удалось проверить права бота в канале",
+                    show_alert=True,
+                )
+                return
+            if member.status not in {
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            }:
+                await callback.answer(
+                    "Сначала добавь бота администратором канала",
+                    show_alert=True,
+                )
+                return
+            await self.repository.set_setting("target_chat_id", str(channel_id))
+            await self._remember_publication_channel(
+                channel_id,
+                str(selected_chat.title or channel_id),
+                selected_chat.username,
+            )
+            await callback.answer("Канал добавлен", show_alert=True)
+            await self._show_target_channel_menu(callback.message.chat.id)
             return
         if action == "target":
             channel_id = int(parts[1])
@@ -2140,6 +2416,30 @@ class EditorBot:
         if not draft:
             await callback.answer("Черновик не найден", show_alert=True)
             return
+
+        if action == "manualedit":
+            await callback.answer(
+                "Открой меню ⋯ у этого поста, выбери «Изменить», "
+                "отредактируй текст и нажми «Готово». Бот сохранит правку автоматически.",
+                show_alert=True,
+            )
+            return
+
+        if action in {"publish", "pubnow", "pubnext", "pubslot"} and isinstance(
+            callback.message,
+            Message,
+        ):
+            _, sync_error = await self._sync_editor_post(
+                callback.message,
+                draft=draft,
+            )
+            if sync_error:
+                await callback.answer(
+                    f"Исправь ручную правку: {sync_error}"[:190],
+                    show_alert=True,
+                )
+                return
+            draft = await self.repository.get_draft(draft_id) or draft
 
         if action == "pubslot":
             try:
@@ -2887,6 +3187,12 @@ class EditorBot:
                 ],
                 [
                     InlineKeyboardButton(
+                        text="✏️ Ручная правка в Telegram",
+                        callback_data=f"manualedit:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         text="Контент-план",
                         callback_data="plan:0",
                     ),
@@ -2928,6 +3234,12 @@ class EditorBot:
                         callback_data=f"image:{draft_id}",
                     ),
                     InlineKeyboardButton(text="Переписать всё", callback_data=f"regen:{draft_id}"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Ручная правка в Telegram",
+                        callback_data=f"manualedit:{draft_id}",
+                    ),
                 ],
                 [
                     InlineKeyboardButton(text="Источники", callback_data=f"sources:{draft_id}"),
