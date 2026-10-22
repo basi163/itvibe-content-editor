@@ -319,3 +319,30 @@ class ArticleExtractor:
                         await asyncio.gather(*(limited_fetch(url) for url in second_wave))
                     )
         return [document for document in documents if document.url]
+
+    async def collect_direct_sources(
+        self,
+        seed_urls: list[str],
+        *,
+        limit: int = 10,
+    ) -> list[SourceDocument]:
+        """Fetch only the supplied URLs and preserve their exact digest order."""
+        seeds = list(dict.fromkeys(filter(None, (normalize_url(url) for url in seed_urls))))
+        seeds = seeds[:limit]
+        if not seeds:
+            return []
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def limited_fetch(url: str) -> SourceDocument:
+            async with semaphore:
+                document = await self.fetch_document(url)
+            if document.url:
+                return document
+            return SourceDocument(
+                url=url,
+                publisher=urlparse(url).netloc.removeprefix("www."),
+                error=document.error,
+            )
+
+        return list(await asyncio.gather(*(limited_fetch(url) for url in seeds)))

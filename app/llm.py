@@ -9,13 +9,16 @@ from openai import AsyncOpenAI
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
 from app.prompts import (
     COMPONENT_REWRITE_SYSTEM_PROMPT,
+    DIGEST_REPAIR_SYSTEM_PROMPT,
     IMAGE_SEARCH_PROMPT,
     REPAIR_SYSTEM_PROMPT,
     TRIAGE_SYSTEM_PROMPT,
+    render_digest_writer_system_prompt,
     render_writer_system_prompt,
 )
 from app.renderer import (
     SIGNATURE_TEXT,
+    SOURCE_MARKER_RE,
     normalize_body_spacing,
     normalize_generated_post,
     validate_post,
@@ -23,6 +26,30 @@ from app.renderer import (
 )
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+DIGEST_MAX_LINKS = 10
+
+
+def _source_link_limit(triage: TriageDecision) -> int:
+    return DIGEST_MAX_LINKS if triage.category == "digest" else 3
+
+
+def _digest_validation_errors(
+    post: GeneratedPost,
+    max_post_chars: int,
+    source_count: int,
+) -> list[str]:
+    errors = validate_post(
+        post,
+        max_post_chars,
+        max_source_links=DIGEST_MAX_LINKS,
+    )
+    indices = [int(match.group(1)) for match in SOURCE_MARKER_RE.finditer(post.body)]
+    expected = list(range(min(source_count, DIGEST_MAX_LINKS)))
+    if indices != expected:
+        errors.append(
+            "Ссылки дайджеста должны идти по одной в порядке источников"
+        )
+    return errors
 
 
 def _title_character_limit(post: GeneratedPost, max_post_chars: int) -> int:
@@ -188,6 +215,47 @@ class QwenClient:
             post = await self.repair(normalized, sources, normalized_errors)
         return post
 
+    async def generate_digest(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+    ) -> GeneratedPost:
+        content_limit = self.max_post_chars - 2 - len(SIGNATURE_TEXT)
+        payload = {
+            "candidate": candidate.to_dict(),
+            "editorial_decision": triage.to_dict(),
+            "sources": _source_payload(sources),
+        }
+        data = await self._completion(
+            model=self.writer_model,
+            system=render_digest_writer_system_prompt(content_limit),
+            user=json.dumps(payload, ensure_ascii=False),
+            temperature=0.45,
+            max_tokens=3200,
+        )
+        post = GeneratedPost(
+            title=str(data.get("title", "")).strip(),
+            body=str(data.get("body", "")).strip(),
+            hashtags=[str(tag).strip() for tag in data.get("hashtags", [])],
+        )
+        errors = _digest_validation_errors(post, self.max_post_chars, len(sources))
+        if errors:
+            normalized = normalize_generated_post(
+                post,
+                self.max_post_chars,
+                max_source_links=DIGEST_MAX_LINKS,
+            )
+            normalized_errors = _digest_validation_errors(
+                normalized,
+                self.max_post_chars,
+                len(sources),
+            )
+            if not normalized_errors:
+                return normalized
+            return await self.repair_digest(normalized, sources, normalized_errors)
+        return post
+
     async def search_images(
         self,
         candidate: StoryCandidate,
@@ -265,6 +333,7 @@ class QwenClient:
             raise ValueError(f"Unsupported post component: {component}")
 
         title_character_limit = _title_character_limit(post, self.max_post_chars)
+        max_source_links = _source_link_limit(triage)
         remaining: list[str] = []
         rejected_titles: list[str] = []
         seen_titles = {post.title.casefold()}
@@ -299,7 +368,11 @@ class QwenClient:
                         body=post.body,
                         hashtags=post.hashtags,
                     )
-                    normalized = normalize_generated_post(raw_proposal, self.max_post_chars)
+                    normalized = normalize_generated_post(
+                        raw_proposal,
+                        self.max_post_chars,
+                        max_source_links=max_source_links,
+                    )
                     fitted_title = _fit_title_to_limit(
                         normalized.title,
                         title_character_limit,
@@ -310,7 +383,11 @@ class QwenClient:
                 for _, fitted_title in sorted(prepared_titles, key=lambda item: item[0]):
                     proposal = GeneratedPost(fitted_title, post.body, post.hashtags)
                     title_key = proposal.title.casefold()
-                    errors = validate_post(proposal, self.max_post_chars)
+                    errors = validate_post(
+                        proposal,
+                        self.max_post_chars,
+                        max_source_links=max_source_links,
+                    )
                     if title_key in seen_titles:
                         errors.append("Новый вариант совпадает с текущим или отклоненным")
                     if not errors:
@@ -330,12 +407,20 @@ class QwenClient:
                 body=post.body,
                 hashtags=[str(tag).strip() for tag in raw_hashtags],
             )
-            normalized = normalize_generated_post(proposal, self.max_post_chars)
+            normalized = normalize_generated_post(
+                proposal,
+                self.max_post_chars,
+                max_source_links=max_source_links,
+            )
             proposal = GeneratedPost(post.title, post.body, normalized.hashtags)
             changed = {tag.casefold() for tag in proposal.hashtags} != {
                 tag.casefold() for tag in post.hashtags
             }
-            remaining = validate_post(proposal, self.max_post_chars)
+            remaining = validate_post(
+                proposal,
+                self.max_post_chars,
+                max_source_links=max_source_links,
+            )
             if not changed:
                 remaining.append("Новый вариант совпадает с текущим")
             if not remaining:
@@ -383,3 +468,54 @@ class QwenClient:
                 return normalized
             current = normalized
         raise ValueError("Post failed validation after repair: " + "; ".join(remaining))
+
+    async def repair_digest(
+        self,
+        post: GeneratedPost,
+        sources: list[SourceDocument],
+        errors: list[str],
+    ) -> GeneratedPost:
+        current = post
+        remaining = errors
+        for _ in range(3):
+            payload = {
+                "post": current.to_dict(),
+                "errors": remaining,
+                "maximum_visible_characters": self.max_post_chars
+                - 2
+                - len(SIGNATURE_TEXT),
+                "allowed_sources": _source_payload(sources, per_source_chars=3000),
+            }
+            data = await self._completion(
+                model=self.writer_model,
+                system=DIGEST_REPAIR_SYSTEM_PROMPT,
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=0.15,
+                max_tokens=3000,
+            )
+            current = GeneratedPost(
+                title=str(data.get("title", "")).strip(),
+                body=str(data.get("body", "")).strip(),
+                hashtags=[str(tag).strip() for tag in data.get("hashtags", [])],
+            )
+            remaining = _digest_validation_errors(
+                current,
+                self.max_post_chars,
+                len(sources),
+            )
+            if not remaining:
+                return current
+            normalized = normalize_generated_post(
+                current,
+                self.max_post_chars,
+                max_source_links=DIGEST_MAX_LINKS,
+            )
+            remaining = _digest_validation_errors(
+                normalized,
+                self.max_post_chars,
+                len(sources),
+            )
+            if not remaining:
+                return normalized
+            current = normalized
+        raise ValueError("Digest failed validation after repair: " + "; ".join(remaining))

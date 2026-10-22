@@ -4,7 +4,99 @@ from types import SimpleNamespace
 import pytest
 
 from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
-from app.pipeline import ContentPipeline
+from app.pipeline import ContentPipeline, is_digest_candidate
+
+
+def test_telegram_digest_detection_requires_multiple_links_and_digest_shape() -> None:
+    candidate = StoryCandidate(
+        "telegram_web",
+        "https://t.me/example/42",
+        "#News",
+        "自留地晚报\n1️⃣ First\n2️⃣ Second\n3️⃣ Third",
+        urls=[
+            "https://example.com/1",
+            "https://example.com/2",
+            "https://example.com/3",
+        ],
+    )
+
+    assert is_digest_candidate(candidate)
+    candidate.urls = candidate.urls[:2]
+    assert not is_digest_candidate(candidate)
+
+
+@pytest.mark.asyncio
+async def test_telegram_digest_uses_direct_links_and_skips_regular_triage() -> None:
+    urls = [
+        "https://media.example/one",
+        "https://company.example/two",
+        "https://social.example/three",
+    ]
+
+    class Extractor:
+        async def collect_sources(self, source_urls: list[str]) -> list[SourceDocument]:
+            raise AssertionError("A digest must not use recursive source discovery")
+
+        async def collect_direct_sources(
+            self,
+            source_urls: list[str],
+            *,
+            limit: int,
+        ) -> list[SourceDocument]:
+            assert source_urls == urls
+            assert limit == 10
+            return [SourceDocument(url=url, title=f"Source {index}") for index, url in enumerate(urls)]
+
+    class Llm:
+        async def triage(self, *_: object) -> TriageDecision:
+            raise AssertionError("A recognized digest must bypass article triage")
+
+        async def generate_digest(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+        ) -> GeneratedPost:
+            assert triage.category == "digest"
+            assert [source.url for source in sources] == urls
+            assert all(source.linkable for source in sources)
+            return GeneratedPost(
+                "Технологический дайджест",
+                (
+                    "1. [[source:0|Первая новость]] коротко.\n\n"
+                    "2. [[source:1|Вторая новость]] коротко.\n\n"
+                    "3. [[source:2|Третья новость]] коротко."
+                ),
+                ["#технологии", "#дайджест", "#IT"],
+            )
+
+    class Repository:
+        created: dict[str, object] | None = None
+
+        async def create_draft(self, **kwargs: object) -> int:
+            self.created = kwargs
+            return 55
+
+    repository = Repository()
+    pipeline = ContentPipeline(
+        settings=SimpleNamespace(relevance_threshold=0.72, max_post_chars=2000),
+        repository=repository,
+        extractor=Extractor(),
+        llm=Llm(),
+    )
+    candidate = StoryCandidate(
+        "telegram_web",
+        "https://t.me/example/42",
+        "#News",
+        "晚报\n1️⃣ First\n2️⃣ Second\n3️⃣ Third",
+        urls=urls,
+        media_urls=["https://images.example/digest.jpg"],
+    )
+
+    assert await pipeline._process(candidate) == 55
+    assert repository.created is not None
+    assert repository.created["triage"]["category"] == "digest"  # type: ignore[index]
+    assert all(source["linkable"] for source in repository.created["sources"])  # type: ignore[union-attr]
 
 
 def test_article_image_is_preferred_over_official_site_card() -> None:

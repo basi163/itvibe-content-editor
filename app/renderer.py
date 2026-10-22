@@ -114,7 +114,7 @@ def _clean_visible_fragment(value: str) -> str:
     return cleaned
 
 
-def _clean_body(body: str) -> str:
+def _clean_body(body: str, max_source_links: int = 3) -> str:
     result: list[str] = []
     position = 0
     marker_count = 0
@@ -123,7 +123,7 @@ def _clean_body(body: str) -> str:
         anchor = _clean_visible_fragment(match.group(2)).strip()
         if anchor:
             marker_count += 1
-            if marker_count <= 3:
+            if marker_count <= max_source_links:
                 result.append(f"[[source:{match.group(1)}|{anchor}]]")
             else:
                 result.append(anchor)
@@ -177,7 +177,12 @@ def _truncate_plain_text(value: str, limit: int) -> str:
     return candidate.rstrip(".,;!? ") + "…"
 
 
-def normalize_generated_post(post: GeneratedPost, max_chars: int) -> GeneratedPost:
+def normalize_generated_post(
+    post: GeneratedPost,
+    max_chars: int,
+    *,
+    max_source_links: int = 3,
+) -> GeneratedPost:
     """Deterministically repair formal style violations without inventing facts."""
     has_industry_alert = bool(INDUSTRY_ALERT_RE.match(post.title))
     raw_title = (
@@ -188,7 +193,7 @@ def normalize_generated_post(post: GeneratedPost, max_chars: int) -> GeneratedPo
     title = _clean_visible_fragment(raw_title).strip()
     if has_industry_alert:
         title = mark_industry_alert(title)
-    body = _clean_body(post.body)
+    body = _clean_body(post.body, max_source_links)
     hashtags = _clean_hashtags(post.hashtags)
 
     title = _limit_em_dashes(title, 3)
@@ -238,6 +243,7 @@ def validate_post(
     max_chars: int,
     *,
     required_hashtag_count: int | None = 3,
+    max_source_links: int = 3,
 ) -> list[str]:
     errors: list[str] = []
     title = post.title.strip()
@@ -270,8 +276,8 @@ def validate_post(
         errors.append(
             f"Текст длиннее лимита на {total_visible_length - max_chars} знаков"
         )
-    if post.body.count("[[source:") > 3:
-        errors.append("Использовано больше трех ссылок")
+    if post.body.count("[[source:") > max_source_links:
+        errors.append(f"Использовано больше {max_source_links} ссылок")
     if RAW_URL_RE.search(visible):
         errors.append("В видимом тексте есть URL")
     if SOURCE_MARKER_LIKE_RE.search(visible):
@@ -283,8 +289,10 @@ def render_post(
     post: GeneratedPost,
     sources: list[SourceDocument],
     max_chars: int,
+    *,
+    max_source_links: int = 3,
 ) -> RenderedPost:
-    errors = validate_post(post, max_chars)
+    errors = validate_post(post, max_chars, max_source_links=max_source_links)
     if errors:
         raise ValueError("; ".join(errors))
 

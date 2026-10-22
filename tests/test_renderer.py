@@ -59,6 +59,26 @@ def test_renderer_adds_exactly_one_blank_line_between_paragraphs() -> None:
     assert "<h2>" not in rendered.rich_html
 
 
+def test_digest_renderer_allows_one_link_for_each_news_item() -> None:
+    sources = [
+        SourceDocument(url=f"https://example.com/{index}", linkable=True)
+        for index in range(7)
+    ]
+    post = GeneratedPost(
+        "Технологический дайджест",
+        "\n\n".join(
+            f"{index + 1}. [[source:{index}|Новость {index + 1}]] в двух словах."
+            for index in range(7)
+        ),
+        ["#технологии", "#дайджест", "#IT"],
+    )
+
+    assert validate_post(post, 2000)
+    rendered = render_post(post, sources, 2000, max_source_links=10)
+
+    assert rendered.html.count('<a href="https://example.com/') == 7
+
+
 def test_signature_is_separated_from_hashtags_by_blank_line() -> None:
     post = GeneratedPost(
         title="Заголовок",

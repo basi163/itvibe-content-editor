@@ -302,6 +302,13 @@ def publish_slot_label(
     return f"{prefix} {local:%H:%M}"
 
 
+def _draft_source_link_limit(draft: dict[str, Any]) -> int:
+    triage = draft.get("triage")
+    if isinstance(triage, dict) and triage.get("category") == "digest":
+        return 10
+    return 3
+
+
 class EditorBot:
     def __init__(
         self,
@@ -2570,6 +2577,7 @@ class EditorBot:
             post,
             self.settings.max_post_chars,
             required_hashtag_count=None,
+            max_source_links=_draft_source_link_limit(draft),
         )
         if errors:
             error = "; ".join(errors)
@@ -2860,7 +2868,11 @@ class EditorBot:
                 await message.answer("Заголовок пустой либо содержит двоеточие или эмодзи. Пришли другой.")
                 return
             post = GeneratedPost(text, draft["body"], draft["hashtags"])
-            errors = validate_post(post, self.settings.max_post_chars)
+            errors = validate_post(
+                post,
+                self.settings.max_post_chars,
+                max_source_links=_draft_source_link_limit(draft),
+            )
             if errors:
                 await self.repository.set_pending_action(message.from_user.id, action, draft_id)
                 await message.answer("Не удалось применить заголовок. " + "; ".join(errors))
@@ -2874,7 +2886,11 @@ class EditorBot:
             tags = [part.strip() for part in re.split(r"[\s,]+", text) if part.strip()]
             tags = [tag if tag.startswith("#") else f"#{tag}" for tag in tags]
             post = GeneratedPost(draft["title"], draft["body"], tags)
-            errors = validate_post(post, self.settings.max_post_chars)
+            errors = validate_post(
+                post,
+                self.settings.max_post_chars,
+                max_source_links=_draft_source_link_limit(draft),
+            )
             if errors:
                 await self.repository.set_pending_action(message.from_user.id, action, draft_id)
                 await message.answer("Не удалось применить хэштеги. " + "; ".join(errors))
@@ -3880,7 +3896,12 @@ class EditorBot:
             return
         sources = [SourceDocument.from_dict(item) for item in draft["sources"]]
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
-        rendered = render_post(post, sources, self.settings.max_post_chars)
+        rendered = render_post(
+            post,
+            sources,
+            self.settings.max_post_chars,
+            max_source_links=_draft_source_link_limit(draft),
+        )
         preview_url = self._preview_url(draft)
         message, media_message_id = await self._send_editor_message(
             int(editor_chat_id),
@@ -3908,7 +3929,12 @@ class EditorBot:
             return
         sources = [SourceDocument.from_dict(item) for item in draft["sources"]]
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
-        rendered = render_post(post, sources, self.settings.max_post_chars)
+        rendered = render_post(
+            post,
+            sources,
+            self.settings.max_post_chars,
+            max_source_links=_draft_source_link_limit(draft),
+        )
         old_message_id = int(draft["editor_message_id"])
         old_media_message_id = draft.get("editor_media_message_id")
         media = self._selected_media(draft)
@@ -4409,7 +4435,12 @@ class EditorBot:
             return bool(published_channels)
         sources = [SourceDocument.from_dict(item) for item in draft["sources"]]
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
-        rendered = render_post(post, sources, self.settings.max_post_chars)
+        rendered = render_post(
+            post,
+            sources,
+            self.settings.max_post_chars,
+            max_source_links=_draft_source_link_limit(draft),
+        )
         media = self._selected_media(draft)
         if not media:
             if owner_id is not None:
