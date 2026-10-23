@@ -215,7 +215,13 @@ async def test_editorial_submission_is_fact_checked_and_bypasses_relevance_filte
 
     class Extractor:
         async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:
-            return []
+            return [
+                SourceDocument(
+                    url="https://www.w3.org/technical-resource",
+                    title="Unrelated technical resource",
+                    text="",
+                )
+            ]
 
         async def collect_direct_sources(
             self,

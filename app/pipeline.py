@@ -235,12 +235,14 @@ class ContentPipeline:
             logger.exception("Fact-check failed for editorial submission: %s", candidate.title)
             raise
 
-        has_external_source = bool(result.source_urls) or any(
-            source.url.startswith(("http://", "https://"))
-            and not is_telegram_url(source.url)
-            for source in sources
-        )
-        if not has_external_source:
+        result.source_urls = [
+            url
+            for url in result.source_urls
+            if url.startswith(("http://", "https://"))
+            and not is_telegram_url(url)
+            and not is_solidot_url(url)
+        ]
+        if not result.source_urls:
             raise RuntimeError("Fact-check did not return any verifiable web sources")
 
         verified_sources: list[SourceDocument] = []
@@ -252,10 +254,14 @@ class ContentPipeline:
                 )
             except Exception:
                 logger.exception("Could not extract fact-check sources: %s", candidate.title)
+        evidence_by_url = {
+            normalize_url(url): evidence
+            for url, evidence in result.source_evidence.items()
+        }
         for source in verified_sources:
             if source.text.strip():
                 continue
-            evidence = result.source_evidence.get(normalize_url(source.url), "").strip()
+            evidence = evidence_by_url.get(normalize_url(source.url), "").strip()
             if evidence:
                 source.text = f"Фрагмент веб-поиска: {evidence}"
                 source.error = None
@@ -271,7 +277,7 @@ class ContentPipeline:
 
         evidence_sources = [
             source
-            for source in merged
+            for source in verified_sources
             if source.url.startswith(("http://", "https://"))
             and not is_telegram_url(source.url)
             and not is_solidot_url(source.url)

@@ -208,7 +208,9 @@ async def test_fact_check_uses_search_enabled_completion_and_returns_sources() -
         await client.client.close()
 
     assert request["extra_body"] == {"enable_search": True, "enable_thinking": False}
-    assert "available_sources" not in request["messages"][1]["content"]
+    fact_check_payload = json.loads(request["messages"][1]["content"])
+    assert "available_sources" not in fact_check_payload
+    assert fact_check_payload["current_date"]
     assert result.facts == ["Компания опубликовала официальное заявление"]
     assert result.source_urls == ["https://company.example/news/announcement"]
     assert result.source_evidence == {

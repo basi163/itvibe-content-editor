@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -195,7 +196,10 @@ class QwenClient:
         sources: list[SourceDocument],
     ) -> FactCheckResult:
         del sources
-        context = {"candidate": candidate.to_dict()}
+        context = {
+            "current_date": datetime.now(UTC).date().isoformat(),
+            "candidate": candidate.to_dict(),
+        }
         response = await self.client.chat.completions.create(
             model=self.writer_model,
             messages=[
@@ -247,6 +251,7 @@ class QwenClient:
         sources: list[SourceDocument],
     ) -> FactCheckResult:
         payload = {
+            "current_date": datetime.now(UTC).date().isoformat(),
             "candidate": candidate.to_dict(),
             "evidence_pages": _source_payload(sources, per_source_chars=10_000),
         }
