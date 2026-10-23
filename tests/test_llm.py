@@ -249,6 +249,71 @@ async def test_fact_check_evidence_is_grounded_in_downloaded_pages() -> None:
     assert result.source_urls == ["https://company.example/news"]
 
 
+
+@pytest.mark.asyncio
+async def test_editorial_writer_only_receives_verified_material() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+    request: dict[str, Any] = {}
+
+    async def completion(**kwargs: Any) -> dict[str, Any]:
+        request.update(kwargs)
+        return {
+            "title": "Подтвержденный материал",
+            "body": "Компания подтвердила событие.",
+            "hashtags": ["#IT", "#фактчек", "#новости"],
+        }
+
+    client._completion = completion  # type: ignore[method-assign]
+    candidate = StoryCandidate(
+        "editorial_submission",
+        "https://t.me/example/1",
+        "Непроверенный сенсационный заголовок",
+        "Непроверенное утверждение из пересланного сообщения",
+        force_editorial=True,
+    )
+    sources = [
+        SourceDocument(
+            url="https://t.me/example/1",
+            title="Непроверенный сенсационный заголовок",
+            text="Непроверенное утверждение из пересланного сообщения",
+        ),
+        SourceDocument(
+            url="https://company.example/official",
+            title="Official statement",
+            text="The company confirmed the event",
+            linkable=True,
+        ),
+    ]
+    triage = TriageDecision(
+        relevant=True,
+        score=1.0,
+        category="technology",
+        reason="Ручная подача",
+        linkable_source_indices=[1],
+        facts=["Компания подтвердила событие"],
+        uncertainties=["Масштаб события не подтвержден"],
+    )
+    try:
+        await client.generate(candidate, sources, triage)
+    finally:
+        await client.client.close()
+
+    payload = json.loads(request["user"])
+    assert payload["editorial_mode"] == "verified_facts_only"
+    assert payload["verified_facts"] == ["Компания подтвердила событие"]
+    assert payload["uncertainties"] == ["Масштаб события не подтвержден"]
+    assert payload["linkable_sources"][0]["index"] == 1
+    assert "candidate" not in payload
+    assert "Непроверенное утверждение" not in request["user"]
+
+
+
 @pytest.mark.asyncio
 async def test_regenerate_title_changes_only_title() -> None:
     client = QwenClient(

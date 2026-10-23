@@ -286,11 +286,36 @@ class QwenClient:
     ) -> GeneratedPost:
         content_limit = self.max_post_chars - 2 - len(SIGNATURE_TEXT)
         system = render_writer_system_prompt(content_limit)
-        payload = {
-            "candidate": candidate.to_dict(),
-            "editorial_decision": triage.to_dict(),
-            "sources": _source_payload(sources),
-        }
+        if candidate.force_editorial:
+            linkable_indices = set(triage.linkable_source_indices)
+            linkable_sources = []
+            for index, source in enumerate(sources):
+                if index not in linkable_indices:
+                    continue
+                linkable_sources.append(
+                    {
+                        "index": index,
+                        "url": source.url,
+                        "title": source.title,
+                        "publisher": source.publisher,
+                        "text": source.text[:12_000],
+                        "linkable": True,
+                    }
+                )
+            payload = {
+                "editorial_mode": "verified_facts_only",
+                "verified_facts": triage.facts,
+                "uncertainties": triage.uncertainties,
+                "category": triage.category,
+                "industry_critical": triage.industry_critical,
+                "linkable_sources": linkable_sources,
+            }
+        else:
+            payload = {
+                "candidate": candidate.to_dict(),
+                "editorial_decision": triage.to_dict(),
+                "sources": _source_payload(sources),
+            }
         data = await self._completion(
             model=self.writer_model,
             system=system,
