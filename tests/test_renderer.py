@@ -192,6 +192,29 @@ def test_local_normalizer_removes_importance_meta_commentary() -> None:
     assert validate_post(normalized, 2000) == []
 
 
+def test_local_normalizer_removes_signal_meta_commentary() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body=(
+            "Решение пока не принято. Это важный сигнал для отрасли. "
+            "Компании продолжают следить за обсуждением."
+        ),
+        hashtags=["#IT", "#рынок", "#новости"],
+    )
+
+    errors = validate_post(post, 2000)
+    assert any("это важный сигнал" in error.casefold() for error in errors)
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert normalized.body == (
+        "Решение пока не принято. Компании продолжают следить за обсуждением."
+    )
+    assert "сигнал" not in normalized.body.casefold()
+    assert validate_post(normalized, 2000) == []
+
+
+
 def test_manual_editor_can_keep_fewer_than_three_hashtags() -> None:
     post = GeneratedPost(
         title="Япония начала охоту за образцами с Фобоса",

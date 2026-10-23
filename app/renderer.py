@@ -38,6 +38,10 @@ BANNED_PHRASES = (
     "это демонстрирует важность",
     "этот пример показывает",
     "это показывает",
+    "это важный сигнал",
+    "это тревожный сигнал",
+    "это серьезный сигнал",
+    "это показательный сигнал",
     "мы наблюдаем классический пример",
 )
 IMPORTANCE_META_RE = re.compile(
@@ -56,6 +60,12 @@ META_LEAD_IN_RE = re.compile(
     r"(?:этот шаг|этот случай|этот пример|это)\s+(?:хорошо\s+)?показывает,\s+что"
     r"|мы\s+наблюдаем\s+(?:классический\s+)?пример\s+того,\s+как"
     r")\s+(?P<next>[A-Za-zА-Яа-яЁё])",
+    re.IGNORECASE,
+)
+SIGNAL_META_RE = re.compile(
+    r"(?P<prefix>^|(?<=[.!?\n])\s*)"
+    r"(?:это\s+)?(?:важный|тревожный|серьезный|показательный)\s+сигнал"
+    r"(?:\s+для\s+[^.!?\n]+)?[.!?]",
     re.IGNORECASE,
 )
 
@@ -106,6 +116,7 @@ def _clean_visible_fragment(value: str) -> str:
         lambda match: match.group("prefix") + match.group("next").upper(),
         cleaned,
     )
+    cleaned = SIGNAL_META_RE.sub(lambda match: match.group("prefix"), cleaned)
     for phrase in BANNED_PHRASES:
         cleaned = re.sub(re.escape(phrase), "Важно", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
