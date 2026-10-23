@@ -114,6 +114,34 @@ async def telegram_source_worker(
             pass
 
 
+async def draft_cleanup_worker(
+    settings: Settings,
+    repository: Repository,
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            cutoff = datetime.now(UTC) - timedelta(
+                days=settings.unpublished_retention_days
+            )
+            deleted_ids = await repository.delete_expired_unpublished_drafts(cutoff)
+            if deleted_ids:
+                logger.info(
+                    "Expired unpublished drafts removed from database: count=%s",
+                    len(deleted_ids),
+                )
+        except Exception:
+            logger.exception("Expired draft database cleanup failed")
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=settings.draft_cleanup_interval_seconds,
+            )
+        except TimeoutError:
+            pass
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -172,6 +200,9 @@ async def main() -> None:
         telegram_source_worker(settings, telegram_sources, stop_event)
     )
     publish_task = asyncio.create_task(editor_bot.scheduled_publish_worker(stop_event))
+    cleanup_task = asyncio.create_task(
+        draft_cleanup_worker(settings, repository, stop_event)
+    )
     try:
         await editor_bot.start_polling()
     finally:
@@ -180,10 +211,12 @@ async def main() -> None:
         feed_task.cancel()
         telegram_task.cancel()
         publish_task.cancel()
+        cleanup_task.cancel()
         await asyncio.gather(
             feed_task,
             telegram_task,
             publish_task,
+            cleanup_task,
             return_exceptions=True,
         )
         await extractor.close()

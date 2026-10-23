@@ -72,6 +72,8 @@ class Settings:
     relevance_threshold: float
     http_timeout_seconds: float
     max_source_links: int
+    unpublished_retention_days: int
+    draft_cleanup_interval_seconds: int
     editor_chat_id: int | None
     target_chat_id: int | None
 
@@ -110,6 +112,12 @@ class Settings:
             relevance_threshold=float(os.getenv("RELEVANCE_THRESHOLD", "0.72")),
             http_timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "25")),
             max_source_links=int(os.getenv("MAX_SOURCE_LINKS", "6")),
+            unpublished_retention_days=int(
+                os.getenv("UNPUBLISHED_RETENTION_DAYS", "30")
+            ),
+            draft_cleanup_interval_seconds=int(
+                os.getenv("DRAFT_CLEANUP_INTERVAL_SECONDS", "86400")
+            ),
             editor_chat_id=_optional_int("EDITOR_CHAT_ID"),
             target_chat_id=_optional_int("TARGET_CHAT_ID"),
         )
@@ -143,4 +151,10 @@ class Settings:
         if not -12 <= self.publish_schedule_utc_offset_hours <= 14:
             raise RuntimeError(
                 "PUBLISH_SCHEDULE_UTC_OFFSET_HOURS must be between -12 and 14"
+            )
+        if self.unpublished_retention_days < 1:
+            raise RuntimeError("UNPUBLISHED_RETENTION_DAYS must be at least 1")
+        if self.draft_cleanup_interval_seconds < 60:
+            raise RuntimeError(
+                "DRAFT_CLEANUP_INTERVAL_SECONDS must be at least 60"
             )

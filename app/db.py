@@ -495,6 +495,62 @@ class Repository:
             )
             return [self._decode_draft(dict(row)) for row in await cursor.fetchall()]
 
+    async def delete_expired_unpublished_drafts(
+        self,
+        older_than: datetime,
+    ) -> list[int]:
+        """Delete old ordinary drafts while preserving any publication history.
+
+        A draft is eligible only when its aggregate status is ``draft`` and none
+        of its per-channel publications is scheduled or published. The selection
+        and deletion run in one write transaction so a concurrent scheduler
+        cannot turn an eligible row into an active publication between them.
+        """
+        cutoff = older_than
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        cutoff_text = cutoff.astimezone(UTC).isoformat()
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT id, publications_json
+                FROM drafts
+                WHERE status = 'draft' AND created_at < ?
+                ORDER BY id
+                """,
+                (cutoff_text,),
+            )
+            eligible_ids: list[int] = []
+            for row in await cursor.fetchall():
+                try:
+                    publications = json.loads(row["publications_json"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(publications, list):
+                    continue
+                if any(
+                    isinstance(publication, dict)
+                    and publication.get("status") in {"scheduled", "published"}
+                    for publication in publications
+                ):
+                    continue
+                eligible_ids.append(int(row["id"]))
+
+            if eligible_ids:
+                placeholders = ", ".join("?" for _ in eligible_ids)
+                await db.execute(
+                    f"""
+                    DELETE FROM drafts
+                    WHERE id IN ({placeholders})
+                      AND status = 'draft'
+                      AND created_at < ?
+                    """,
+                    (*eligible_ids, cutoff_text),
+                )
+            await db.commit()
+            return eligible_ids
+
     async def scheduled_publications_by_channel(
         self,
     ) -> dict[int, list[datetime]]:

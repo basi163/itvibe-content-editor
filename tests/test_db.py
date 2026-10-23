@@ -89,6 +89,75 @@ async def test_unpublished_queue_and_navigation_context(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_expired_cleanup_deletes_only_ordinary_unpublished_drafts(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+
+    async def create(title: str) -> int:
+        return await repository.create_draft(
+            origin_type="test",
+            origin_ref=title,
+            title=title,
+            body="Текст",
+            hashtags=["#ИИ", "#наука", "#технологии"],
+            sources=[],
+            media=[],
+            material={},
+            triage={},
+        )
+
+    expired_plain = await create("expired plain")
+    expired_failed = await create("expired failed")
+    expired_scheduled = await create("expired scheduled")
+    expired_published = await create("expired published")
+    recent_plain = await create("recent plain")
+    cutoff = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    old_created_at = (cutoff - timedelta(seconds=1)).isoformat()
+    recent_created_at = (cutoff + timedelta(seconds=1)).isoformat()
+
+    await repository.update_draft(
+        expired_failed,
+        publications_json=json.dumps([{"status": "failed"}]),
+    )
+    await repository.update_draft(
+        expired_scheduled,
+        status="scheduled",
+        publications_json=json.dumps([{"status": "scheduled"}]),
+    )
+    await repository.update_draft(
+        expired_published,
+        publications_json=json.dumps([{"status": "published"}]),
+    )
+    await repository.set_pending_action(100, "title", expired_plain)
+    await repository.set_navigation_context(100, -100123, expired_plain)
+    async with repository.connect() as db:
+        await db.executemany(
+            "UPDATE drafts SET created_at = ? WHERE id = ?",
+            [
+                (old_created_at, expired_plain),
+                (old_created_at, expired_failed),
+                (old_created_at, expired_scheduled),
+                (old_created_at, expired_published),
+                (recent_created_at, recent_plain),
+            ],
+        )
+        await db.commit()
+
+    deleted = await repository.delete_expired_unpublished_drafts(cutoff)
+
+    assert deleted == [expired_plain, expired_failed]
+    assert await repository.get_draft(expired_plain) is None
+    assert await repository.get_draft(expired_failed) is None
+    assert await repository.get_draft(expired_scheduled) is not None
+    assert await repository.get_draft(expired_published) is not None
+    assert await repository.get_draft(recent_plain) is not None
+    assert await repository.pop_pending_action(100) is None
+    assert await repository.get_navigation_context(100, -100123) is None
+
+
+@pytest.mark.asyncio
 async def test_existing_edited_drafts_are_backfilled_once(tmp_path: Path) -> None:
     repository = Repository(tmp_path / "editor.sqlite3")
     await repository.initialize()
