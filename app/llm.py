@@ -194,10 +194,8 @@ class QwenClient:
         candidate: StoryCandidate,
         sources: list[SourceDocument],
     ) -> FactCheckResult:
-        context = {
-            "candidate": candidate.to_dict(),
-            "available_sources": _source_payload(sources, per_source_chars=5000),
-        }
+        del sources
+        context = {"candidate": candidate.to_dict()}
         response = await self.client.chat.completions.create(
             model=self.writer_model,
             messages=[

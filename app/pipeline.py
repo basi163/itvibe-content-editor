@@ -285,6 +285,8 @@ class ContentPipeline:
         except Exception:
             logger.exception("Evidence verification failed: %s", candidate.title)
             raise
+        if not grounded.facts:
+            raise RuntimeError("Fact-check did not confirm any publishable facts")
         return grounded, merged
 
     async def _contextual_media(
