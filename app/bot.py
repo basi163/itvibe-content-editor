@@ -391,6 +391,7 @@ class EditorBot:
         self.router.channel_post.register(self._editor_channel_post)
         self.router.edited_channel_post.register(self._edited_editor_post)
         self.router.message.register(self._private_message, F.chat.type == ChatType.PRIVATE)
+        self.router.message.register(self._editor_channel_post)
 
     async def _is_owner(self, user_id: int) -> bool:
         return await self.repository.is_owner(user_id)
@@ -2726,20 +2727,74 @@ class EditorBot:
         if not candidate.text:
             return
 
+        progress = await self.bot.send_message(
+            message.chat.id,
+            "Материал принят. Проверяю факты и готовлю черновик.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="« В главное меню", callback_data="home:0")]
+                ]
+            ),
+        )
+        logger.info(
+            "Queued editorial submission from chat %s message %s",
+            message.chat.id,
+            message.message_id,
+        )
+
         async def process() -> None:
             draft_id = await self.pipeline.process_manual(candidate)
             if draft_id:
+                logger.info(
+                    "Editorial submission %s produced draft %s",
+                    message.message_id,
+                    draft_id,
+                )
+                try:
+                    await self.bot.delete_message(
+                        progress.chat.id,
+                        progress.message_id,
+                    )
+                except TelegramBadRequest:
+                    pass
                 return
-            await self.bot.send_message(
-                message.chat.id,
-                "Не удалось подготовить черновик из ручного материала. "
-                "Проверь текст и попробуй ещё раз.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="« В главное меню", callback_data="home:0")]
-                    ]
-                ),
+            logger.warning(
+                "Editorial submission %s could not be prepared",
+                message.message_id,
             )
+            try:
+                await self.bot.edit_message_text(
+                    "Не удалось подготовить черновик. "
+                    "Сервис проверки источников мог временно не ответить. "
+                    "Перешли материал ещё раз.",
+                    chat_id=progress.chat.id,
+                    message_id=progress.message_id,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="« В главное меню",
+                                    callback_data="home:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+            except TelegramBadRequest:
+                await self.bot.send_message(
+                    message.chat.id,
+                    "Не удалось подготовить черновик. Перешли материал ещё раз.",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="« В главное меню",
+                                    callback_data="home:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
 
         asyncio.create_task(process())
 

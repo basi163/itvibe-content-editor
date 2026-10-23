@@ -459,7 +459,15 @@ async def test_plain_editorial_channel_post_is_queued_without_relevance_filter()
         get_draft_by_editor_message=AsyncMock(return_value=None),
     )
     editor.pipeline = SimpleNamespace(process_manual=AsyncMock(return_value=91))
-    editor.bot = SimpleNamespace(send_message=AsyncMock())
+    progress = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001234567890),
+        message_id=124,
+    )
+    editor.bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=progress),
+        delete_message=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
     message = SimpleNamespace(
         chat=SimpleNamespace(id=-1001234567890),
         message_id=123,
@@ -481,7 +489,11 @@ async def test_plain_editorial_channel_post_is_queued_without_relevance_filter()
     candidate = editor.pipeline.process_manual.await_args.args[0]
     assert candidate.text == "Любой текст для редакции"
     assert candidate.force_editorial is True
-    editor.bot.send_message.assert_not_awaited()
+    editor.bot.send_message.assert_awaited_once()
+    editor.bot.delete_message.assert_awaited_once_with(
+        -1001234567890,
+        124,
+    )
 
 
 @pytest.mark.asyncio

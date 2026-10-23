@@ -48,6 +48,7 @@ class FactCheckResult:
     facts: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
     source_urls: list[str] = field(default_factory=list)
+    source_evidence: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

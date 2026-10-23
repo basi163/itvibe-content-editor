@@ -156,7 +156,7 @@ async def test_image_search_places_model_selection_first() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fact_check_uses_web_tools_and_returns_verified_sources() -> None:
+async def test_fact_check_uses_search_enabled_completion_and_returns_sources() -> None:
     client = QwenClient(
         api_key="test",
         base_url="https://example.com/v1",
@@ -165,20 +165,26 @@ async def test_fact_check_uses_web_tools_and_returns_verified_sources() -> None:
         max_post_chars=2000,
     )
     response = SimpleNamespace(
-        output=[],
-        output_text=json.dumps(
-            {
-                "facts": ["Компания опубликовала официальное заявление"],
-                "uncertainties": ["Точный масштаб пока неизвестен"],
-                "sources": [
-                    {
-                        "url": "https://company.example/news/announcement",
-                        "title": "Announcement",
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        ),
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "facts": ["Компания опубликовала официальное заявление"],
+                            "uncertainties": ["Точный масштаб пока неизвестен"],
+                            "sources": [
+                                {
+                                    "url": "https://company.example/news/announcement",
+                                    "title": "Announcement",
+                                    "evidence": "В заявлении подтверждено событие",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        ]
     )
     request: dict[str, Any] = {}
 
@@ -186,7 +192,7 @@ async def test_fact_check_uses_web_tools_and_returns_verified_sources() -> None:
         request.update(kwargs)
         return response
 
-    client.client.responses.create = create  # type: ignore[method-assign]
+    client.client.chat.completions.create = create  # type: ignore[method-assign]
     try:
         result = await client.fact_check(
             StoryCandidate(
@@ -201,10 +207,45 @@ async def test_fact_check_uses_web_tools_and_returns_verified_sources() -> None:
     finally:
         await client.client.close()
 
-    assert request["tools"] == [{"type": "web_search"}, {"type": "web_extractor"}]
-    assert request["extra_body"] == {"enable_thinking": True}
+    assert request["extra_body"] == {"enable_search": True, "enable_thinking": False}
     assert result.facts == ["Компания опубликовала официальное заявление"]
     assert result.source_urls == ["https://company.example/news/announcement"]
+    assert result.source_evidence == {
+        "https://company.example/news/announcement": "В заявлении подтверждено событие"
+    }
+
+
+@pytest.mark.asyncio
+async def test_fact_check_evidence_is_grounded_in_downloaded_pages() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+
+    async def completion(**_: Any) -> dict[str, Any]:
+        return {
+            "facts": ["Официальное заявление подтверждает событие"],
+            "uncertainties": ["Масштаб не указан"],
+            "source_indices": [1],
+        }
+
+    client._completion = completion  # type: ignore[method-assign]
+    try:
+        result = await client.verify_fact_check(
+            StoryCandidate("editorial_submission", "", "Событие", "Текст"),
+            [
+                SourceDocument(url="https://media.example/story", text="Пересказ"),
+                SourceDocument(url="https://company.example/news", text="Заявление"),
+            ],
+        )
+    finally:
+        await client.client.close()
+
+    assert result.facts == ["Официальное заявление подтверждает событие"]
+    assert result.source_urls == ["https://company.example/news"]
 
 
 @pytest.mark.asyncio

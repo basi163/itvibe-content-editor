@@ -229,7 +229,7 @@ async def test_editorial_submission_is_fact_checked_and_bypasses_relevance_filte
                 SourceDocument(
                     url=official_url,
                     title="Official announcement",
-                    text="The company confirmed the event",
+                    text="",
                     publisher="Company",
                 )
             ]
@@ -242,6 +242,23 @@ async def test_editorial_submission_is_fact_checked_and_bypasses_relevance_filte
         ) -> FactCheckResult:
             assert candidate.force_editorial is True
             assert sources[0].text == candidate.text
+            return FactCheckResult(
+                facts=["Компания подтвердила событие"],
+                uncertainties=["Масштаб не указан"],
+                source_urls=[official_url],
+                source_evidence={official_url: "The company confirmed the event"},
+            )
+
+        async def verify_fact_check(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+        ) -> FactCheckResult:
+            assert candidate.force_editorial is True
+            assert [source.url for source in sources] == [official_url]
+            assert sources[0].text == (
+                "Фрагмент веб-поиска: The company confirmed the event"
+            )
             return FactCheckResult(
                 facts=["Компания подтвердила событие"],
                 uncertainties=["Масштаб не указан"],

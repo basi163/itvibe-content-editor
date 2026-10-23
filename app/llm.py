@@ -16,6 +16,7 @@ from app.models import (
 from app.prompts import (
     COMPONENT_REWRITE_SYSTEM_PROMPT,
     DIGEST_REPAIR_SYSTEM_PROMPT,
+    FACT_CHECK_EVIDENCE_PROMPT,
     FACT_CHECK_PROMPT,
     IMAGE_SEARCH_PROMPT,
     REPAIR_SYSTEM_PROMPT,
@@ -197,35 +198,35 @@ class QwenClient:
             "candidate": candidate.to_dict(),
             "available_sources": _source_payload(sources, per_source_chars=5000),
         }
-        response = await self.client.responses.create(
+        response = await self.client.chat.completions.create(
             model=self.writer_model,
-            input=(
-                f"{FACT_CHECK_PROMPT}\n\n"
-                f"Материал для проверки\n"
-                f"{json.dumps(context, ensure_ascii=False)}"
-            ),
-            tools=[{"type": "web_search"}, {"type": "web_extractor"}],
-            max_output_tokens=2500,
-            extra_body={"enable_thinking": True},
+            messages=[
+                {"role": "system", "content": FACT_CHECK_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(context, ensure_ascii=False),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=2500,
+            extra_body={"enable_search": True, "enable_thinking": False},
         )
-        content = str(getattr(response, "output_text", "") or "").strip()
+        content = str(response.choices[0].message.content or "").strip()
         if not content:
             raise RuntimeError("Fact-check model returned an empty response")
         data = _parse_json(content)
 
         source_urls: list[str] = []
+        source_evidence: dict[str, str] = {}
         for item in data.get("sources", []):
             value = item.get("url", "") if isinstance(item, dict) else item
             url = str(value or "").strip()
             if url.startswith(("http://", "https://")) and url not in source_urls:
                 source_urls.append(url)
-
-        for output_item in getattr(response, "output", []) or []:
-            for part in getattr(output_item, "content", []) or []:
-                for annotation in getattr(part, "annotations", []) or []:
-                    url = str(getattr(annotation, "url", "") or "").strip()
-                    if url.startswith(("http://", "https://")) and url not in source_urls:
-                        source_urls.append(url)
+            if isinstance(item, dict) and url:
+                evidence = str(item.get("evidence", "") or "").strip()
+                if evidence:
+                    source_evidence[url] = evidence[:3000]
 
         return FactCheckResult(
             facts=[str(item).strip() for item in data.get("facts", []) if str(item).strip()],
@@ -235,6 +236,48 @@ class QwenClient:
                 if str(item).strip()
             ],
             source_urls=source_urls[:6],
+            source_evidence={
+                url: source_evidence[url]
+                for url in source_urls[:6]
+                if url in source_evidence
+            },
+        )
+
+    async def verify_fact_check(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> FactCheckResult:
+        payload = {
+            "candidate": candidate.to_dict(),
+            "evidence_pages": _source_payload(sources, per_source_chars=10_000),
+        }
+        data = await self._completion(
+            model=self.writer_model,
+            system=FACT_CHECK_EVIDENCE_PROMPT,
+            user=json.dumps(payload, ensure_ascii=False),
+            temperature=0.0,
+            max_tokens=1800,
+        )
+        selected_indices = [
+            int(item)
+            for item in data.get("source_indices", [])
+            if str(item).lstrip("-").isdigit()
+            and 0 <= int(item) < len(sources)
+        ]
+        if not selected_indices:
+            selected_indices = list(range(len(sources)))
+        source_urls = list(
+            dict.fromkeys(sources[index].url for index in selected_indices)
+        )
+        return FactCheckResult(
+            facts=[str(item).strip() for item in data.get("facts", []) if str(item).strip()],
+            uncertainties=[
+                str(item).strip()
+                for item in data.get("uncertainties", [])
+                if str(item).strip()
+            ],
+            source_urls=source_urls,
         )
 
     async def generate(

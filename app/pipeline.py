@@ -243,16 +243,22 @@ class ContentPipeline:
         if not has_external_source:
             raise RuntimeError("Fact-check did not return any verifiable web sources")
 
-        if not result.source_urls:
-            return result, sources
-        try:
-            verified_sources = await self.extractor.collect_direct_sources(
-                result.source_urls,
-                limit=min(6, int(getattr(self.settings, "max_source_links", 6))),
-            )
-        except Exception:
-            logger.exception("Could not extract fact-check sources: %s", candidate.title)
-            return result, sources
+        verified_sources: list[SourceDocument] = []
+        if result.source_urls:
+            try:
+                verified_sources = await self.extractor.collect_direct_sources(
+                    result.source_urls,
+                    limit=min(6, int(getattr(self.settings, "max_source_links", 6))),
+                )
+            except Exception:
+                logger.exception("Could not extract fact-check sources: %s", candidate.title)
+        for source in verified_sources:
+            if source.text.strip():
+                continue
+            evidence = result.source_evidence.get(normalize_url(source.url), "").strip()
+            if evidence:
+                source.text = f"Фрагмент веб-поиска: {evidence}"
+                source.error = None
 
         merged = list(sources)
         known_urls = {normalize_url(source.url) for source in merged if source.url}
@@ -262,7 +268,24 @@ class ContentPipeline:
                 continue
             known_urls.add(normalized)
             merged.append(source)
-        return result, merged
+
+        evidence_sources = [
+            source
+            for source in merged
+            if source.url.startswith(("http://", "https://"))
+            and not is_telegram_url(source.url)
+            and not is_solidot_url(source.url)
+            and bool(source.text.strip())
+            and not source.error
+        ][:6]
+        if not evidence_sources:
+            raise RuntimeError("Fact-check sources could not be downloaded")
+        try:
+            grounded = await self.llm.verify_fact_check(candidate, evidence_sources)
+        except Exception:
+            logger.exception("Evidence verification failed: %s", candidate.title)
+            raise
+        return grounded, merged
 
     async def _contextual_media(
         self,
