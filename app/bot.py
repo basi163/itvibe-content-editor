@@ -2710,9 +2710,38 @@ class EditorBot:
         if not editor_chat_id or message.chat.id != int(editor_chat_id):
             return
         request = await self.repository.get_source_input_request(message.chat.id)
-        if not request or message.message_id == request.get("prompt_message_id"):
+        if request:
+            if message.message_id == request.get("prompt_message_id"):
+                return
+            await self._consume_source_input(message, request)
             return
-        await self._consume_source_input(message, request)
+        if getattr(message, "reply_markup", None):
+            return
+        if await self.repository.get_draft_by_editor_message(
+            message.chat.id,
+            message.message_id,
+        ):
+            return
+        candidate = self._candidate_from_message(message, force_editorial=True)
+        if not candidate.text:
+            return
+
+        async def process() -> None:
+            draft_id = await self.pipeline.process_manual(candidate)
+            if draft_id:
+                return
+            await self.bot.send_message(
+                message.chat.id,
+                "Не удалось подготовить черновик из ручного материала. "
+                "Проверь текст и попробуй ещё раз.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="« В главное меню", callback_data="home:0")]
+                    ]
+                ),
+            )
+
+        asyncio.create_task(process())
 
     async def _consume_source_input(
         self,
@@ -4834,9 +4863,14 @@ class EditorBot:
             show_above_text=True,
         )
 
-    @staticmethod
-    def _candidate_from_message(message: Message) -> StoryCandidate:
-        text = (message.text or message.caption or "").strip()
+    @classmethod
+    def _candidate_from_message(
+        cls,
+        message: Message,
+        *,
+        force_editorial: bool = False,
+    ) -> StoryCandidate:
+        text = cls._editor_message_text(message)
         urls = URL_RE.findall(text)
         for entity in list(message.entities or []) + list(message.caption_entities or []):
             if entity.url:
@@ -4861,11 +4895,12 @@ class EditorBot:
 
         title = text.splitlines()[0][:240] if text else "Пересланный материал"
         return StoryCandidate(
-            origin_type="telegram_forward",
+            origin_type="editorial_submission" if force_editorial else "telegram_forward",
             origin_ref=origin_ref,
             title=title,
             text=text,
             urls=list(dict.fromkeys(urls)),
             telegram_file_id=file_id,
             telegram_media_type=media_type,
+            force_editorial=force_editorial,
         )

@@ -6,10 +6,17 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
+from app.models import (
+    FactCheckResult,
+    GeneratedPost,
+    SourceDocument,
+    StoryCandidate,
+    TriageDecision,
+)
 from app.prompts import (
     COMPONENT_REWRITE_SYSTEM_PROMPT,
     DIGEST_REPAIR_SYSTEM_PROMPT,
+    FACT_CHECK_PROMPT,
     IMAGE_SEARCH_PROMPT,
     REPAIR_SYSTEM_PROMPT,
     TRIAGE_SYSTEM_PROMPT,
@@ -179,6 +186,55 @@ class QwenClient:
             uncertainties=[
                 str(item).strip() for item in data.get("uncertainties", []) if str(item).strip()
             ],
+        )
+
+    async def fact_check(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> FactCheckResult:
+        context = {
+            "candidate": candidate.to_dict(),
+            "available_sources": _source_payload(sources, per_source_chars=5000),
+        }
+        response = await self.client.responses.create(
+            model=self.writer_model,
+            input=(
+                f"{FACT_CHECK_PROMPT}\n\n"
+                f"Материал для проверки\n"
+                f"{json.dumps(context, ensure_ascii=False)}"
+            ),
+            tools=[{"type": "web_search"}, {"type": "web_extractor"}],
+            max_output_tokens=2500,
+            extra_body={"enable_thinking": True},
+        )
+        content = str(getattr(response, "output_text", "") or "").strip()
+        if not content:
+            raise RuntimeError("Fact-check model returned an empty response")
+        data = _parse_json(content)
+
+        source_urls: list[str] = []
+        for item in data.get("sources", []):
+            value = item.get("url", "") if isinstance(item, dict) else item
+            url = str(value or "").strip()
+            if url.startswith(("http://", "https://")) and url not in source_urls:
+                source_urls.append(url)
+
+        for output_item in getattr(response, "output", []) or []:
+            for part in getattr(output_item, "content", []) or []:
+                for annotation in getattr(part, "annotations", []) or []:
+                    url = str(getattr(annotation, "url", "") or "").strip()
+                    if url.startswith(("http://", "https://")) and url not in source_urls:
+                        source_urls.append(url)
+
+        return FactCheckResult(
+            facts=[str(item).strip() for item in data.get("facts", []) if str(item).strip()],
+            uncertainties=[
+                str(item).strip()
+                for item in data.get("uncertainties", [])
+                if str(item).strip()
+            ],
+            source_urls=source_urls[:6],
         )
 
     async def generate(

@@ -33,6 +33,7 @@ class StoryCandidate:
     media_urls: list[str] = field(default_factory=list)
     telegram_file_id: str | None = None
     telegram_media_type: str | None = None
+    force_editorial: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -40,6 +41,16 @@ class StoryCandidate:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> StoryCandidate:
         return cls(**value)
+
+
+@dataclass
+class FactCheckResult:
+    facts: list[str] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
+    source_urls: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass

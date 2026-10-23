@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -420,6 +421,67 @@ def test_plain_text_can_be_extracted_from_rich_telegram_blocks() -> None:
     assert EditorBot._editor_message_text(message) == (
         "Заголовок\n\nТекст новости\n\n#ИИ #новости #IT"
     )
+
+
+def test_forwarded_editorial_message_becomes_forced_candidate() -> None:
+    message = SimpleNamespace(
+        text="Заголовок\nТекст с https://example.org/source",
+        caption=None,
+        rich_message=None,
+        entities=[],
+        caption_entities=[],
+        forward_origin=SimpleNamespace(
+            chat=SimpleNamespace(username="source_channel"),
+            message_id=42,
+        ),
+        photo=[SimpleNamespace(file_id="photo-file-id")],
+        video=None,
+    )
+
+    candidate = EditorBot._candidate_from_message(message, force_editorial=True)
+
+    assert candidate.origin_type == "editorial_submission"
+    assert candidate.force_editorial is True
+    assert candidate.origin_ref == "https://t.me/source_channel/42"
+    assert candidate.urls == [
+        "https://t.me/source_channel/42",
+        "https://example.org/source",
+    ]
+    assert candidate.telegram_file_id == "photo-file-id"
+
+
+@pytest.mark.asyncio
+async def test_plain_editorial_channel_post_is_queued_without_relevance_filter() -> None:
+    editor = object.__new__(EditorBot)
+    editor.repository = SimpleNamespace(
+        get_setting=AsyncMock(return_value="-1001234567890"),
+        get_source_input_request=AsyncMock(return_value=None),
+        get_draft_by_editor_message=AsyncMock(return_value=None),
+    )
+    editor.pipeline = SimpleNamespace(process_manual=AsyncMock(return_value=91))
+    editor.bot = SimpleNamespace(send_message=AsyncMock())
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001234567890),
+        message_id=123,
+        text="Любой текст для редакции",
+        caption=None,
+        rich_message=None,
+        reply_markup=None,
+        entities=[],
+        caption_entities=[],
+        forward_origin=None,
+        photo=[],
+        video=None,
+    )
+
+    await editor._editor_channel_post(message)
+    await asyncio.sleep(0)
+
+    editor.pipeline.process_manual.assert_awaited_once()
+    candidate = editor.pipeline.process_manual.await_args.args[0]
+    assert candidate.text == "Любой текст для редакции"
+    assert candidate.force_editorial is True
+    editor.bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

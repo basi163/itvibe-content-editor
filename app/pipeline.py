@@ -16,7 +16,13 @@ from app.extractor import (
     normalize_url,
 )
 from app.llm import QwenClient
-from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
+from app.models import (
+    FactCheckResult,
+    GeneratedPost,
+    SourceDocument,
+    StoryCandidate,
+    TriageDecision,
+)
 from app.renderer import mark_industry_alert, normalize_generated_post, render_post
 
 logger = logging.getLogger(__name__)
@@ -99,6 +105,7 @@ class ContentPipeline:
             return None
 
     async def _process(self, candidate: StoryCandidate) -> int | None:
+        fact_check = FactCheckResult()
         is_digest = is_digest_candidate(candidate)
         if is_digest:
             sources = await self.extractor.collect_direct_sources(
@@ -128,6 +135,11 @@ class ContentPipeline:
             ]
         elif candidate.text and not sources[0].text:
             sources[0].text = candidate.text
+        if candidate.force_editorial:
+            fact_check, sources = await self._fact_check_editorial_submission(
+                candidate,
+                sources,
+            )
         if is_digest:
             triage = TriageDecision(
                 relevant=True,
@@ -139,6 +151,16 @@ class ContentPipeline:
             )
         else:
             triage = await self.llm.triage(candidate, sources)
+        if candidate.force_editorial:
+            triage.facts = fact_check.facts
+            triage.uncertainties = list(
+                dict.fromkeys([*fact_check.uncertainties, *triage.uncertainties])
+            )
+            triage.relevant = True
+            triage.score = max(triage.score, self.settings.relevance_threshold)
+            triage.reason = (
+                f"Ручная подача в редакцию. {triage.reason}"
+            ).strip()
         if triage.industry_critical:
             triage.relevant = True
             triage.score = max(triage.score, self.settings.relevance_threshold)
@@ -185,6 +207,7 @@ class ContentPipeline:
         material = {
             "candidate": candidate.to_dict(),
             "sources": [source.to_dict() for source in sources],
+            "fact_check": fact_check.to_dict(),
         }
         draft_id = await self.repository.create_draft(
             origin_type=candidate.origin_type,
@@ -200,6 +223,46 @@ class ContentPipeline:
         if self.deliver:
             await self.deliver(draft_id)
         return draft_id
+
+    async def _fact_check_editorial_submission(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> tuple[FactCheckResult, list[SourceDocument]]:
+        try:
+            result = await self.llm.fact_check(candidate, sources)
+        except Exception:
+            logger.exception("Fact-check failed for editorial submission: %s", candidate.title)
+            raise
+
+        has_external_source = bool(result.source_urls) or any(
+            source.url.startswith(("http://", "https://"))
+            and not is_telegram_url(source.url)
+            for source in sources
+        )
+        if not has_external_source:
+            raise RuntimeError("Fact-check did not return any verifiable web sources")
+
+        if not result.source_urls:
+            return result, sources
+        try:
+            verified_sources = await self.extractor.collect_direct_sources(
+                result.source_urls,
+                limit=min(6, int(getattr(self.settings, "max_source_links", 6))),
+            )
+        except Exception:
+            logger.exception("Could not extract fact-check sources: %s", candidate.title)
+            return result, sources
+
+        merged = list(sources)
+        known_urls = {normalize_url(source.url) for source in merged if source.url}
+        for source in verified_sources:
+            normalized = normalize_url(source.url)
+            if not normalized or normalized in known_urls:
+                continue
+            known_urls.add(normalized)
+            merged.append(source)
+        return result, merged
 
     async def _contextual_media(
         self,

@@ -3,7 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.models import GeneratedPost, SourceDocument, StoryCandidate, TriageDecision
+from app.models import (
+    FactCheckResult,
+    GeneratedPost,
+    SourceDocument,
+    StoryCandidate,
+    TriageDecision,
+)
 from app.pipeline import ContentPipeline, is_digest_candidate
 
 
@@ -201,6 +207,110 @@ async def test_industry_critical_story_bypasses_threshold_and_is_marked() -> Non
     triage = repository.created["triage"]
     assert isinstance(triage, dict)
     assert triage["industry_critical"] is True
+
+
+@pytest.mark.asyncio
+async def test_editorial_submission_is_fact_checked_and_bypasses_relevance_filter() -> None:
+    official_url = "https://company.example/official-announcement"
+
+    class Extractor:
+        async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:
+            return []
+
+        async def collect_direct_sources(
+            self,
+            urls: list[str],
+            *,
+            limit: int,
+        ) -> list[SourceDocument]:
+            assert urls == [official_url]
+            assert limit == 6
+            return [
+                SourceDocument(
+                    url=official_url,
+                    title="Official announcement",
+                    text="The company confirmed the event",
+                    publisher="Company",
+                )
+            ]
+
+    class Llm:
+        async def fact_check(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+        ) -> FactCheckResult:
+            assert candidate.force_editorial is True
+            assert sources[0].text == candidate.text
+            return FactCheckResult(
+                facts=["Компания подтвердила событие"],
+                uncertainties=["Масштаб не указан"],
+                source_urls=[official_url],
+            )
+
+        async def triage(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+        ) -> TriageDecision:
+            assert sources[-1].url == official_url
+            return TriageDecision(
+                relevant=False,
+                score=0.1,
+                category="other",
+                reason="Вне обычной тематики",
+                linkable_source_indices=[1],
+                facts=["Непроверенная формулировка"],
+            )
+
+        async def generate(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+        ) -> GeneratedPost:
+            assert triage.relevant is True
+            assert triage.score == 0.65
+            assert triage.facts == ["Компания подтвердила событие"]
+            assert triage.uncertainties == ["Масштаб не указан"]
+            return GeneratedPost(
+                "Проверенный материал",
+                "[[source:1|Компания подтвердила]] событие.",
+                ["#новости", "#фактчек", "#IT"],
+            )
+
+    class Repository:
+        created: dict[str, object] | None = None
+
+        async def create_draft(self, **kwargs: object) -> int:
+            self.created = kwargs
+            return 77
+
+    repository = Repository()
+    pipeline = ContentPipeline(
+        settings=SimpleNamespace(
+            relevance_threshold=0.65,
+            max_post_chars=2000,
+            max_source_links=6,
+        ),
+        repository=repository,
+        extractor=Extractor(),
+        llm=Llm(),
+    )
+    candidate = StoryCandidate(
+        origin_type="editorial_submission",
+        origin_ref="",
+        title="Ручной материал",
+        text="Здесь может быть текст на любую тему",
+        media_urls=["https://images.example/manual.jpg"],
+        force_editorial=True,
+    )
+
+    assert await pipeline._process(candidate) == 77
+    assert repository.created is not None
+    assert repository.created["origin_type"] == "editorial_submission"
+    assert repository.created["sources"][1]["linkable"] is True  # type: ignore[index]
+    assert repository.created["material"]["fact_check"]["source_urls"] == [official_url]  # type: ignore[index]
 
 
 @pytest.mark.asyncio

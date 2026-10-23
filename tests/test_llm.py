@@ -156,6 +156,58 @@ async def test_image_search_places_model_selection_first() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fact_check_uses_web_tools_and_returns_verified_sources() -> None:
+    client = QwenClient(
+        api_key="test",
+        base_url="https://example.com/v1",
+        triage_model="triage",
+        writer_model="writer",
+        max_post_chars=2000,
+    )
+    response = SimpleNamespace(
+        output=[],
+        output_text=json.dumps(
+            {
+                "facts": ["Компания опубликовала официальное заявление"],
+                "uncertainties": ["Точный масштаб пока неизвестен"],
+                "sources": [
+                    {
+                        "url": "https://company.example/news/announcement",
+                        "title": "Announcement",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    request: dict[str, Any] = {}
+
+    async def create(**kwargs: Any) -> SimpleNamespace:
+        request.update(kwargs)
+        return response
+
+    client.client.responses.create = create  # type: ignore[method-assign]
+    try:
+        result = await client.fact_check(
+            StoryCandidate(
+                "editorial_submission",
+                "",
+                "Важное заявление",
+                "Компания сделала заявление",
+                force_editorial=True,
+            ),
+            [SourceDocument(url="", text="Исходное сообщение")],
+        )
+    finally:
+        await client.client.close()
+
+    assert request["tools"] == [{"type": "web_search"}, {"type": "web_extractor"}]
+    assert request["extra_body"] == {"enable_thinking": True}
+    assert result.facts == ["Компания опубликовала официальное заявление"]
+    assert result.source_urls == ["https://company.example/news/announcement"]
+
+
+@pytest.mark.asyncio
 async def test_regenerate_title_changes_only_title() -> None:
     client = QwenClient(
         api_key="test",
