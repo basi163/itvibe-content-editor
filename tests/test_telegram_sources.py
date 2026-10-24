@@ -37,7 +37,13 @@ def test_public_telegram_html_is_parsed_without_telegram_links() -> None:
     page = """
     <html><body>
       <div class="tgme_channel_info_header_title"><span>Example News</span></div>
+      <div class="tgme_channel_info_header_photo">
+        <img src="https://cdn.example.org/channel-avatar.jpg" />
+      </div>
       <div class="tgme_widget_message" data-post="example_channel/41">
+        <a class="tgme_widget_message_user_photo">
+          <img src="https://cdn.example.org/channel-avatar.jpg" />
+        </a>
         <div class="tgme_widget_message_text">Old message</div>
         <time datetime="2026-10-22T10:00:00+00:00"></time>
       </div>
@@ -59,6 +65,7 @@ def test_public_telegram_html_is_parsed_without_telegram_links() -> None:
     assert snapshot.title == "Example News"
     assert snapshot.latest_id == "42"
     assert [entry.external_id for entry in snapshot.entries] == ["41", "42"]
+    assert snapshot.entries[0].raw["media_urls"] == []
     assert snapshot.entries[1].urls == ["https://research.example.org/report"]
     assert snapshot.entries[1].raw["media_urls"] == [
         "https://cdn.example.org/photo.jpg"

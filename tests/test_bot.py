@@ -405,6 +405,20 @@ def test_native_telegram_edit_is_parsed_and_keeps_source_marker() -> None:
     assert "[[source:0|Официальный отчёт]]" in post.body
 
 
+def test_native_telegram_edit_collapses_duplicate_hashtag_paragraphs() -> None:
+    post = parse_editor_post_text(
+        "Заголовок\n\n"
+        "Текст новости.\n\n"
+        "#ИИ #бизнес #технологии\n\n"
+        "#ИИ #бизнес #технологии\n\n"
+        "🔳 IT Vibe News",
+        "Текст новости.",
+    )
+
+    assert post.body == "Текст новости."
+    assert post.hashtags == ["#ИИ", "#бизнес", "#технологии"]
+
+
 def test_plain_text_can_be_extracted_from_rich_telegram_blocks() -> None:
     message = SimpleNamespace(
         text=None,

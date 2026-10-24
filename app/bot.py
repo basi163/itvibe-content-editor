@@ -185,19 +185,21 @@ def parse_editor_post_text(value: str, original_body: str) -> GeneratedPost:
     if paragraphs and paragraphs[-1] == SIGNATURE_TEXT:
         paragraphs.pop()
 
-    hashtag_index: int | None = None
+    hashtag_indices: set[int] = set()
     hashtags: list[str] = []
-    for index in range(len(paragraphs) - 1, 0, -1):
+    for index in range(1, len(paragraphs)):
         candidate = re.findall(r"#[\wА-Яа-яЁё]+", paragraphs[index], re.UNICODE)
         remainder = re.sub(r"#[\wА-Яа-яЁё]+", "", paragraphs[index]).strip()
         if candidate and not remainder:
-            hashtag_index = index
+            hashtag_indices.add(index)
             hashtags = candidate
-            break
 
     title = paragraphs[0] if paragraphs else ""
-    body_end = hashtag_index if hashtag_index is not None else len(paragraphs)
-    body = "\n\n".join(paragraphs[1:body_end]).strip()
+    body = "\n\n".join(
+        paragraph
+        for index, paragraph in enumerate(paragraphs[1:], start=1)
+        if index not in hashtag_indices
+    ).strip()
     for match in SOURCE_MARKER_RE.finditer(original_body):
         marker = match.group(0)
         anchor = match.group(2).strip()

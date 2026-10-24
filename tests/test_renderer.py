@@ -152,6 +152,61 @@ def test_local_normalizer_removes_malformed_source_markers() -> None:
     assert validate_post(normalized, 2000) == []
 
 
+def test_local_normalizer_removes_hashtag_only_lines_from_body() -> None:
+    post = GeneratedPost(
+        title="Обновление менеджера паролей",
+        body=(
+            "Разработчики выпустили новую версию.\n\n"
+            "#безопасность #KeePassXC #обновление\n\n"
+            "Она переводит приложение на Qt6."
+        ),
+        hashtags=["#безопасность", "#KeePassXC", "#обновление"],
+    )
+
+    assert any("продублированы" in error for error in validate_post(post, 2000))
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert normalized.body == (
+        "Разработчики выпустили новую версию.\n\n"
+        "Она переводит приложение на Qt6."
+    )
+    assert validate_post(normalized, 2000) == []
+
+
+@pytest.mark.parametrize(
+    "title,body",
+    [
+        ("Слухи о停产 RTX 5090 разогнали цены", "Текст новости."),
+        (
+            "KeePassXC переходит на Qt6",
+            "Разработчики完成了 миграцию с Qt5 на Qt6.",
+        ),
+    ],
+)
+def test_validation_rejects_chinese_characters(title: str, body: str) -> None:
+    post = GeneratedPost(
+        title=title,
+        body=body,
+        hashtags=["#безопасность", "#KeePassXC", "#обновление"],
+    )
+
+    assert any("иероглифы" in error for error in validate_post(post, 2000))
+
+
+def test_hashtag_normalizer_drops_chinese_tags() -> None:
+    post = GeneratedPost(
+        title="Заголовок",
+        body="Текст новости.",
+        hashtags=["#安全", "#KeePassXC", "#обновление"],
+    )
+
+    normalized = normalize_generated_post(post, 2000)
+
+    assert normalized.hashtags == ["#KeePassXC", "#обновление", "#технологии"]
+    assert validate_post(normalized, 2000) == []
+
+
 def test_local_normalizer_removes_meta_commentary_lead_ins() -> None:
     post = GeneratedPost(
         title="Заголовок",
@@ -212,7 +267,6 @@ def test_local_normalizer_removes_signal_meta_commentary() -> None:
     )
     assert "сигнал" not in normalized.body.casefold()
     assert validate_post(normalized, 2000) == []
-
 
 
 def test_manual_editor_can_keep_fewer_than_three_hashtags() -> None:

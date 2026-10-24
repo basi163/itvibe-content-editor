@@ -12,7 +12,17 @@ SOURCE_MARKER_LIKE_RE = re.compile(
     r"\[\[\s*source\b[^\]\r\n]*]]",
     re.IGNORECASE,
 )
-TAG_RE = re.compile(r"^#[\wА-Яа-яЁё]+$", re.UNICODE)
+HASHTAG_TOKEN = r"#[A-Za-z0-9_А-Яа-яЁё]+"
+TAG_RE = re.compile(rf"^{HASHTAG_TOKEN}$")
+HASHTAG_ONLY_LINE_RE = re.compile(rf"^\s*(?:{HASHTAG_TOKEN}\s*)+$", re.MULTILINE)
+CJK_RE = re.compile(
+    "["
+    "\u3400-\u4DBF"
+    "\u4E00-\u9FFF"
+    "\uF900-\uFAFF"
+    "\U00020000-\U0002FA1F"
+    "]"
+)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 RAW_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 EMOJI_RE = re.compile(
@@ -140,7 +150,11 @@ def _clean_body(body: str, max_source_links: int = 3) -> str:
                 result.append(anchor)
         position = match.end()
     result.append(_clean_visible_fragment(body[position:]))
-    return normalize_body_spacing("".join(result))
+    cleaned = normalize_body_spacing("".join(result))
+    without_hashtag_lines = "\n".join(
+        line for line in cleaned.splitlines() if not HASHTAG_ONLY_LINE_RE.fullmatch(line)
+    )
+    return normalize_body_spacing(without_hashtag_lines)
 
 
 def _limit_em_dashes(value: str, allowed: int) -> str:
@@ -157,7 +171,7 @@ def _clean_hashtags(hashtags: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for hashtag in hashtags:
-        value = re.sub(r"[^\wА-Яа-яЁё]", "", hashtag.lstrip("#"), flags=re.UNICODE)
+        value = re.sub(r"[^A-Za-z0-9_А-Яа-яЁё]", "", hashtag.lstrip("#"))
         if not value:
             continue
         tag = f"#{value}"
@@ -273,6 +287,10 @@ def validate_post(
     emoji_checked_visible = f"{emoji_checked_title}\n\n{body}\n\n{' '.join(hashtags)}"
     if EMOJI_RE.search(emoji_checked_visible):
         errors.append("В тексте есть эмодзи")
+    if CJK_RE.search(visible):
+        errors.append("В русском тексте остались китайские иероглифы")
+    if HASHTAG_ONLY_LINE_RE.search(body):
+        errors.append("Хэштеги продублированы в основном тексте")
     if visible.count("—") > 3:
         errors.append("Слишком много длинных тире")
     for phrase in BANNED_PHRASES:

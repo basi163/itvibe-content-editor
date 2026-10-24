@@ -53,7 +53,44 @@ def _message_id(element: Tag, username: str) -> int | None:
     return int(raw_id)
 
 
-def _media_urls(element: Tag, base_url: str) -> list[str]:
+def _avatar_urls(soup: BeautifulSoup, base_url: str) -> set[str]:
+    urls: set[str] = set()
+    for image in soup.select(
+        ".tgme_channel_info_header_photo img[src], "
+        ".tgme_widget_message_user_photo img[src], "
+        ".tgme_widget_message_owner_photo img[src], "
+        ".tgme_page_photo_image[src]"
+    ):
+        candidate = normalize_url(urljoin(base_url, str(image.get("src") or "")))
+        if candidate:
+            urls.add(candidate)
+    return urls
+
+
+def _is_profile_image(element: Tag) -> bool:
+    for ancestor in [element, *element.parents]:
+        if not isinstance(ancestor, Tag):
+            continue
+        classes = {str(value) for value in ancestor.get("class", [])}
+        if classes.intersection(
+            {
+                "tgme_channel_info_header_photo",
+                "tgme_widget_message_user_photo",
+                "tgme_widget_message_owner_photo",
+                "tgme_page_photo_image",
+            }
+        ):
+            return True
+    return False
+
+
+def _media_urls(
+    element: Tag,
+    base_url: str,
+    *,
+    excluded_urls: set[str] | None = None,
+) -> list[str]:
+    excluded_urls = excluded_urls or set()
     urls: list[str] = []
     for media in element.select(
         ".tgme_widget_message_photo_wrap, .tgme_widget_message_video_player, "
@@ -64,13 +101,15 @@ def _media_urls(element: Tag, base_url: str) -> list[str]:
         if match:
             urls.append(html.unescape(match.group(1)))
     for media in element.select("img[src], video[poster]"):
+        if _is_profile_image(media):
+            continue
         value = media.get("src") or media.get("poster")
         if value:
             urls.append(str(value))
     normalized: list[str] = []
     for value in urls:
         candidate = normalize_url(urljoin(base_url, value))
-        if candidate and candidate not in normalized:
+        if candidate and candidate not in excluded_urls and candidate not in normalized:
             normalized.append(candidate)
     return normalized
 
@@ -126,6 +165,8 @@ class TelegramPublicFeed:
             owner = soup.select_one(".tgme_widget_message_owner_name span")
             title = owner.get_text(" ", strip=True) if owner else f"@{self.username}"
 
+        avatar_urls = _avatar_urls(soup, self.url)
+
         entries: dict[int, FeedEntry] = {}
         for message in messages:
             message_id = _message_id(message, self.username)
@@ -133,7 +174,11 @@ class TelegramPublicFeed:
                 continue
             text_node = message.select_one(".tgme_widget_message_text")
             text = text_node.get_text("\n", strip=True) if text_node else ""
-            media_urls = _media_urls(message, self.url)
+            media_urls = _media_urls(
+                message,
+                self.url,
+                excluded_urls=avatar_urls,
+            )
             if not text:
                 continue
             links: list[str] = []
