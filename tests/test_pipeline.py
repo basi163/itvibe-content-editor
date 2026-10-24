@@ -149,7 +149,13 @@ def test_telegram_public_image_is_available_to_the_existing_media_pipeline() -> 
 async def test_industry_critical_story_bypasses_threshold_and_is_marked() -> None:
     class Extractor:
         async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:
-            return []
+            return [
+                SourceDocument(
+                    url="https://www.w3.org/technical-resource",
+                    title="Unrelated technical resource",
+                    text="",
+                )
+            ]
 
     class Llm:
         async def triage(
@@ -215,13 +221,7 @@ async def test_editorial_submission_is_fact_checked_and_bypasses_relevance_filte
 
     class Extractor:
         async def collect_sources(self, urls: list[str]) -> list[SourceDocument]:
-            return [
-                SourceDocument(
-                    url="https://www.w3.org/technical-resource",
-                    title="Unrelated technical resource",
-                    text="",
-                )
-            ]
+            return []
 
         async def collect_direct_sources(
             self,
@@ -466,6 +466,46 @@ async def test_story_uses_contextual_image_when_sources_have_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_contextual_image_search_retries_transient_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.pipeline.IMAGE_SEARCH_RETRY_DELAYS", (0.0,))
+
+    class Llm:
+        attempts = 0
+
+        async def search_images(
+            self,
+            candidate: StoryCandidate,
+            sources: list[SourceDocument],
+            triage: TriageDecision,
+            post: GeneratedPost,
+        ) -> list[dict[str, object]]:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary capacity limit")
+            return [{"index": 1, "title": "Result", "url": "https://img.example/new.jpg"}]
+
+    llm = Llm()
+    pipeline = ContentPipeline(
+        settings=SimpleNamespace(max_post_chars=2000),
+        repository=SimpleNamespace(),
+        extractor=SimpleNamespace(),
+        llm=llm,
+    )
+
+    results = await pipeline._search_images_with_retry(
+        StoryCandidate("manual", "", "Title", "Text"),
+        [],
+        TriageDecision(True, 1.0, "technology", "relevant"),
+        GeneratedPost("Title", "Body", ["#one", "#two", "#three"]),
+    )
+
+    assert llm.attempts == 2
+    assert results[0]["url"] == "https://img.example/new.jpg"
+
+
+@pytest.mark.asyncio
 async def test_regenerate_media_finds_a_different_contextual_image() -> None:
     old_url = "https://images.example/old.jpg"
     second_old_url = "https://images.example/second-old.jpg"
@@ -530,3 +570,64 @@ async def test_regenerate_media_finds_a_different_contextual_image() -> None:
     assert media[1]["image_url"] == old_url
     assert media[2]["image_url"] == second_old_url
     assert repository.updated["preview_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_regenerate_media_falls_back_to_verified_source_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.pipeline.IMAGE_SEARCH_RETRY_DELAYS", (0.0,))
+    source_url = "https://official.example/cover.jpg"
+    draft = {
+        "id": 10,
+        "title": "Заголовок",
+        "body": "Проверенный текст",
+        "hashtags": ["#ИИ", "#наука", "#технологии"],
+        "media": [
+            {
+                "type": "photo",
+                "image_url": "https://telegram.example/old.jpg",
+                "provider": "telegram_public_web",
+            },
+            {
+                "type": "photo",
+                "image_url": source_url,
+                "source_index": 0,
+            },
+        ],
+        "preview_index": 0,
+        "material": {
+            "candidate": StoryCandidate("telegram_web", "", "Story", "").to_dict(),
+            "sources": [SourceDocument(url="https://official.example").to_dict()],
+        },
+        "triage": TriageDecision(True, 0.9, "technology", "relevant").to_dict(),
+    }
+
+    class Repository:
+        updated: dict[str, object] | None = None
+
+        async def get_draft(self, draft_id: int) -> dict[str, object]:
+            return draft
+
+        async def update_draft(self, draft_id: int, **fields: object) -> None:
+            self.updated = fields
+
+    class Extractor:
+        async def download_image(self, url: str) -> tuple[bytes, str] | None:
+            assert url == source_url
+            return b"x" * 20_000, "source.jpg"
+
+    class Llm:
+        async def search_images(self, *_: object, **__: object) -> list[dict[str, object]]:
+            raise RuntimeError("temporary capacity limit")
+
+    repository = Repository()
+    pipeline = ContentPipeline(
+        settings=SimpleNamespace(max_post_chars=2000),
+        repository=repository,
+        extractor=Extractor(),
+        llm=Llm(),
+    )
+
+    assert await pipeline.regenerate_media(10)
+    assert repository.updated == {"preview_index": 1}

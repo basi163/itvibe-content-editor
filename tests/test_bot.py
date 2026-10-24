@@ -511,6 +511,51 @@ async def test_plain_editorial_channel_post_is_queued_without_relevance_filter()
 
 
 @pytest.mark.asyncio
+async def test_forwarded_editorial_post_with_external_buttons_is_not_ignored() -> None:
+    editor = object.__new__(EditorBot)
+    editor.repository = SimpleNamespace(
+        get_setting=AsyncMock(return_value="-1001234567890"),
+        get_source_input_request=AsyncMock(return_value=None),
+        get_draft_by_editor_message=AsyncMock(return_value=None),
+    )
+    editor.pipeline = SimpleNamespace(process_manual=AsyncMock(return_value=92))
+    progress = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001234567890),
+        message_id=126,
+    )
+    editor.bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=progress),
+        delete_message=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001234567890),
+        message_id=125,
+        text="Пост из другого канала",
+        caption=None,
+        rich_message=None,
+        reply_markup=SimpleNamespace(inline_keyboard=[[SimpleNamespace(text="Сайт")]]),
+        entities=[],
+        caption_entities=[],
+        forward_origin=SimpleNamespace(
+            chat=SimpleNamespace(username="source_channel"),
+            message_id=42,
+        ),
+        photo=[],
+        video=None,
+    )
+
+    await editor._editor_channel_post(message)
+    await asyncio.sleep(0)
+
+    editor.pipeline.process_manual.assert_awaited_once()
+    candidate = editor.pipeline.process_manual.await_args.args[0]
+    assert candidate.text == "Пост из другого канала"
+    assert candidate.force_editorial is True
+    editor.bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_native_telegram_edit_updates_stored_draft() -> None:
     editor = object.__new__(EditorBot)
     draft = {

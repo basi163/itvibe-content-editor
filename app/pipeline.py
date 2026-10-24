@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -28,6 +29,7 @@ from app.renderer import mark_industry_alert, normalize_generated_post, render_p
 logger = logging.getLogger(__name__)
 DraftDelivery = Callable[[int], Awaitable[None]]
 DIGEST_MAX_LINKS = 10
+IMAGE_SEARCH_RETRY_DELAYS = (2.0, 8.0)
 DIGEST_KEYWORD_RE = re.compile(
     r"(?:дайджест|digest|早报|晚报|日报|周报)",
     re.IGNORECASE,
@@ -303,7 +305,12 @@ class ContentPipeline:
         post: GeneratedPost,
     ) -> list[dict[str, Any]]:
         try:
-            search_results = await self.llm.search_images(candidate, sources, triage, post)
+            search_results = await self._search_images_with_retry(
+                candidate,
+                sources,
+                triage,
+                post,
+            )
         except Exception:
             logger.exception("Contextual image search failed for: %s", candidate.title)
             return []
@@ -328,6 +335,45 @@ class ContentPipeline:
                     "search_title": str(result.get("title") or ""),
                 }
             ]
+        return []
+
+    async def _search_images_with_retry(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+        *,
+        excluded_urls: list[str] | None = None,
+    ) -> list[dict[str, str | int]]:
+        attempts = len(IMAGE_SEARCH_RETRY_DELAYS) + 1
+        for attempt in range(attempts):
+            try:
+                if excluded_urls is None:
+                    return await self.llm.search_images(
+                        candidate,
+                        sources,
+                        triage,
+                        post,
+                    )
+                return await self.llm.search_images(
+                    candidate,
+                    sources,
+                    triage,
+                    post,
+                    excluded_urls=excluded_urls,
+                )
+            except Exception:
+                if attempt >= attempts - 1:
+                    raise
+                delay = IMAGE_SEARCH_RETRY_DELAYS[attempt]
+                logger.warning(
+                    "Image search attempt %s/%s failed; retrying in %.0f seconds",
+                    attempt + 1,
+                    attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
         return []
 
     async def regenerate(self, draft_id: int) -> bool:
@@ -409,7 +455,7 @@ class ContentPipeline:
             if item.get("image_url")
         }
         try:
-            search_results = await self.llm.search_images(
+            search_results = await self._search_images_with_retry(
                 candidate,
                 sources,
                 triage,
@@ -418,7 +464,7 @@ class ContentPipeline:
             )
         except Exception:
             logger.exception("Alternative image search failed for draft %s", draft_id)
-            return False
+            return await self._select_existing_media_fallback(draft_id, draft)
 
         for result in search_results[:10]:
             image_url = normalize_url(str(result.get("url") or ""))
@@ -440,6 +486,43 @@ class ContentPipeline:
                 media_json=_json([alternative, *media]),
                 preview_index=0,
             )
+            return True
+        return await self._select_existing_media_fallback(draft_id, draft)
+
+    async def _select_existing_media_fallback(
+        self,
+        draft_id: int,
+        draft: dict[str, Any],
+    ) -> bool:
+        media = list(draft.get("media") or [])
+        if len(media) < 2:
+            return False
+        current_index = int(draft.get("preview_index") or 0) % len(media)
+        choices = [
+            (index, item)
+            for index, item in enumerate(media)
+            if index != current_index
+        ]
+        choices.sort(
+            key=lambda choice: (
+                0 if choice[1].get("source_index") is not None else 1,
+                0 if choice[1].get("provider") == "qwen_web_search_image" else 1,
+                1 if choice[1].get("provider") == "telegram_public_web" else 0,
+                choice[0],
+            )
+        )
+        for index, item in choices:
+            if item.get("telegram_file_id"):
+                await self.repository.update_draft(draft_id, preview_index=index)
+                return True
+            image_url = normalize_url(str(item.get("image_url") or ""))
+            if not image_url:
+                continue
+            downloaded = await self.extractor.download_image(image_url)
+            if not downloaded or len(downloaded[0]) < 15_000:
+                continue
+            logger.info("Using verified source image fallback for draft %s", draft_id)
+            await self.repository.update_draft(draft_id, preview_index=index)
             return True
         return False
 

@@ -7,6 +7,7 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -45,7 +46,11 @@ from app.renderer import (
 )
 from app.rss import normalize_rss_url
 from app.rss_sources import RssSourceManager
-from app.telegram_sources import TelegramSourceManager, parse_public_channel_username
+from app.telegram_sources import (
+    TelegramPublicFeed,
+    TelegramSourceManager,
+    parse_public_channel_username,
+)
 
 logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -2718,7 +2723,7 @@ class EditorBot:
                 return
             await self._consume_source_input(message, request)
             return
-        if getattr(message, "reply_markup", None):
+        if getattr(message, "reply_markup", None) and not message.forward_origin:
             return
         if await self.repository.get_draft_by_editor_message(
             message.chat.id,
@@ -2726,7 +2731,13 @@ class EditorBot:
         ):
             return
         candidate = self._candidate_from_message(message, force_editorial=True)
+        await self._hydrate_public_forward(candidate)
         if not candidate.text:
+            await self.bot.send_message(
+                message.chat.id,
+                "Не удалось прочитать текст пересланного поста. Если канал публичный, "
+                "перешли публикацию ещё раз целиком вместе с подписью.",
+            )
             return
 
         progress = await self.bot.send_message(
@@ -2799,6 +2810,46 @@ class EditorBot:
                 )
 
         asyncio.create_task(process())
+
+    async def _hydrate_public_forward(self, candidate: StoryCandidate) -> None:
+        if candidate.text.strip() or not candidate.origin_ref:
+            return
+        parsed = urlparse(candidate.origin_ref)
+        host = (parsed.hostname or "").casefold().removeprefix("www.")
+        parts = [part for part in parsed.path.split("/") if part]
+        if host not in {"t.me", "telegram.me", "telegram.dog"} or len(parts) < 2:
+            return
+        username, raw_message_id = parts[0], parts[1]
+        if not raw_message_id.isdigit():
+            return
+        try:
+            snapshot = await TelegramPublicFeed(
+                username,
+                self.settings.http_timeout_seconds,
+            ).fetch()
+        except Exception:  # noqa: BLE001 - restoring a forwarded post is best effort
+            logger.warning(
+                "Could not restore text for forwarded public Telegram post %s/%s",
+                username,
+                raw_message_id,
+            )
+            return
+        entry = next(
+            (
+                item
+                for item in snapshot.entries
+                if item.external_id == raw_message_id
+            ),
+            None,
+        )
+        if not entry:
+            return
+        candidate.title = entry.title
+        candidate.text = entry.summary
+        candidate.urls = list(dict.fromkeys([*candidate.urls, *entry.urls]))
+        candidate.media_urls = list(
+            dict.fromkeys([*candidate.media_urls, *entry.raw.get("media_urls", [])])
+        )
 
     async def _consume_source_input(
         self,
@@ -2886,6 +2937,13 @@ class EditorBot:
             await message.answer("Перешли пост из канала или используй команды меню.")
             return
         candidate = self._candidate_from_message(message)
+        await self._hydrate_public_forward(candidate)
+        if not candidate.text:
+            await message.answer(
+                "Не удалось прочитать текст пересланного поста. Перешли его ещё раз "
+                "целиком вместе с подписью."
+            )
+            return
         await message.answer("Материал принят. Проверяю источники и релевантность.")
 
         async def process() -> None:
