@@ -59,6 +59,29 @@ def test_mascot_is_scaled_to_dominate_the_right_side() -> None:
     assert mascot.height >= 650
 
 
+def test_mascot_surface_light_is_recolored_from_green_to_orange() -> None:
+    mascot = _mascot("excited")
+    pixels = mascot.tobytes()
+
+    green_highlights = sum(
+        pixels[offset + 1] > pixels[offset] + 16
+        and pixels[offset + 1] > pixels[offset + 2] + 10
+        and pixels[offset + 1] > 34
+        for offset in range(0, len(pixels), 4)
+        if pixels[offset + 3]
+    )
+    orange_highlights = sum(
+        pixels[offset] > pixels[offset + 1] * 1.45
+        and pixels[offset + 1] > pixels[offset + 2] * 2
+        and pixels[offset] > 80
+        for offset in range(0, len(pixels), 4)
+        if pixels[offset + 3]
+    )
+
+    assert green_highlights == 0
+    assert orange_highlights > 1_000
+
+
 def test_digest_cover_renders_publishable_jpeg() -> None:
     content = render_digest_cover(
         build_digest_cover_spec("Технодайджест #122", _post())

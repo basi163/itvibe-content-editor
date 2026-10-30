@@ -296,7 +296,20 @@ def _mascot(pose: str) -> Image.Image:
         (round(image.width * scale), round(image.height * scale)),
         Image.Resampling.LANCZOS,
     )
-    return image
+
+    # The source portraits have green rim light baked into the clothing and
+    # head. Replace those reflected highlights with the poster's warm orange
+    # accent while preserving neutral blacks, whites and skin-independent
+    # mascot details.
+    recolored = bytearray(image.tobytes())
+    for offset in range(0, len(recolored), 4):
+        red, green, blue, _alpha = recolored[offset : offset + 4]
+        if green > red + 16 and green > blue + 10 and green > 34:
+            intensity = max(red, green, blue)
+            recolored[offset] = intensity
+            recolored[offset + 1] = round(intensity * ORANGE[1] / 255)
+            recolored[offset + 2] = round(intensity * ORANGE[2] / 255)
+    return Image.frombytes("RGBA", image.size, bytes(recolored))
 
 
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
@@ -342,7 +355,9 @@ def render_digest_cover(
     # Place the mascot below all typography so its enlarged hands and
     # shoulders can enter the copy area without hurting readability.
     mascot = _mascot(spec.pose)
-    mascot_x = width - mascot.width + 8
+    # Crop the mascot deliberately at the right edge. The face sits below the
+    # issue badge while only the near hand reaches into the story panel.
+    mascot_x = width - mascot.width + 268
     mascot_y = height - mascot.height + 18
 
     # Build the orange halo on a padded layer so the blur is not clipped at
@@ -370,7 +385,7 @@ def render_digest_cover(
     issue_font = _font(76, bold=True, condensed=True)
     brand_font = _font(41, bold=True, condensed=True)
 
-    title_polygon = ((38, 75), (912, 52), (947, 190), (16, 221))
+    title_polygon = ((38, 75), (1060, 49), (1094, 190), (16, 221))
     title_glow = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))
     title_glow_draw = ImageDraw.Draw(title_glow, "RGBA")
     title_glow_draw.line(
@@ -382,7 +397,7 @@ def render_digest_cover(
     title_glow = title_glow.filter(ImageFilter.GaussianBlur(radius=10))
     canvas.alpha_composite(title_glow)
     draw = ImageDraw.Draw(canvas, "RGBA")
-    draw.polygon(title_polygon, fill=(*accent, 248))
+    draw.polygon(title_polygon, fill=(*ORANGE, 252))
     draw.line(
         (*title_polygon, title_polygon[0]),
         fill=(*ORANGE, 255),
@@ -394,8 +409,8 @@ def render_digest_cover(
         "ТЕХНОДАЙДЖЕСТ",
         font=title_font,
         fill=(4, 5, 7, 255),
-        stroke_width=2,
-        stroke_fill=ORANGE,
+        stroke_width=1,
+        stroke_fill=(4, 5, 7),
     )
 
     issue_text = spec.issue
@@ -456,7 +471,17 @@ def render_digest_cover(
             break
 
     labels = "  •  ".join(spec.labels)
-    draw.rounded_rectangle((28, 749, 1006, 817), radius=14, fill=(0, 0, 0, 218), outline=(*secondary, 110), width=2)
+    labels_panel = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))
+    labels_panel_draw = ImageDraw.Draw(labels_panel, "RGBA")
+    labels_panel_draw.rounded_rectangle(
+        (28, 749, 1006, 817),
+        radius=14,
+        fill=(0, 0, 0, 128),
+        outline=(*secondary, 155),
+        width=2,
+    )
+    canvas.alpha_composite(labels_panel)
+    draw = ImageDraw.Draw(canvas, "RGBA")
     draw.text((55, 764), labels, font=label_font, fill=(*secondary, 255))
 
     draw.polygon(((27, 839), (458, 825), (484, 891), (16, 897)), fill=(*RED, 250))
