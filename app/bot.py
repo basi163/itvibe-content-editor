@@ -593,7 +593,7 @@ class EditorBot:
         scheduled = await self.repository.scheduled_publications_by_channel()
         channels = await self._publication_channels()
         selected = set(await self._selected_publication_channel_ids())
-        channel_titles = {
+        base_channel_titles = {
             int(channel["chat_id"]): str(
                 channel.get("title")
                 or channel.get("username")
@@ -601,6 +601,26 @@ class EditorBot:
             )
             for channel in channels
         }
+        duplicate_titles = {
+            title.casefold()
+            for title in base_channel_titles.values()
+            if sum(
+                other.casefold() == title.casefold()
+                for other in base_channel_titles.values()
+            )
+            > 1
+        }
+        channel_titles: dict[int, str] = {}
+        for channel in channels:
+            channel_id = int(channel["chat_id"])
+            title = base_channel_titles[channel_id]
+            kind = str(channel.get("kind") or "telegram")
+            if title.casefold() in duplicate_titles:
+                platform = "Teletype" if kind == "teletype" else "Telegram"
+                title = f"{platform} · {title}"
+            elif kind == "teletype":
+                title = f"Teletype · {title}"
+            channel_titles[channel_id] = title
         channel_ids = list(channel_titles)
         channel_ids.extend(
             channel_id

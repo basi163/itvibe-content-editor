@@ -326,6 +326,11 @@ async def test_home_menu_shows_publication_status_for_each_channel() -> None:
         return_value=[
             {"chat_id": -1001, "title": "IT Vibe News"},
             {"chat_id": -1002, "title": "Business Vibe"},
+            {
+                "chat_id": 9_000_000_000_001_234,
+                "kind": "teletype",
+                "title": "IT Vibe News",
+            },
         ]
     )
     editor._selected_publication_channel_ids = AsyncMock(
@@ -344,7 +349,8 @@ async def test_home_menu_shows_publication_status_for_each_channel() -> None:
     assert "Опубликовано постов всего: <b>17</b>" in text
     assert "Запланировано публикаций: <b>3</b>" in text
     assert "Каналов с планом: <b>2</b>" in text
-    assert "IT Vibe News" in text
+    assert "Telegram · IT Vibe News" in text
+    assert "Teletype · IT Vibe News" in text
     assert "Business Vibe" in text
     assert "22.10.2026 12:10 (UTC+4)" in text
     assert "Запланировано: <b>2</b>" in text
