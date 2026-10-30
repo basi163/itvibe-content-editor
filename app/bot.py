@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
 import json
 import logging
 import re
@@ -9,6 +10,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -51,6 +53,13 @@ from app.telegram_sources import (
     TelegramSourceManager,
     parse_public_channel_username,
 )
+from app.vk import (
+    VkApiError,
+    VkPublisher,
+    parse_vk_group_name,
+    render_vk_post,
+    vk_target_id,
+)
 
 logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -64,6 +73,7 @@ PUBLICATION_SCHEDULES_SETTING = "publication_schedules"
 PUBLICATION_SCHEDULE_DAYS_SETTING = "publication_schedule_days"
 EDITORIAL_REWRITE_RULES_SETTING = "editorial_rewrite_rules"
 EDITORIAL_REWRITE_RULES_REQUEST = "editorial_rewrite_rules"
+VK_PUBLICATION_REQUEST = "vk_publication"
 MAX_EDITORIAL_REWRITE_RULES_CHARS = 3000
 WEEKDAY_NAMES = (
     "понедельник",
@@ -327,12 +337,14 @@ class EditorBot:
         pipeline: ContentPipeline,
         telegram_sources: TelegramSourceManager | None = None,
         rss_sources: RssSourceManager | None = None,
+        vk_publisher: VkPublisher | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.pipeline = pipeline
         self.telegram_sources = telegram_sources
         self.rss_sources = rss_sources
+        self.vk_publisher = vk_publisher
         self.bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -829,7 +841,14 @@ class EditorBot:
             values = json.loads(raw)
         except (TypeError, ValueError):
             return []
-        return [value for value in values if isinstance(value, dict) and value.get("chat_id")]
+        channels: list[dict[str, Any]] = []
+        for value in values:
+            if not isinstance(value, dict) or not value.get("chat_id"):
+                continue
+            channel = dict(value)
+            channel.setdefault("kind", "telegram")
+            channels.append(channel)
+        return channels
 
     async def _remember_publication_channel(
         self,
@@ -840,6 +859,7 @@ class EditorBot:
         channels = await self._publication_channels()
         channel = {
             "chat_id": chat_id,
+            "kind": "telegram",
             "title": title or str(chat_id),
             "username": username,
         }
@@ -848,6 +868,45 @@ class EditorBot:
         await self.repository.set_setting(
             PUBLICATION_CHANNELS_SETTING,
             json.dumps(channels, ensure_ascii=False),
+        )
+
+    async def _remember_vk_publication_channel(
+        self,
+        group_id: int,
+        title: str,
+        screen_name: str,
+    ) -> int:
+        target_id = vk_target_id(group_id)
+        channels = await self._publication_channels()
+        channel = {
+            "chat_id": target_id,
+            "kind": "vk",
+            "group_id": group_id,
+            "title": title or screen_name,
+            "username": screen_name,
+            "url": f"https://vk.ru/{screen_name}",
+        }
+        channels = [
+            item for item in channels if int(item["chat_id"]) != target_id
+        ]
+        channels.append(channel)
+        await self.repository.set_setting(
+            PUBLICATION_CHANNELS_SETTING,
+            json.dumps(channels, ensure_ascii=False),
+        )
+        return target_id
+
+    async def _publication_channel(
+        self,
+        channel_id: int,
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                channel
+                for channel in await self._publication_channels()
+                if int(channel["chat_id"]) == int(channel_id)
+            ),
+            None,
         )
 
     async def _selected_publication_channel_ids(self) -> list[int]:
@@ -1048,11 +1107,12 @@ class EditorBot:
             return "не выбран"
         for channel in await self._publication_channels():
             if str(channel["chat_id"]) == str(channel_id):
-                return str(
+                label = str(
                     channel.get("title")
                     or channel.get("username")
                     or channel_id
                 )
+                return f"VK · {label}" if channel.get("kind") == "vk" else label
         return str(channel_id)
 
     async def _target_channel_label(self) -> str:
@@ -1590,6 +1650,8 @@ class EditorBot:
         for channel in channels:
             channel_id = int(channel["chat_id"])
             title = str(channel.get("title") or channel.get("username") or channel_id)
+            if channel.get("kind") == "vk":
+                title = f"VK · {title}"
             marker = "🟢 " if channel_id in selected else "⚪️ "
             rows.append(
                 [
@@ -1603,13 +1665,13 @@ class EditorBot:
             [
                 [
                     InlineKeyboardButton(
-                        text="Добавить другой канал",
+                        text="➕ Добавить канал",
                         callback_data="targetadd:0",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Как добавить канал",
+                        text="Как добавить Telegram-канал",
                         callback_data="targethelp:0",
                     )
                 ],
@@ -1658,6 +1720,8 @@ class EditorBot:
         for channel in channels:
             channel_id = int(channel["chat_id"])
             title = str(channel.get("title") or channel.get("username") or channel_id)
+            if channel.get("kind") == "vk":
+                title = f"VK · {title}"
             marker = "🟢 " if channel_id in selected else ""
             rows.append(
                 [
@@ -1994,6 +2058,139 @@ class EditorBot:
             reply_markup=keyboard,
         )
 
+    async def _show_target_type_picker(
+        self,
+        chat_id: int,
+        message_id: int | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        keyboard = await self._with_navigation(
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Telegram-канал",
+                            callback_data="targetaddtelegram:0",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="VK-сообщество",
+                            callback_data="targetaddvk:0",
+                        )
+                    ],
+                ]
+            ),
+            user_id,
+            chat_id,
+            back_callback="targetmenu:0",
+            back_label="« Назад к каналам",
+        )
+        text = (
+            "<b>Добавление канала публикации</b>\n\n"
+            "Выбери площадку. Для каждого канала сохраняются отдельное "
+            "расписание и очередь публикаций."
+        )
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not edit target type picker; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_vk_target_add_flow(
+        self,
+        chat_id: int,
+        *,
+        user_id: int,
+        message_id: int | None = None,
+    ) -> None:
+        if not self.vk_publisher:
+            text = (
+                "<b>Подключение VK</b>\n\n"
+                "Публикация во VK ещё не авторизована. Сначала нужно один раз "
+                "подключить аккаунт владельца через VK OAuth. Ключ нельзя "
+                "отправлять в этот канал или в личный чат бота — он вводится "
+                "только в Terminal на сервере."
+            )
+            keyboard = await self._with_navigation(
+                InlineKeyboardMarkup(inline_keyboard=[]),
+                user_id,
+                chat_id,
+                back_callback="targetadd:0",
+                back_label="« Назад",
+            )
+            if message_id is not None:
+                try:
+                    await self.bot.edit_message_text(
+                        text=text,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=keyboard,
+                    )
+                    return
+                except TelegramBadRequest:
+                    pass
+            await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+            return
+
+        text = (
+            "<b>Добавление VK-сообщества</b>\n\n"
+            "Отправь следующим сообщением ссылку на сообщество, например:\n"
+            "<code>https://vk.ru/it_vibe</code>\n\n"
+            "Бот проверит, что подключённый аккаунт имеет права администратора. "
+            "Токен и пароль сюда отправлять не нужно."
+        )
+        prompt = None
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="Отмена",
+                                    callback_data="targetvkcancel:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                prompt = message_id
+            except TelegramBadRequest:
+                pass
+        if prompt is None:
+            sent = await self.bot.send_message(
+                chat_id,
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Отмена",
+                                callback_data="targetvkcancel:0",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            prompt = sent.message_id
+        await self.repository.set_source_input_request(
+            chat_id,
+            user_id,
+            prompt,
+            VK_PUBLICATION_REQUEST,
+        )
+
     async def _show_target_channel_help(
         self,
         chat_id: int,
@@ -2042,7 +2239,7 @@ class EditorBot:
             else ""
         )
         return (
-            "<b>Как добавить канал публикации</b>\n\n"
+            "<b>Как добавить Telegram-канал публикации</b>\n\n"
             "1. Открой нужный Telegram-канал.\n"
             "2. Открой <b>Управление каналом → Администраторы</b>.\n"
             "3. Нажми <b>Добавить администратора</b> и найди "
@@ -2965,6 +3162,64 @@ class EditorBot:
             )
             return
 
+        if kind == VK_PUBLICATION_REQUEST:
+            value = (message.text or message.caption or "").strip()
+            try:
+                parse_vk_group_name(value)
+            except ValueError as error:
+                await message.answer(f"{html.escape(str(error))}. Попробуй ещё раз.")
+                return
+            if not self.vk_publisher:
+                await message.answer(
+                    "Авторизация VK не настроена. Не отправляй сюда токен — "
+                    "его нужно ввести в Terminal на сервере."
+                )
+                return
+            progress = await message.answer("Проверяю сообщество и права владельца…")
+            try:
+                group = await self.vk_publisher.resolve_group(value)
+                if not group.is_admin:
+                    raise ValueError(
+                        "Подключённый аккаунт VK не является администратором сообщества"
+                    )
+            except (ValueError, VkApiError, httpx.HTTPError) as error:
+                logger.warning(
+                    "Could not add VK publication target: %s",
+                    type(error).__name__,
+                )
+                try:
+                    await self.bot.delete_message(progress.chat.id, progress.message_id)
+                except TelegramBadRequest:
+                    pass
+                await message.answer(
+                    "Не удалось подключить VK-сообщество.\n\n"
+                    f"<code>{html.escape(str(error))}</code>\n\n"
+                    "Проверь ссылку и права подключённого аккаунта."
+                )
+                return
+            target_id = await self._remember_vk_publication_channel(
+                group.group_id,
+                group.title,
+                group.screen_name,
+            )
+            await self._select_publication_channel(target_id)
+            await self.repository.clear_source_input_request(message.chat.id)
+            if message.chat.type == ChatType.CHANNEL:
+                try:
+                    await self.bot.delete_message(message.chat.id, message.message_id)
+                except TelegramBadRequest:
+                    logger.info("Could not delete VK group URL from editor channel")
+            try:
+                await self.bot.delete_message(progress.chat.id, progress.message_id)
+            except TelegramBadRequest:
+                pass
+            await self._show_target_channel_menu(
+                message.chat.id,
+                message_id=request.get("prompt_message_id"),
+                user_id=int(request["user_id"]),
+            )
+            return
+
         manager = self.rss_sources if kind == "rss" else self.telegram_sources
         if not manager:
             await message.answer("Этот тип источников сейчас недоступен.")
@@ -3854,6 +4109,15 @@ class EditorBot:
                 )
             return
         if action == "targetadd":
+            await callback.answer("Выбери площадку")
+            if callback.message:
+                await self._show_target_type_picker(
+                    callback.message.chat.id,
+                    None if source_draft else callback.message.message_id,
+                    callback.from_user.id,
+                )
+            return
+        if action == "targetaddtelegram":
             await callback.answer("Показываю инструкцию")
             if callback.message:
                 current_channel_id = (
@@ -3865,8 +4129,29 @@ class EditorBot:
                     callback.message.chat.id,
                     current_channel_id,
                     callback.from_user.id,
-                    None if source_draft else callback.message.message_id,
+                    callback.message.message_id,
                 )
+            return
+        if action == "targetaddvk":
+            await callback.answer("Подключение VK")
+            if callback.message:
+                await self._show_vk_target_add_flow(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                    message_id=callback.message.message_id,
+                )
+            return
+        if action == "targetvkcancel":
+            if callback.message:
+                await self.repository.clear_source_input_request(
+                    callback.message.chat.id
+                )
+                await self._show_target_type_picker(
+                    callback.message.chat.id,
+                    callback.message.message_id,
+                    callback.from_user.id,
+                )
+            await callback.answer("Добавление отменено")
             return
         if action == "targetpicker":
             await callback.answer("Системный выбор открыт в личном боте")
@@ -4607,7 +4892,7 @@ class EditorBot:
                     published = False
                     failure = f"{type(error).__name__}: {error}"
                 else:
-                    failure = "Telegram publication failed"
+                    failure = "Publication target rejected the post"
                 if published:
                     continue
                 current = await self.repository.get_draft(draft_id)
@@ -4770,37 +5055,70 @@ class EditorBot:
         failed: list[str] = []
         for channel_id in target_chat_ids:
             label = await self._channel_label(channel_id)
-            file_value = await self._media_input(media)
-            if not file_value:
-                failed.append(label)
-                continue
-            sent = None
-            try:
-                sent = await self.bot.send_rich_message(
-                    chat_id=channel_id,
-                    rich_message=self._rich_message(
-                        rendered.rich_html,
-                        file_value,
-                        str(media.get("type") or "photo"),
-                    ),
-                )
-            except TelegramBadRequest:
-                if rendered.char_count <= 1024:
+            channel = await self._publication_channel(channel_id)
+            target_message_id: int | None = None
+            target_error: str | None = None
+            if channel and channel.get("kind") == "vk":
+                if not self.vk_publisher:
+                    target_error = "VK authorization is not configured"
+                elif media.get("type") != "photo":
+                    target_error = "VK publication currently requires a photo"
+                else:
+                    vk_media = await self._vk_media_bytes(media)
+                    if not vk_media:
+                        target_error = "Could not download the VK publication image"
+                    else:
+                        content, filename = vk_media
+                        try:
+                            target_message_id = await self.vk_publisher.publish_photo(
+                                group_id=int(channel["group_id"]),
+                                message=render_vk_post(post, sources),
+                                content=content,
+                                filename=filename,
+                                guid=f"itvibe-{draft_id}-{channel['group_id']}",
+                            )
+                        except (VkApiError, httpx.HTTPError, KeyError, ValueError) as error:
+                            logger.warning(
+                                "VK publication failed for draft %s in group %s: %s",
+                                draft_id,
+                                channel.get("group_id"),
+                                type(error).__name__,
+                            )
+                            target_error = str(error)
+            else:
+                file_value = await self._media_input(media)
+                sent = None
+                if file_value:
                     try:
-                        if media.get("type") == "video":
-                            sent = await self.bot.send_video(
-                                channel_id,
-                                video=file_value,
-                                caption=rendered.html,
-                            )
-                        else:
-                            sent = await self.bot.send_photo(
-                                channel_id,
-                                photo=file_value,
-                                caption=rendered.html,
-                            )
+                        sent = await self.bot.send_rich_message(
+                            chat_id=channel_id,
+                            rich_message=self._rich_message(
+                                rendered.rich_html,
+                                file_value,
+                                str(media.get("type") or "photo"),
+                            ),
+                        )
                     except TelegramBadRequest:
-                        sent = None
+                        if rendered.char_count <= 1024:
+                            try:
+                                if media.get("type") == "video":
+                                    sent = await self.bot.send_video(
+                                        channel_id,
+                                        video=file_value,
+                                        caption=rendered.html,
+                                    )
+                                else:
+                                    sent = await self.bot.send_photo(
+                                        channel_id,
+                                        photo=file_value,
+                                        caption=rendered.html,
+                                    )
+                            except TelegramBadRequest:
+                                sent = None
+                if sent is not None:
+                    target_message_id = sent.message_id
+                else:
+                    target_error = "Telegram rejected post"
             publication = next(
                 (
                     item
@@ -4809,7 +5127,7 @@ class EditorBot:
                 ),
                 None,
             )
-            if sent is None:
+            if target_message_id is None:
                 logger.warning(
                     "Rich media publication failed for draft %s in channel %s",
                     draft_id,
@@ -4822,7 +5140,7 @@ class EditorBot:
                         publications.append(publication)
                     publication.update(
                         status="failed",
-                        error="Telegram rejected post",
+                        error=target_error or "Publication failed",
                     )
                 continue
             if publication is None:
@@ -4833,13 +5151,13 @@ class EditorBot:
                 scheduled_at=None,
                 attempts=0,
                 error=None,
-                target_message_id=sent.message_id,
+                target_message_id=target_message_id,
             )
             succeeded.append(label)
             await self._save_draft_publications(
                 draft_id,
                 publications,
-                target_message_id=sent.message_id,
+                target_message_id=target_message_id,
             )
         if failed and target_chat_id is None:
             await self._save_draft_publications(draft_id, publications)
@@ -5122,6 +5440,30 @@ class EditorBot:
             return None
         content, filename = downloaded
         return BufferedInputFile(content, filename=filename)
+
+    async def _vk_media_bytes(
+        self,
+        media: dict[str, Any] | None,
+    ) -> tuple[bytes, str] | None:
+        if not media or media.get("type") != "photo":
+            return None
+        image_url = str(media.get("image_url") or "")
+        if image_url:
+            return await self.pipeline.extractor.download_image(image_url)
+        file_id = str(media.get("telegram_file_id") or "")
+        if not file_id:
+            return None
+        try:
+            telegram_file = await self.bot.get_file(file_id)
+            destination = io.BytesIO()
+            await self.bot.download_file(telegram_file.file_path, destination=destination)
+        except TelegramBadRequest:
+            return None
+        content = destination.getvalue()
+        if not content:
+            return None
+        filename = str(telegram_file.file_path or "image.jpg").rsplit("/", 1)[-1]
+        return content, filename or "image.jpg"
 
     @staticmethod
     def _rich_message(

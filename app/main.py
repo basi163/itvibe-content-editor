@@ -13,6 +13,7 @@ from app.llm import QwenClient
 from app.pipeline import ContentPipeline
 from app.rss_sources import RssSourceManager
 from app.telegram_sources import TelegramSourceManager
+from app.vk import VkPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,15 @@ async def main() -> None:
         builtin_url=settings.solidot_rss_url,
         bootstrap_items=settings.rss_bootstrap_items,
     )
+    vk_publisher = (
+        VkPublisher(
+            settings.vk_user_access_token,
+            api_version=settings.vk_api_version,
+            timeout=settings.http_timeout_seconds,
+        )
+        if settings.vk_user_access_token
+        else None
+    )
     await rss_sources.ensure_builtin()
     editor_bot = EditorBot(
         settings,
@@ -186,6 +196,7 @@ async def main() -> None:
         pipeline,
         telegram_sources,
         rss_sources,
+        vk_publisher,
     )
     pipeline.set_delivery(editor_bot.deliver_draft)
     await editor_bot.initialize()
@@ -223,6 +234,8 @@ async def main() -> None:
             return_exceptions=True,
         )
         await extractor.close()
+        if vk_publisher:
+            await vk_publisher.close()
         await editor_bot.close()
 
 

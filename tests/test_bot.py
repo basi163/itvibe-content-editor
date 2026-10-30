@@ -765,6 +765,7 @@ async def test_publish_draft_sends_one_edited_post_to_both_selected_channels() -
     editor._selected_publication_channel_ids = AsyncMock(
         return_value=[-1001, -1002]
     )
+    editor._publication_channel = AsyncMock(return_value=None)
     editor._channel_label = AsyncMock(side_effect=["Канал 1", "Канал 2"])
     editor._media_input = AsyncMock(return_value="photo-file-id")
     editor._save_draft_publications = AsyncMock(return_value="published")

@@ -76,6 +76,8 @@ class Settings:
     draft_cleanup_interval_seconds: int
     editor_chat_id: int | None
     target_chat_id: int | None
+    vk_user_access_token: str
+    vk_api_version: str
 
     @classmethod
     def load(cls) -> Settings:
@@ -120,6 +122,8 @@ class Settings:
             ),
             editor_chat_id=_optional_int("EDITOR_CHAT_ID"),
             target_chat_id=_optional_int("TARGET_CHAT_ID"),
+            vk_user_access_token=os.getenv("VK_USER_ACCESS_TOKEN", "").strip(),
+            vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip(),
         )
         settings.validate()
         settings.database_path.parent.mkdir(parents=True, exist_ok=True)

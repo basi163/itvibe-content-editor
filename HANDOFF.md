@@ -37,6 +37,9 @@ the terminal. Never write them to Git or display them in logs.
 - Alibaba Cloud Model Studio / Qwen API key
 - Qwen OpenAI-compatible base URL; the deployment script defaults to the
   international DashScope endpoint
+- Optional VK user OAuth token with `wall`, `photos` and `groups` permissions.
+  It is required only for VK publication and must be entered as
+  `VK_USER_ACCESS_TOKEN` directly in the server `.env`.
 
 Credentials previously pasted into chat must be treated as temporary and should
 be rotated after verification.
@@ -127,7 +130,15 @@ be rotated after verification.
   in the channel. The next channel message is stored as configuration rather than processed
   as a story. Rules apply to new ordinary posts, digests, repairs and generated title or
   hashtag alternatives; existing drafts remain unchanged. Built-in factual, source-link,
-  language, hashtag and formatting constraints always take priority. 131 tests passing.
+  language, hashtag and formatting constraints always take priority.
+- Publication targets can be Telegram channels or VK communities. VK communities use
+  the same content-plan, per-target schedule and retry flow, but are authenticated with
+  an optional user OAuth token because wall-photo upload is not available to a community
+  token. The editor adds a VK target from the editorial channel by sending its public URL;
+  the service resolves the community and verifies that the connected user is an admin.
+  Without `VK_USER_ACCESS_TOKEN`, existing Telegram behavior is unchanged and the VK
+  menu displays setup guidance. The token is never accepted through Telegram or stored
+  in the database.
 
 ## Completion criteria
 
