@@ -43,10 +43,10 @@ def test_vk_renderer_expands_official_source_links() -> None:
         ],
     )
 
-    assert text.startswith("Новый релиз\n\n")
+    assert text.startswith("▰ НОВЫЙ РЕЛИЗ\n\n")
     assert "официальный отчёт — https://example.com/report" in text
     assert "#IT #разработка #новости" in text
-    assert "🔳 IT Vibe News" in text
+    assert text.endswith("[https://t.me/+u5H6mukl7zg4NzZi|IT Vibe News]")
 
 
 @pytest.mark.asyncio
@@ -165,3 +165,29 @@ async def test_vk_community_token_publishes_link_preview_without_photo_upload() 
         "/method/groups.getById",
         "/method/wall.post",
     ]
+
+
+@pytest.mark.asyncio
+async def test_vk_publisher_edits_existing_community_post() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/wall.edit")
+        body = request.content.decode()
+        assert "post_id=100" in body
+        assert "https%3A%2F%2Fexample.com%2Fimage.jpg" in body
+        return httpx.Response(200, json={"response": 1}, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    publisher = VkPublisher(
+        community_access_token="community-token",
+        community_group_id=42,
+        client=client,
+    )
+    try:
+        await publisher.edit_post(
+            group_id=42,
+            post_id=100,
+            message="▰ ПРОВЕРОЧНЫЙ ПОСТ",
+            attachment_url="https://example.com/image.jpg",
+        )
+    finally:
+        await client.aclose()

@@ -10,7 +10,6 @@ import httpx
 
 from app.models import GeneratedPost, SourceDocument
 from app.renderer import (
-    SIGNATURE_TEXT,
     SIGNATURE_URL,
     SOURCE_MARKER_RE,
     normalize_body_spacing,
@@ -85,11 +84,13 @@ def render_vk_post(
     result.append(body[position:])
     visible_body = normalize_body_spacing("".join(result))
     hashtags = " ".join(tag.strip() for tag in post.hashtags)
+    title = post.title.strip().upper()
+    signature = f"[{SIGNATURE_URL}|IT Vibe News]"
     return (
-        f"{post.title.strip()}\n\n"
+        f"▰ {title}\n\n"
         f"{visible_body}\n\n"
         f"{hashtags}\n\n"
-        f"{SIGNATURE_TEXT}\n{SIGNATURE_URL}"
+        f"{signature}"
     )
 
 
@@ -277,3 +278,24 @@ class VkPublisher:
         if post_id <= 0:
             raise VkApiError("VK did not return the published post ID")
         return post_id
+
+    async def edit_post(
+        self,
+        *,
+        group_id: int,
+        post_id: int,
+        message: str,
+        attachment_url: str | None = None,
+    ) -> None:
+        attachments = ""
+        if attachment_url and attachment_url.startswith(("http://", "https://")):
+            attachments = attachment_url
+        edited = await self._call(
+            "wall.edit",
+            owner_id=-group_id,
+            post_id=post_id,
+            message=message,
+            attachments=attachments,
+        )
+        if edited not in (1, True) and not isinstance(edited, dict):
+            raise VkApiError("VK did not confirm the edited post")

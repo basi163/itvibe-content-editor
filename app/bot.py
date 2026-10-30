@@ -5075,15 +5075,29 @@ class EditorBot:
                     if vk_media:
                         content, filename = vk_media
                         try:
-                            fallback_url = next(
-                                (
-                                    source.url
-                                    for source in sources
-                                    if source.linkable
-                                    and source.url.startswith(("http://", "https://"))
-                                ),
-                                None,
-                            )
+                            fallback_url = None
+                            if media.get("type") == "photo":
+                                fallback_url = str(
+                                    media.get("image_url")
+                                    or media.get("page_url")
+                                    or ""
+                                ).strip()
+                                if fallback_url.startswith("http://"):
+                                    fallback_url = "https://" + fallback_url[7:]
+                                if not fallback_url.startswith(
+                                    ("http://", "https://")
+                                ):
+                                    fallback_url = None
+                            if not fallback_url:
+                                fallback_url = next(
+                                    (
+                                        source.url
+                                        for source in sources
+                                        if source.linkable
+                                        and source.url.startswith(("http://", "https://"))
+                                    ),
+                                    None,
+                                )
                             target_message_id = await self.vk_publisher.publish_photo(
                                 group_id=int(channel["group_id"]),
                                 message=render_vk_post(post, sources),
