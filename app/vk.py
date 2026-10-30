@@ -10,7 +10,6 @@ import httpx
 
 from app.models import GeneratedPost, SourceDocument
 from app.renderer import (
-    SIGNATURE_URL,
     SOURCE_MARKER_RE,
     normalize_body_spacing,
 )
@@ -18,6 +17,7 @@ from app.renderer import (
 VK_API_URL = "https://api.vk.com/method"
 VK_TARGET_ID_BASE = 8_000_000_000_000_000
 VK_SCREEN_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{2,64}$")
+VK_TELEGRAM_URL = "https://t.me/itvibenews"
 
 
 class VkApiError(RuntimeError):
@@ -85,7 +85,7 @@ def render_vk_post(
     visible_body = normalize_body_spacing("".join(result))
     hashtags = " ".join(tag.strip() for tag in post.hashtags)
     title = post.title.strip().upper()
-    signature = f"[{SIGNATURE_URL}|IT Vibe News]"
+    signature = f"IT Vibe News → {VK_TELEGRAM_URL}"
     return (
         f"▰ {title}\n\n"
         f"{visible_body}\n\n"
@@ -220,21 +220,10 @@ class VkPublisher:
         fallback_url: str | None = None,
     ) -> int:
         if not self.user_access_token:
-            attachments = ""
-            if fallback_url and fallback_url.startswith(("http://", "https://")):
-                attachments = fallback_url
-            published = await self._call(
-                "wall.post",
-                owner_id=-group_id,
-                from_group=1,
-                message=message,
-                attachments=attachments,
-                guid=guid,
+            raise VkApiError(
+                "VK не позволяет ключу сообщества загрузить фотографию на стену. "
+                "Публикация остановлена, чтобы не отправлять пост без изображения."
             )
-            post_id = int(published.get("post_id") or 0)
-            if post_id <= 0:
-                raise VkApiError("VK did not return the published post ID")
-            return post_id
 
         upload_server = await self._call(
             "photos.getWallUploadServer",

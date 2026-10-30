@@ -6,6 +6,7 @@ import pytest
 from app.models import GeneratedPost, SourceDocument
 from app.vk import (
     VK_TARGET_ID_BASE,
+    VkApiError,
     VkPublisher,
     parse_vk_group_name,
     render_vk_post,
@@ -46,7 +47,7 @@ def test_vk_renderer_expands_official_source_links() -> None:
     assert text.startswith("▰ НОВЫЙ РЕЛИЗ\n\n")
     assert "официальный отчёт — https://example.com/report" in text
     assert "#IT #разработка #новости" in text
-    assert text.endswith("[https://t.me/+u5H6mukl7zg4NzZi|IT Vibe News]")
+    assert text.endswith("IT Vibe News → https://t.me/itvibenews")
 
 
 @pytest.mark.asyncio
@@ -110,7 +111,7 @@ async def test_vk_publisher_resolves_group_and_publishes_photo() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vk_community_token_publishes_link_preview_without_photo_upload() -> None:
+async def test_vk_community_token_refuses_to_publish_without_photo() -> None:
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -130,10 +131,6 @@ async def test_vk_community_token_publishes_link_preview_without_photo_upload() 
                     ]
                 }
             }
-        elif request.url.path.endswith("/wall.post"):
-            body = request.content.decode()
-            assert "https%3A%2F%2Fexample.com%2Fofficial" in body
-            payload = {"response": {"post_id": 100}}
         else:  # pragma: no cover
             raise AssertionError(f"Unexpected VK request: {request.url}")
         return httpx.Response(200, json=payload, request=request)
@@ -146,24 +143,23 @@ async def test_vk_community_token_publishes_link_preview_without_photo_upload() 
     )
     try:
         group = await publisher.resolve_group("https://vk.ru/it_vibe")
-        post_id = await publisher.publish_photo(
-            group_id=group.group_id,
-            message="Проверочный пост",
-            content=b"",
-            filename="",
-            guid="itvibe-community-42",
-            fallback_url="https://example.com/official",
-        )
+        with pytest.raises(VkApiError, match="Публикация остановлена"):
+            await publisher.publish_photo(
+                group_id=group.group_id,
+                message="Проверочный пост",
+                content=b"",
+                filename="",
+                guid="itvibe-community-42",
+                fallback_url="https://example.com/official",
+            )
     finally:
         await client.aclose()
 
     assert publisher.requires_photo_upload is False
     assert group.is_admin is True
-    assert post_id == 100
     assert calls == [
         "/method/groups.getTokenPermissions",
         "/method/groups.getById",
-        "/method/wall.post",
     ]
 
 
