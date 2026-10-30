@@ -2,6 +2,10 @@
 .github
 .env
 .venv
+.DS_Store
+._*
+**/.DS_Store
+**/._*
 __pycache__
 *.pyc
 .pytest_cache
