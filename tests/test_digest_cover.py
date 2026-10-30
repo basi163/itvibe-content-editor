@@ -4,6 +4,7 @@ from PIL import Image
 
 from app.digest_cover import (
     COVER_SIZE,
+    PALETTES,
     build_digest_cover_spec,
     digest_headlines,
     render_digest_cover,
@@ -40,6 +41,14 @@ def test_digest_headlines_only_uses_numbered_items() -> None:
     )
 
     assert headlines == ("Первая новость.", "Вторая новость.")
+
+
+def test_digest_palettes_use_matrix_green_accents() -> None:
+    for accent, secondary, _base in PALETTES.values():
+        assert accent[1] > accent[0]
+        assert accent[1] > accent[2]
+        assert secondary[1] > secondary[0]
+        assert secondary[1] > secondary[2]
 
 
 def test_digest_cover_renders_publishable_jpeg() -> None:

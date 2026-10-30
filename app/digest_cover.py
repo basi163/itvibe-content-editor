@@ -91,11 +91,11 @@ TOPIC_KEYWORDS = {
 }
 
 PALETTES = {
-    "security": ((255, 44, 68), (10, 184, 230), (11, 12, 18)),
-    "ai": ((145, 82, 255), (0, 220, 255), (10, 8, 24)),
-    "gadgets": ((255, 214, 0), (255, 104, 32), (14, 12, 9)),
-    "business": ((0, 215, 170), (255, 196, 70), (8, 17, 18)),
-    "technology": ((255, 214, 0), (255, 80, 47), (12, 12, 14)),
+    "security": ((124, 255, 0), (0, 255, 102), (2, 10, 4)),
+    "ai": ((57, 255, 20), (0, 200, 83), (0, 10, 4)),
+    "gadgets": ((182, 255, 46), (24, 216, 96), (7, 16, 7)),
+    "business": ((0, 255, 133), (61, 255, 82), (3, 16, 10)),
+    "technology": ((108, 255, 35), (0, 214, 90), (2, 11, 4)),
 }
 
 POSES = ("thumbs", "excited", "alert", "thoughtful")
@@ -248,11 +248,13 @@ def _add_background(canvas: Image.Image, backdrops: list[bytes], topic: str) -> 
     decoded = [image for content in backdrops if (image := _cover_image(content))]
     if decoded:
         hero = ImageOps.fit(decoded[0], canvas.size, method=Image.Resampling.LANCZOS)
+        hero = ImageOps.colorize(hero.convert("L"), black=(0, 4, 2), white=accent)
         hero = hero.filter(ImageFilter.GaussianBlur(radius=14)).convert("RGBA")
         hero.putalpha(150)
         canvas.alpha_composite(hero)
     if len(decoded) > 1:
         panel = ImageOps.fit(decoded[1], (660, 520), method=Image.Resampling.LANCZOS)
+        panel = ImageOps.colorize(panel.convert("L"), black=(0, 5, 2), white=secondary)
         panel = panel.filter(ImageFilter.GaussianBlur(radius=2)).convert("RGBA")
         panel.putalpha(125)
         canvas.alpha_composite(panel, (930, 145))
@@ -346,8 +348,8 @@ def render_digest_cover(
     issue_width = _text_width(draw, issue_text, issue_font)
     badge_left = max(1265, width - issue_width - 84)
     badge = ((badge_left, 28), (width - 16, 8), (width - 42, 151), (badge_left - 31, 173))
-    draw.polygon(badge, fill=(236, 28, 38, 245))
-    draw.text((badge_left + 18, 41), issue_text, font=issue_font, fill="white", stroke_width=1)
+    draw.polygon(badge, fill=(*secondary, 245))
+    draw.text((badge_left + 18, 41), issue_text, font=issue_font, fill=(0, 8, 3, 255), stroke_width=1)
 
     draw.rounded_rectangle((28, 238, 1006, 730), radius=20, fill=(2, 3, 6, 218), outline=(*accent, 95), width=2)
     y = 262
@@ -367,16 +369,16 @@ def render_digest_cover(
         suffix_lines = _wrap(draw, suffix, headline_font, max(240, available))
         if prefix and suffix_lines:
             first = suffix_lines[0]
-            draw.text((line_x, y), first, font=headline_font, fill=(246, 246, 248, 255))
+            draw.text((line_x, y), first, font=headline_font, fill=(220, 255, 224, 255))
             remainder = " ".join(suffix_lines[1:])
             if remainder:
-                draw.text((111, y + 37), remainder, font=headline_font, fill=(246, 246, 248, 255))
+                draw.text((111, y + 37), remainder, font=headline_font, fill=(220, 255, 224, 255))
                 y += 34
         else:
             lines = _wrap(draw, suffix, headline_font, 846)
-            draw.text((111, y), lines[0] if lines else suffix, font=headline_font, fill=(246, 246, 248, 255))
+            draw.text((111, y), lines[0] if lines else suffix, font=headline_font, fill=(220, 255, 224, 255))
             if len(lines) > 1:
-                draw.text((111, y + 37), lines[1], font=headline_font, fill=(246, 246, 248, 255))
+                draw.text((111, y + 37), lines[1], font=headline_font, fill=(220, 255, 224, 255))
                 y += 34
         y += 71
         if y > 685:
@@ -386,10 +388,10 @@ def render_digest_cover(
     draw.rounded_rectangle((28, 749, 1006, 817), radius=14, fill=(0, 0, 0, 218), outline=(*secondary, 110), width=2)
     draw.text((55, 764), labels, font=label_font, fill=(*secondary, 255))
 
-    draw.polygon(((27, 839), (458, 825), (484, 891), (16, 897)), fill=(232, 31, 40, 245))
-    draw.rectangle((54, 850, 87, 883), fill=(255, 255, 255, 255))
-    draw.rectangle((62, 858, 79, 875), fill=(5, 5, 7, 255))
-    draw.text((104, 836), "IT Vibe News", font=brand_font, fill=(255, 255, 255, 255))
+    draw.polygon(((27, 839), (458, 825), (484, 891), (16, 897)), fill=(*accent, 245))
+    draw.rectangle((54, 850, 87, 883), fill=(0, 9, 3, 255))
+    draw.rectangle((62, 858, 79, 875), fill=(*accent, 255))
+    draw.text((104, 836), "IT Vibe News", font=brand_font, fill=(0, 9, 3, 255))
 
     mascot = _mascot(spec.pose)
     shadow = mascot.getchannel("A").filter(ImageFilter.GaussianBlur(radius=20))
