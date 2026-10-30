@@ -286,9 +286,13 @@ def _mascot(pose: str) -> Image.Image:
     alpha_box = image.getchannel("A").getbbox()
     if alpha_box:
         image = image.crop(alpha_box)
-    # The sprite sheet contains bust portraits. Keep the mascot large, like a
-    # presenter leaning into the frame, without ever showing a full body.
-    image.thumbnail((650, 610), Image.Resampling.LANCZOS)
+    # Let the bust dominate the right side of the poster. Upscaling is
+    # intentional: hands may overlap the story panel while copy stays above.
+    scale = min(950 / image.width, 760 / image.height)
+    image = image.resize(
+        (round(image.width * scale), round(image.height * scale)),
+        Image.Resampling.LANCZOS,
+    )
     return image
 
 
@@ -331,6 +335,18 @@ def render_digest_cover(
     width, height = COVER_SIZE
     canvas = Image.new("RGBA", COVER_SIZE, (*PALETTES[spec.topic][2], 255))
     _add_background(canvas, backdrops or [], spec.topic)
+
+    # Place the mascot below all typography so its enlarged hands and
+    # shoulders can enter the copy area without hurting readability.
+    mascot = _mascot(spec.pose)
+    shadow = mascot.getchannel("A").filter(ImageFilter.GaussianBlur(radius=24))
+    shadow_rgba = Image.new("RGBA", mascot.size, (0, 0, 0, 0))
+    shadow_rgba.putalpha(shadow.point(lambda value: min(150, value)))
+    mascot_x = width - mascot.width + 35
+    mascot_y = height - mascot.height + 20
+    canvas.alpha_composite(shadow_rgba, (mascot_x + 18, mascot_y + 24))
+    canvas.alpha_composite(mascot, (mascot_x, mascot_y))
+
     draw = ImageDraw.Draw(canvas, "RGBA")
     accent, secondary, _ = PALETTES[spec.topic]
 
@@ -392,15 +408,6 @@ def render_digest_cover(
     draw.rectangle((54, 850, 87, 883), fill=(0, 9, 3, 255))
     draw.rectangle((62, 858, 79, 875), fill=(*accent, 255))
     draw.text((104, 836), "IT Vibe News", font=brand_font, fill=(0, 9, 3, 255))
-
-    mascot = _mascot(spec.pose)
-    shadow = mascot.getchannel("A").filter(ImageFilter.GaussianBlur(radius=20))
-    shadow_rgba = Image.new("RGBA", mascot.size, (0, 0, 0, 0))
-    shadow_rgba.putalpha(shadow.point(lambda value: min(150, value)))
-    mascot_x = width - mascot.width - 35
-    mascot_y = height - mascot.height + 25
-    canvas.alpha_composite(shadow_rgba, (mascot_x + 16, mascot_y + 22))
-    canvas.alpha_composite(mascot, (mascot_x, mascot_y))
 
     output = io.BytesIO()
     canvas.convert("RGB").save(output, format="JPEG", quality=91, optimize=True, progressive=True)

@@ -5,6 +5,7 @@ from PIL import Image
 from app.digest_cover import (
     COVER_SIZE,
     PALETTES,
+    _mascot,
     build_digest_cover_spec,
     digest_headlines,
     render_digest_cover,
@@ -49,6 +50,13 @@ def test_digest_palettes_use_matrix_green_accents() -> None:
         assert accent[1] > accent[2]
         assert secondary[1] > secondary[0]
         assert secondary[1] > secondary[2]
+
+
+def test_mascot_is_scaled_to_dominate_the_right_side() -> None:
+    mascot = _mascot("excited")
+
+    assert mascot.width >= 900
+    assert mascot.height >= 500
 
 
 def test_digest_cover_renders_publishable_jpeg() -> None:
