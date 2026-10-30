@@ -183,10 +183,12 @@ async def main() -> None:
     vk_publisher = (
         VkPublisher(
             settings.vk_user_access_token,
+            community_access_token=settings.vk_community_access_token,
+            community_group_id=settings.vk_community_group_id,
             api_version=settings.vk_api_version,
             timeout=settings.http_timeout_seconds,
         )
-        if settings.vk_user_access_token
+        if settings.vk_user_access_token or settings.vk_community_access_token
         else None
     )
     await rss_sources.ensure_builtin()

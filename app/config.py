@@ -77,6 +77,8 @@ class Settings:
     editor_chat_id: int | None
     target_chat_id: int | None
     vk_user_access_token: str
+    vk_community_access_token: str
+    vk_community_group_id: int | None
     vk_api_version: str
 
     @classmethod
@@ -123,6 +125,10 @@ class Settings:
             editor_chat_id=_optional_int("EDITOR_CHAT_ID"),
             target_chat_id=_optional_int("TARGET_CHAT_ID"),
             vk_user_access_token=os.getenv("VK_USER_ACCESS_TOKEN", "").strip(),
+            vk_community_access_token=os.getenv(
+                "VK_COMMUNITY_ACCESS_TOKEN", ""
+            ).strip(),
+            vk_community_group_id=_optional_int("VK_COMMUNITY_GROUP_ID"),
             vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip(),
         )
         settings.validate()
@@ -143,6 +149,12 @@ class Settings:
             raise RuntimeError("MAX_POST_CHARS must be between 512 and 4096")
         if not 0 <= self.relevance_threshold <= 1:
             raise RuntimeError("RELEVANCE_THRESHOLD must be between 0 and 1")
+        if self.vk_community_access_token and not self.vk_community_group_id:
+            raise RuntimeError(
+                "VK_COMMUNITY_GROUP_ID is required with VK_COMMUNITY_ACCESS_TOKEN"
+            )
+        if self.vk_community_group_id is not None and self.vk_community_group_id <= 0:
+            raise RuntimeError("VK_COMMUNITY_GROUP_ID must be positive")
         if self.rss_poll_interval_seconds < 30:
             raise RuntimeError("RSS_POLL_INTERVAL_SECONDS must be at least 30")
         if self.rss_offpeak_poll_interval_seconds < self.rss_poll_interval_seconds:

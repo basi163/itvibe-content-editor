@@ -107,3 +107,61 @@ async def test_vk_publisher_resolves_group_and_publishes_photo() -> None:
         "/method/photos.saveWallPhoto",
         "/method/wall.post",
     ]
+
+
+@pytest.mark.asyncio
+async def test_vk_community_token_publishes_link_preview_without_photo_upload() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/groups.getTokenPermissions"):
+            payload = {
+                "response": {
+                    "mask": 8192,
+                    "permissions": [{"name": "wall", "setting": 8192}],
+                }
+            }
+        elif request.url.path.endswith("/groups.getById"):
+            payload = {
+                "response": {
+                    "groups": [
+                        {"id": 42, "name": "IT Vibe", "screen_name": "it_vibe"}
+                    ]
+                }
+            }
+        elif request.url.path.endswith("/wall.post"):
+            body = request.content.decode()
+            assert "https%3A%2F%2Fexample.com%2Fofficial" in body
+            payload = {"response": {"post_id": 100}}
+        else:  # pragma: no cover
+            raise AssertionError(f"Unexpected VK request: {request.url}")
+        return httpx.Response(200, json=payload, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    publisher = VkPublisher(
+        community_access_token="community-token",
+        community_group_id=42,
+        client=client,
+    )
+    try:
+        group = await publisher.resolve_group("https://vk.ru/it_vibe")
+        post_id = await publisher.publish_photo(
+            group_id=group.group_id,
+            message="Проверочный пост",
+            content=b"",
+            filename="",
+            guid="itvibe-community-42",
+            fallback_url="https://example.com/official",
+        )
+    finally:
+        await client.aclose()
+
+    assert publisher.requires_photo_upload is False
+    assert group.is_admin is True
+    assert post_id == 100
+    assert calls == [
+        "/method/groups.getTokenPermissions",
+        "/method/groups.getById",
+        "/method/wall.post",
+    ]

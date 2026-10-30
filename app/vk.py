@@ -96,13 +96,22 @@ def render_vk_post(
 class VkPublisher:
     def __init__(
         self,
-        access_token: str,
+        access_token: str = "",
         *,
+        community_access_token: str = "",
+        community_group_id: int | None = None,
         api_version: str = "5.199",
         timeout: float = 25.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.access_token = access_token
+        self.user_access_token = access_token.strip()
+        self.community_access_token = community_access_token.strip()
+        self.community_group_id = community_group_id
+        self.access_token = self.community_access_token or self.user_access_token
+        if not self.access_token:
+            raise ValueError("VK access token is required")
+        if self.community_access_token and not self.community_group_id:
+            raise ValueError("VK community group ID is required")
         self.api_version = api_version
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(
@@ -114,12 +123,22 @@ class VkPublisher:
         if self._owns_client:
             await self.client.aclose()
 
-    async def _call(self, method: str, **parameters: Any) -> Any:
+    @property
+    def requires_photo_upload(self) -> bool:
+        return bool(self.user_access_token)
+
+    async def _call(
+        self,
+        method: str,
+        *,
+        access_token: str | None = None,
+        **parameters: Any,
+    ) -> Any:
         response = await self.client.post(
             f"{VK_API_URL}/{method}",
             data={
                 **parameters,
-                "access_token": self.access_token,
+                "access_token": access_token or self.access_token,
                 "v": self.api_version,
             },
         )
@@ -135,31 +154,58 @@ class VkPublisher:
 
     async def resolve_group(self, value: str) -> VkGroup:
         screen_name = parse_vk_group_name(value)
-        resolved = await self._call(
-            "utils.resolveScreenName",
-            screen_name=screen_name,
-        )
-        if not isinstance(resolved, dict) or resolved.get("type") not in {
-            "group",
-            "page",
-            "event",
-        }:
-            raise ValueError("По этой ссылке не найдено сообщество VK")
-        group_id = int(resolved.get("object_id") or 0)
+        if self.community_access_token:
+            group_id = int(self.community_group_id or 0)
+            permissions = await self._call("groups.getTokenPermissions")
+            names = {
+                str(item.get("name") or "")
+                for item in permissions.get("permissions", [])
+                if isinstance(item, dict)
+            }
+            if "wall" not in names:
+                raise ValueError("У ключа сообщества нет права «Стена»")
+            lookup = str(group_id)
+        else:
+            resolved = await self._call(
+                "utils.resolveScreenName",
+                screen_name=screen_name,
+            )
+            if not isinstance(resolved, dict) or resolved.get("type") not in {
+                "group",
+                "page",
+                "event",
+            }:
+                raise ValueError("По этой ссылке не найдено сообщество VK")
+            group_id = int(resolved.get("object_id") or 0)
+            lookup = str(group_id)
         response = await self._call(
             "groups.getById",
-            group_ids=str(group_id),
+            group_ids=lookup,
             fields="description",
         )
         groups = response.get("groups", []) if isinstance(response, dict) else response
         if not isinstance(groups, list) or not groups:
             raise ValueError("VK не вернул данные сообщества")
         group = groups[0]
+        resolved_group_id = int(group.get("id") or group_id)
+        if self.community_group_id and resolved_group_id != self.community_group_id:
+            raise ValueError("Этот ключ VK принадлежит другому сообществу")
+        resolved_screen_name = str(group.get("screen_name") or "")
+        if self.community_group_id:
+            allowed_names = {
+                resolved_screen_name.casefold(),
+                str(resolved_group_id),
+                f"club{resolved_group_id}",
+                f"public{resolved_group_id}",
+                f"event{resolved_group_id}",
+            }
+            if screen_name.casefold() not in allowed_names:
+                raise ValueError("Ссылка ведёт не на сообщество этого ключа VK")
         return VkGroup(
-            group_id=int(group.get("id") or group_id),
+            group_id=resolved_group_id,
             title=str(group.get("name") or screen_name),
-            screen_name=str(group.get("screen_name") or screen_name),
-            is_admin=bool(group.get("is_admin")),
+            screen_name=resolved_screen_name or screen_name,
+            is_admin=bool(group.get("is_admin")) or bool(self.community_access_token),
         )
 
     async def publish_photo(
@@ -170,9 +216,28 @@ class VkPublisher:
         content: bytes,
         filename: str,
         guid: str,
+        fallback_url: str | None = None,
     ) -> int:
+        if not self.user_access_token:
+            attachments = ""
+            if fallback_url and fallback_url.startswith(("http://", "https://")):
+                attachments = fallback_url
+            published = await self._call(
+                "wall.post",
+                owner_id=-group_id,
+                from_group=1,
+                message=message,
+                attachments=attachments,
+                guid=guid,
+            )
+            post_id = int(published.get("post_id") or 0)
+            if post_id <= 0:
+                raise VkApiError("VK did not return the published post ID")
+            return post_id
+
         upload_server = await self._call(
             "photos.getWallUploadServer",
+            access_token=self.user_access_token,
             group_id=group_id,
         )
         upload_url = str(upload_server.get("upload_url") or "")
@@ -188,6 +253,7 @@ class VkPublisher:
         upload_payload = upload.json()
         saved = await self._call(
             "photos.saveWallPhoto",
+            access_token=self.user_access_token,
             group_id=group_id,
             photo=upload_payload.get("photo", ""),
             server=upload_payload.get("server", ""),

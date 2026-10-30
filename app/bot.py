@@ -2114,8 +2114,8 @@ class EditorBot:
         if not self.vk_publisher:
             text = (
                 "<b>Подключение VK</b>\n\n"
-                "Публикация во VK ещё не авторизована. Сначала нужно один раз "
-                "подключить аккаунт владельца через VK OAuth. Ключ нельзя "
+                "Публикация во VK ещё не авторизована. Сначала нужно добавить "
+                "ключ сообщества с правом «Стена» в Terminal. Ключ нельзя "
                 "отправлять в этот канал или в личный чат бота — он вводится "
                 "только в Terminal на сервере."
             )
@@ -2144,7 +2144,7 @@ class EditorBot:
             "<b>Добавление VK-сообщества</b>\n\n"
             "Отправь следующим сообщением ссылку на сообщество, например:\n"
             "<code>https://vk.ru/it_vibe</code>\n\n"
-            "Бот проверит, что подключённый аккаунт имеет права администратора. "
+            "Бот проверит, что ключ принадлежит этому сообществу и имеет право «Стена». "
             "Токен и пароль сюда отправлять не нужно."
         )
         prompt = None
@@ -3175,7 +3175,7 @@ class EditorBot:
                     "его нужно ввести в Terminal на сервере."
                 )
                 return
-            progress = await message.answer("Проверяю сообщество и права владельца…")
+            progress = await message.answer("Проверяю сообщество и права ключа…")
             try:
                 group = await self.vk_publisher.resolve_group(value)
                 if not group.is_admin:
@@ -3194,7 +3194,7 @@ class EditorBot:
                 await message.answer(
                     "Не удалось подключить VK-сообщество.\n\n"
                     f"<code>{html.escape(str(error))}</code>\n\n"
-                    "Проверь ссылку и права подключённого аккаунта."
+                    "Проверь ссылку, ID сообщества и права ключа."
                 )
                 return
             target_id = await self._remember_vk_publication_channel(
@@ -5061,21 +5061,36 @@ class EditorBot:
             if channel and channel.get("kind") == "vk":
                 if not self.vk_publisher:
                     target_error = "VK authorization is not configured"
-                elif media.get("type") != "photo":
-                    target_error = "VK publication currently requires a photo"
                 else:
-                    vk_media = await self._vk_media_bytes(media)
-                    if not vk_media:
-                        target_error = "Could not download the VK publication image"
+                    if self.vk_publisher.requires_photo_upload:
+                        if media.get("type") != "photo":
+                            target_error = "VK publication currently requires a photo"
+                            vk_media = None
+                        else:
+                            vk_media = await self._vk_media_bytes(media)
+                        if not vk_media and target_error is None:
+                            target_error = "Could not download the VK publication image"
                     else:
+                        vk_media = (b"", "")
+                    if vk_media:
                         content, filename = vk_media
                         try:
+                            fallback_url = next(
+                                (
+                                    source.url
+                                    for source in sources
+                                    if source.linkable
+                                    and source.url.startswith(("http://", "https://"))
+                                ),
+                                None,
+                            )
                             target_message_id = await self.vk_publisher.publish_photo(
                                 group_id=int(channel["group_id"]),
                                 message=render_vk_post(post, sources),
                                 content=content,
                                 filename=filename,
                                 guid=f"itvibe-{draft_id}-{channel['group_id']}",
+                                fallback_url=fallback_url,
                             )
                         except (VkApiError, httpx.HTTPError, KeyError, ValueError) as error:
                             logger.warning(
