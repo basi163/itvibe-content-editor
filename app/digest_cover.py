@@ -270,6 +270,7 @@ def _add_background(canvas: Image.Image, backdrops: list[bytes], topic: str) -> 
 
 
 def _mascot(pose: str) -> Image.Image:
+    """Return a tight head-and-shoulders mascot portrait for the cover."""
     sheet = Image.open(MASCOT_SHEET).convert("RGBA")
     half_width = sheet.width // 2
     half_height = sheet.height // 2
@@ -283,7 +284,9 @@ def _mascot(pose: str) -> Image.Image:
     alpha_box = image.getchannel("A").getbbox()
     if alpha_box:
         image = image.crop(alpha_box)
-    image.thumbnail((625, 735), Image.Resampling.LANCZOS)
+    # The sprite sheet contains bust portraits. Keep the mascot large, like a
+    # presenter leaning into the frame, without ever showing a full body.
+    image.thumbnail((650, 610), Image.Resampling.LANCZOS)
     return image
 
 
