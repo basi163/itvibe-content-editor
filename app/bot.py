@@ -53,12 +53,12 @@ from app.telegram_sources import (
     TelegramSourceManager,
     parse_public_channel_username,
 )
-from app.vk import (
-    VkApiError,
-    VkPublisher,
-    parse_vk_group_name,
-    render_vk_post,
-    vk_target_id,
+from app.teletype import (
+    TeletypeApiError,
+    TeletypeImage,
+    TeletypePublisher,
+    parse_teletype_blog_name,
+    teletype_target_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ PUBLICATION_SCHEDULES_SETTING = "publication_schedules"
 PUBLICATION_SCHEDULE_DAYS_SETTING = "publication_schedule_days"
 EDITORIAL_REWRITE_RULES_SETTING = "editorial_rewrite_rules"
 EDITORIAL_REWRITE_RULES_REQUEST = "editorial_rewrite_rules"
-VK_PUBLICATION_REQUEST = "vk_publication"
+TELETYPE_PUBLICATION_REQUEST = "teletype_publication"
 MAX_EDITORIAL_REWRITE_RULES_CHARS = 3000
 WEEKDAY_NAMES = (
     "понедельник",
@@ -337,14 +337,14 @@ class EditorBot:
         pipeline: ContentPipeline,
         telegram_sources: TelegramSourceManager | None = None,
         rss_sources: RssSourceManager | None = None,
-        vk_publisher: VkPublisher | None = None,
+        teletype_publisher: TeletypePublisher | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.pipeline = pipeline
         self.telegram_sources = telegram_sources
         self.rss_sources = rss_sources
-        self.vk_publisher = vk_publisher
+        self.teletype_publisher = teletype_publisher
         self.bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -358,6 +358,7 @@ class EditorBot:
 
     async def initialize(self) -> None:
         await self.repository.clear_pending_actions()
+        await self._migrate_legacy_vk_publication_targets()
         await self.bot.set_my_commands(
             [
                 BotCommand(command="start", description="Запустить редактор"),
@@ -845,10 +846,86 @@ class EditorBot:
         for value in values:
             if not isinstance(value, dict) or not value.get("chat_id"):
                 continue
+            if value.get("kind") == "vk":
+                continue
             channel = dict(value)
             channel.setdefault("kind", "telegram")
             channels.append(channel)
         return channels
+
+    async def _migrate_legacy_vk_publication_targets(self) -> None:
+        raw = await self.repository.get_setting(PUBLICATION_CHANNELS_SETTING)
+        if not raw:
+            return
+        try:
+            channels = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(channels, list):
+            return
+        legacy_ids = {
+            int(item["chat_id"])
+            for item in channels
+            if isinstance(item, dict)
+            and item.get("kind") == "vk"
+            and str(item.get("chat_id", "")).isdigit()
+        }
+        if not legacy_ids:
+            return
+        remaining_channels = [
+            item
+            for item in channels
+            if not isinstance(item, dict) or item.get("kind") != "vk"
+        ]
+        await self.repository.set_setting(
+            PUBLICATION_CHANNELS_SETTING,
+            json.dumps(remaining_channels, ensure_ascii=False),
+        )
+        selected_raw = await self.repository.get_setting(
+            SELECTED_PUBLICATION_CHANNELS_SETTING
+        )
+        if selected_raw:
+            try:
+                selected = json.loads(selected_raw)
+            except (TypeError, ValueError):
+                selected = []
+            if isinstance(selected, list):
+                await self._set_selected_publication_channel_ids(
+                    [
+                        int(value)
+                        for value in selected
+                        if str(value).lstrip("-").isdigit()
+                        and int(value) not in legacy_ids
+                    ]
+                )
+        legacy_target = await self.repository.get_setting("target_chat_id")
+        if (
+            legacy_target
+            and legacy_target.lstrip("-").isdigit()
+            and int(legacy_target) in legacy_ids
+        ):
+            await self.repository.set_setting("target_chat_id", "")
+        schedules_raw = await self.repository.get_setting(
+            PUBLICATION_SCHEDULES_SETTING
+        )
+        if schedules_raw:
+            try:
+                schedules = json.loads(schedules_raw)
+            except (TypeError, ValueError):
+                schedules = {}
+            if isinstance(schedules, dict):
+                for target_id in legacy_ids:
+                    schedules.pop(str(target_id), None)
+                await self.repository.set_setting(
+                    PUBLICATION_SCHEDULES_SETTING,
+                    json.dumps(schedules, ensure_ascii=False, sort_keys=True),
+                )
+        changed = await self.repository.remove_publication_targets(legacy_ids)
+        logger.info(
+            "Removed %s legacy VK publication target(s) and updated %s draft(s)",
+            len(legacy_ids),
+            changed,
+        )
 
     async def _remember_publication_channel(
         self,
@@ -870,21 +947,21 @@ class EditorBot:
             json.dumps(channels, ensure_ascii=False),
         )
 
-    async def _remember_vk_publication_channel(
+    async def _remember_teletype_publication_channel(
         self,
-        group_id: int,
+        blog_id: int,
         title: str,
-        screen_name: str,
+        uri: str,
     ) -> int:
-        target_id = vk_target_id(group_id)
+        target_id = teletype_target_id(blog_id)
         channels = await self._publication_channels()
         channel = {
             "chat_id": target_id,
-            "kind": "vk",
-            "group_id": group_id,
-            "title": title or screen_name,
-            "username": screen_name,
-            "url": f"https://vk.ru/{screen_name}",
+            "kind": "teletype",
+            "blog_id": blog_id,
+            "title": title or uri,
+            "username": uri,
+            "url": f"https://teletype.in/@{uri}",
         }
         channels = [
             item for item in channels if int(item["chat_id"]) != target_id
@@ -1112,7 +1189,11 @@ class EditorBot:
                     or channel.get("username")
                     or channel_id
                 )
-                return f"VK · {label}" if channel.get("kind") == "vk" else label
+                return (
+                    f"Teletype · {label}"
+                    if channel.get("kind") == "teletype"
+                    else label
+                )
         return str(channel_id)
 
     async def _target_channel_label(self) -> str:
@@ -1650,8 +1731,8 @@ class EditorBot:
         for channel in channels:
             channel_id = int(channel["chat_id"])
             title = str(channel.get("title") or channel.get("username") or channel_id)
-            if channel.get("kind") == "vk":
-                title = f"VK · {title}"
+            if channel.get("kind") == "teletype":
+                title = f"Teletype · {title}"
             marker = "🟢 " if channel_id in selected else "⚪️ "
             rows.append(
                 [
@@ -1720,8 +1801,8 @@ class EditorBot:
         for channel in channels:
             channel_id = int(channel["chat_id"])
             title = str(channel.get("title") or channel.get("username") or channel_id)
-            if channel.get("kind") == "vk":
-                title = f"VK · {title}"
+            if channel.get("kind") == "teletype":
+                title = f"Teletype · {title}"
             marker = "🟢 " if channel_id in selected else ""
             rows.append(
                 [
@@ -2075,8 +2156,8 @@ class EditorBot:
                     ],
                     [
                         InlineKeyboardButton(
-                            text="VK-сообщество",
-                            callback_data="targetaddvk:0",
+                            text="Teletype-блог",
+                            callback_data="targetaddteletype:0",
                         )
                     ],
                 ]
@@ -2104,18 +2185,18 @@ class EditorBot:
                 logger.info("Could not edit target type picker; sending a new one")
         await self.bot.send_message(chat_id, text, reply_markup=keyboard)
 
-    async def _show_vk_target_add_flow(
+    async def _show_teletype_target_add_flow(
         self,
         chat_id: int,
         *,
         user_id: int,
         message_id: int | None = None,
     ) -> None:
-        if not self.vk_publisher:
+        if not self.teletype_publisher:
             text = (
-                "<b>Подключение VK</b>\n\n"
-                "Публикация во VK ещё не авторизована. Сначала нужно добавить "
-                "ключ сообщества с правом «Стена» в Terminal. Ключ нельзя "
+                "<b>Подключение Teletype</b>\n\n"
+                "Публикация в Teletype ещё не авторизована. Сначала нужно добавить "
+                "токен аккаунта в Terminal. Токен нельзя "
                 "отправлять в этот канал или в личный чат бота — он вводится "
                 "только в Terminal на сервере."
             )
@@ -2141,10 +2222,10 @@ class EditorBot:
             return
 
         text = (
-            "<b>Добавление VK-сообщества</b>\n\n"
-            "Отправь следующим сообщением ссылку на сообщество, например:\n"
-            "<code>https://vk.ru/it_vibe</code>\n\n"
-            "Бот проверит, что ключ принадлежит этому сообществу и имеет право «Стена». "
+            "<b>Добавление Teletype-блога</b>\n\n"
+            "Отправь следующим сообщением ссылку на блог, например:\n"
+            "<code>https://teletype.in/@itvibe</code>\n\n"
+            "Бот проверит, что подключённый аккаунт может публиковать в этом блоге. "
             "Токен и пароль сюда отправлять не нужно."
         )
         prompt = None
@@ -2159,7 +2240,7 @@ class EditorBot:
                             [
                                 InlineKeyboardButton(
                                     text="Отмена",
-                                    callback_data="targetvkcancel:0",
+                                    callback_data="targetteletypecancel:0",
                                 )
                             ]
                         ]
@@ -2177,7 +2258,7 @@ class EditorBot:
                         [
                             InlineKeyboardButton(
                                 text="Отмена",
-                                callback_data="targetvkcancel:0",
+                                callback_data="targetteletypecancel:0",
                             )
                         ]
                     ]
@@ -2188,7 +2269,7 @@ class EditorBot:
             chat_id,
             user_id,
             prompt,
-            VK_PUBLICATION_REQUEST,
+            TELETYPE_PUBLICATION_REQUEST,
         )
 
     async def _show_target_channel_help(
@@ -3162,29 +3243,29 @@ class EditorBot:
             )
             return
 
-        if kind == VK_PUBLICATION_REQUEST:
+        if kind == TELETYPE_PUBLICATION_REQUEST:
             value = (message.text or message.caption or "").strip()
             try:
-                parse_vk_group_name(value)
+                parse_teletype_blog_name(value)
             except ValueError as error:
                 await message.answer(f"{html.escape(str(error))}. Попробуй ещё раз.")
                 return
-            if not self.vk_publisher:
+            if not self.teletype_publisher:
                 await message.answer(
-                    "Авторизация VK не настроена. Не отправляй сюда токен — "
+                    "Авторизация Teletype не настроена. Не отправляй сюда токен — "
                     "его нужно ввести в Terminal на сервере."
                 )
                 return
-            progress = await message.answer("Проверяю сообщество и права ключа…")
+            progress = await message.answer("Проверяю блог и права аккаунта…")
             try:
-                group = await self.vk_publisher.resolve_group(value)
-                if not group.is_admin:
+                blog = await self.teletype_publisher.resolve_blog(value)
+                if not blog.can_publish:
                     raise ValueError(
-                        "Подключённый аккаунт VK не является администратором сообщества"
+                        "Подключённый аккаунт Teletype не может публиковать в этом блоге"
                     )
-            except (ValueError, VkApiError, httpx.HTTPError) as error:
+            except (ValueError, TeletypeApiError, httpx.HTTPError) as error:
                 logger.warning(
-                    "Could not add VK publication target: %s",
+                    "Could not add Teletype publication target: %s",
                     type(error).__name__,
                 )
                 try:
@@ -3192,15 +3273,15 @@ class EditorBot:
                 except TelegramBadRequest:
                     pass
                 await message.answer(
-                    "Не удалось подключить VK-сообщество.\n\n"
+                    "Не удалось подключить Teletype-блог.\n\n"
                     f"<code>{html.escape(str(error))}</code>\n\n"
-                    "Проверь ссылку, ID сообщества и права ключа."
+                    "Проверь ссылку, токен и права аккаунта."
                 )
                 return
-            target_id = await self._remember_vk_publication_channel(
-                group.group_id,
-                group.title,
-                group.screen_name,
+            target_id = await self._remember_teletype_publication_channel(
+                blog.blog_id,
+                blog.title,
+                blog.uri,
             )
             await self._select_publication_channel(target_id)
             await self.repository.clear_source_input_request(message.chat.id)
@@ -3208,7 +3289,7 @@ class EditorBot:
                 try:
                     await self.bot.delete_message(message.chat.id, message.message_id)
                 except TelegramBadRequest:
-                    logger.info("Could not delete VK group URL from editor channel")
+                    logger.info("Could not delete Teletype blog URL from editor channel")
             try:
                 await self.bot.delete_message(progress.chat.id, progress.message_id)
             except TelegramBadRequest:
@@ -4132,16 +4213,16 @@ class EditorBot:
                     callback.message.message_id,
                 )
             return
-        if action == "targetaddvk":
-            await callback.answer("Подключение VK")
+        if action == "targetaddteletype":
+            await callback.answer("Подключение Teletype")
             if callback.message:
-                await self._show_vk_target_add_flow(
+                await self._show_teletype_target_add_flow(
                     callback.message.chat.id,
                     user_id=callback.from_user.id,
                     message_id=callback.message.message_id,
                 )
             return
-        if action == "targetvkcancel":
+        if action == "targetteletypecancel":
             if callback.message:
                 await self.repository.clear_source_input_request(
                     callback.message.chat.id
@@ -5058,62 +5139,38 @@ class EditorBot:
             channel = await self._publication_channel(channel_id)
             target_message_id: int | None = None
             target_error: str | None = None
-            if channel and channel.get("kind") == "vk":
-                if not self.vk_publisher:
-                    target_error = "VK authorization is not configured"
+            if channel and channel.get("kind") == "teletype":
+                if not self.teletype_publisher:
+                    target_error = "Teletype authorization is not configured"
                 else:
-                    if self.vk_publisher.requires_photo_upload:
-                        if media.get("type") != "photo":
-                            target_error = "VK publication currently requires a photo"
-                            vk_media = None
-                        else:
-                            vk_media = await self._vk_media_bytes(media)
-                        if not vk_media and target_error is None:
-                            target_error = "Could not download the VK publication image"
-                    else:
-                        vk_media = (b"", "")
-                    if vk_media:
-                        content, filename = vk_media
-                        try:
-                            fallback_url = None
-                            if media.get("type") == "photo":
-                                fallback_url = str(
-                                    media.get("image_url")
-                                    or media.get("page_url")
-                                    or ""
-                                ).strip()
-                                if fallback_url.startswith("http://"):
-                                    fallback_url = "https://" + fallback_url[7:]
-                                if not fallback_url.startswith(
-                                    ("http://", "https://")
-                                ):
-                                    fallback_url = None
-                            if not fallback_url:
-                                fallback_url = next(
-                                    (
-                                        source.url
-                                        for source in sources
-                                        if source.linkable
-                                        and source.url.startswith(("http://", "https://"))
-                                    ),
-                                    None,
-                                )
-                            target_message_id = await self.vk_publisher.publish_photo(
-                                group_id=int(channel["group_id"]),
-                                message=render_vk_post(post, sources),
-                                content=content,
-                                filename=filename,
-                                guid=f"itvibe-{draft_id}-{channel['group_id']}",
-                                fallback_url=fallback_url,
+                    try:
+                        teletype_image = await self._teletype_image(draft, media)
+                        if not teletype_image:
+                            raise ValueError(
+                                "Не удалось подготовить изображение для Teletype"
                             )
-                        except (VkApiError, httpx.HTTPError, KeyError, ValueError) as error:
-                            logger.warning(
-                                "VK publication failed for draft %s in group %s: %s",
-                                draft_id,
-                                channel.get("group_id"),
-                                type(error).__name__,
-                            )
-                            target_error = str(error)
+                        article = await self.teletype_publisher.publish_article(
+                            blog_id=int(channel["blog_id"]),
+                            blog_uri=str(channel["username"]),
+                            article_uri=f"itvibe-{draft_id}",
+                            post=post,
+                            sources=sources,
+                            image=teletype_image,
+                        )
+                        target_message_id = article.article_id
+                    except (
+                        TeletypeApiError,
+                        httpx.HTTPError,
+                        KeyError,
+                        ValueError,
+                    ) as error:
+                        logger.warning(
+                            "Teletype publication failed for draft %s in blog %s: %s",
+                            draft_id,
+                            channel.get("blog_id"),
+                            type(error).__name__,
+                        )
+                        target_error = str(error)
             else:
                 file_value = await self._media_input(media)
                 sent = None
@@ -5470,29 +5527,76 @@ class EditorBot:
         content, filename = downloaded
         return BufferedInputFile(content, filename=filename)
 
-    async def _vk_media_bytes(
+    async def _teletype_image(
         self,
-        media: dict[str, Any] | None,
-    ) -> tuple[bytes, str] | None:
-        if not media or media.get("type") != "photo":
+        draft: dict[str, Any],
+        preferred_media: dict[str, Any] | None,
+    ) -> TeletypeImage | None:
+        if not self.teletype_publisher:
             return None
-        image_url = str(media.get("image_url") or "")
-        if image_url:
-            return await self.pipeline.extractor.download_image(image_url)
-        file_id = str(media.get("telegram_file_id") or "")
-        if not file_id:
-            return None
-        try:
-            telegram_file = await self.bot.get_file(file_id)
-            destination = io.BytesIO()
-            await self.bot.download_file(telegram_file.file_path, destination=destination)
-        except TelegramBadRequest:
-            return None
-        content = destination.getvalue()
-        if not content:
-            return None
-        filename = str(telegram_file.file_path or "image.jpg").rsplit("/", 1)[-1]
-        return content, filename or "image.jpg"
+        candidates = [
+            item
+            for item in [preferred_media, *draft.get("media", [])]
+            if item and item.get("type") == "photo"
+        ]
+        seen: set[tuple[str, str]] = set()
+        for media in candidates:
+            image_url = str(media.get("image_url") or "").strip()
+            file_id = str(media.get("telegram_file_id") or "").strip()
+            key = (image_url, file_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            if image_url.startswith(("http://", "https://")):
+                downloaded = await self.pipeline.extractor.download_image(image_url)
+                if downloaded:
+                    content, filename = downloaded
+                    content_type = (
+                        "image/png"
+                        if filename.casefold().endswith(".png")
+                        else "image/gif"
+                        if filename.casefold().endswith(".gif")
+                        else "image/jpeg"
+                    )
+                    try:
+                        return await self.teletype_publisher.upload_image(
+                            content,
+                            filename,
+                            content_type,
+                        )
+                    except (TeletypeApiError, httpx.HTTPError):
+                        logger.warning(
+                            "Could not mirror source image to Teletype; using source URL"
+                        )
+                return TeletypeImage(url=image_url)
+            if not file_id:
+                continue
+            try:
+                telegram_file = await self.bot.get_file(file_id)
+                destination = io.BytesIO()
+                await self.bot.download_file(
+                    telegram_file.file_path,
+                    destination=destination,
+                )
+            except TelegramBadRequest:
+                continue
+            content = destination.getvalue()
+            if not content:
+                continue
+            filename = str(telegram_file.file_path or "image.jpg").rsplit("/", 1)[-1]
+            content_type = (
+                "image/png"
+                if filename.casefold().endswith(".png")
+                else "image/gif"
+                if filename.casefold().endswith(".gif")
+                else "image/jpeg"
+            )
+            return await self.teletype_publisher.upload_image(
+                content,
+                filename or "image.jpg",
+                content_type,
+            )
+        return None
 
     @staticmethod
     def _rich_message(

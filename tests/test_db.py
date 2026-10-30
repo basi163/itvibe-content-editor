@@ -366,3 +366,55 @@ async def test_scheduled_drafts_are_returned_when_due(tmp_path: Path) -> None:
     assert await repository.next_scheduled_publication() == first_at
     scheduled_drafts = await repository.scheduled_drafts()
     assert [draft["id"] for draft in scheduled_drafts] == [draft_id]
+
+
+@pytest.mark.asyncio
+async def test_remove_publication_targets_cancels_only_removed_target(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    draft_id = await repository.create_draft(
+        origin_type="test",
+        origin_ref="migration",
+        title="Заголовок",
+        body="Текст",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+        sources=[],
+        media=[],
+        material={},
+        triage={},
+    )
+    removed_target = 8_000_000_000_000_042
+    remaining_target = -1002
+    scheduled_at = datetime(2026, 11, 1, 10, 0, tzinfo=UTC)
+    publications = [
+        {
+            "target_chat_id": removed_target,
+            "status": "scheduled",
+            "scheduled_at": scheduled_at.isoformat(),
+        },
+        {
+            "target_chat_id": remaining_target,
+            "status": "published",
+            "target_message_id": 55,
+        },
+    ]
+    await repository.update_draft(
+        draft_id,
+        status="scheduled",
+        target_chat_id=removed_target,
+        scheduled_at=scheduled_at.isoformat(),
+        publications_json=json.dumps(publications),
+    )
+
+    changed = await repository.remove_publication_targets({removed_target})
+    draft = await repository.get_draft(draft_id)
+
+    assert changed == 1
+    assert draft is not None
+    assert draft["status"] == "published"
+    assert draft["scheduled_at"] is None
+    assert draft["target_chat_id"] is None
+    assert draft["target_message_id"] == 55
+    assert draft["publications"] == [publications[1]]

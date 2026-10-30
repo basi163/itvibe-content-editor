@@ -456,6 +456,84 @@ class Repository:
             await db.execute(f"UPDATE drafts SET {columns} WHERE id = ?", values)
             await db.commit()
 
+    async def remove_publication_targets(self, target_ids: set[int]) -> int:
+        if not target_ids:
+            return 0
+        changed = 0
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT id, status, publications_json FROM drafts"
+            )
+            for row in await cursor.fetchall():
+                try:
+                    publications = json.loads(row["publications_json"] or "[]")
+                except (TypeError, ValueError):
+                    publications = []
+                remaining = [
+                    item
+                    for item in publications
+                    if int(item.get("target_chat_id") or 0) not in target_ids
+                ]
+                if len(remaining) == len(publications):
+                    continue
+                changed += 1
+                scheduled = [
+                    item for item in remaining if item.get("status") == "scheduled"
+                ]
+                scheduled_times = sorted(
+                    str(item["scheduled_at"])
+                    for item in scheduled
+                    if item.get("scheduled_at")
+                )
+                if scheduled:
+                    status = "scheduled"
+                elif any(item.get("status") == "failed" for item in remaining):
+                    status = "draft"
+                elif any(item.get("status") == "published" for item in remaining):
+                    status = "published"
+                else:
+                    status = "draft"
+                target_message_id = next(
+                    (
+                        int(item["target_message_id"])
+                        for item in remaining
+                        if item.get("target_message_id") is not None
+                    ),
+                    None,
+                )
+                await db.execute(
+                    """
+                    UPDATE drafts
+                    SET publications_json = ?, status = ?, scheduled_at = ?,
+                        target_chat_id = ?, target_message_id = ?,
+                        schedule_attempts = ?, schedule_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(remaining, ensure_ascii=False),
+                        status,
+                        scheduled_times[0] if scheduled_times else None,
+                        int(scheduled[0]["target_chat_id"]) if scheduled else None,
+                        target_message_id,
+                        max(
+                            (int(item.get("attempts") or 0) for item in remaining),
+                            default=0,
+                        ),
+                        next(
+                            (
+                                str(item["error"])
+                                for item in remaining
+                                if item.get("error")
+                            ),
+                            None,
+                        ),
+                        _now(),
+                        int(row["id"]),
+                    ),
+                )
+            await db.commit()
+        return changed
+
     async def recent_drafts(self, limit: int = 10) -> list[dict[str, Any]]:
         async with self.connect() as db:
             cursor = await db.execute(
