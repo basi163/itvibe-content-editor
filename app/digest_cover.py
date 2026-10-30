@@ -213,6 +213,8 @@ def _font(size: int, *, bold: bool = False, condensed: bool = False) -> ImageFon
     candidates = (
         f"/usr/share/fonts/truetype/dejavu/{family}{weight}.ttf",
         f"/usr/local/share/fonts/{family}{weight}.ttf",
+        f"/usr/share/fonts/truetype/dejavu/DejaVuSans{weight}.ttf",
+        f"/usr/local/share/fonts/DejaVuSans{weight}.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
     )
