@@ -98,6 +98,9 @@ PALETTES = {
     "technology": ((108, 255, 35), (0, 214, 90), (2, 11, 4)),
 }
 
+ORANGE = (255, 119, 22)
+RED = (239, 32, 45)
+
 POSES = ("thumbs", "excited", "alert", "thoughtful")
 TOPIC_POSE = {
     "security": "alert",
@@ -288,7 +291,7 @@ def _mascot(pose: str) -> Image.Image:
         image = image.crop(alpha_box)
     # Let the bust dominate the right side of the poster. Upscaling is
     # intentional: hands may overlap the story panel while copy stays above.
-    scale = min(950 / image.width, 760 / image.height)
+    scale = min(1160 / image.width, 880 / image.height)
     image = image.resize(
         (round(image.width * scale), round(image.height * scale)),
         Image.Resampling.LANCZOS,
@@ -339,12 +342,23 @@ def render_digest_cover(
     # Place the mascot below all typography so its enlarged hands and
     # shoulders can enter the copy area without hurting readability.
     mascot = _mascot(spec.pose)
-    shadow = mascot.getchannel("A").filter(ImageFilter.GaussianBlur(radius=24))
-    shadow_rgba = Image.new("RGBA", mascot.size, (0, 0, 0, 0))
-    shadow_rgba.putalpha(shadow.point(lambda value: min(150, value)))
-    mascot_x = width - mascot.width + 35
-    mascot_y = height - mascot.height + 20
-    canvas.alpha_composite(shadow_rgba, (mascot_x + 18, mascot_y + 24))
+    mascot_x = width - mascot.width + 8
+    mascot_y = height - mascot.height + 18
+
+    # Build the orange halo on a padded layer so the blur is not clipped at
+    # the tightly cropped edges of the mascot sprite.
+    glow_pad = 58
+    glow_size = (mascot.width + glow_pad * 2, mascot.height + glow_pad * 2)
+    glow_source = Image.new("L", glow_size, 0)
+    glow_source.paste(mascot.getchannel("A"), (glow_pad, glow_pad))
+    for radius, opacity in ((30, 85), (12, 165)):
+        glow_mask = glow_source.filter(ImageFilter.GaussianBlur(radius=radius))
+        glow_mask = glow_mask.point(
+            lambda value, limit=opacity: min(limit, round(value * limit / 255))
+        )
+        glow = Image.new("RGBA", glow_size, (*ORANGE, 0))
+        glow.putalpha(glow_mask)
+        canvas.alpha_composite(glow, (mascot_x - glow_pad, mascot_y - glow_pad))
     canvas.alpha_composite(mascot, (mascot_x, mascot_y))
 
     draw = ImageDraw.Draw(canvas, "RGBA")
@@ -357,17 +371,58 @@ def render_digest_cover(
     brand_font = _font(41, bold=True, condensed=True)
 
     title_polygon = ((38, 75), (912, 52), (947, 190), (16, 221))
+    title_glow = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))
+    title_glow_draw = ImageDraw.Draw(title_glow, "RGBA")
+    title_glow_draw.line(
+        (*title_polygon, title_polygon[0]),
+        fill=(*ORANGE, 235),
+        width=11,
+        joint="curve",
+    )
+    title_glow = title_glow.filter(ImageFilter.GaussianBlur(radius=10))
+    canvas.alpha_composite(title_glow)
+    draw = ImageDraw.Draw(canvas, "RGBA")
     draw.polygon(title_polygon, fill=(*accent, 248))
-    draw.text((54, 79), "ТЕХНОДАЙДЖЕСТ", font=title_font, fill=(4, 5, 7, 255), stroke_width=1)
+    draw.line(
+        (*title_polygon, title_polygon[0]),
+        fill=(*ORANGE, 255),
+        width=4,
+        joint="curve",
+    )
+    draw.text(
+        (54, 79),
+        "ТЕХНОДАЙДЖЕСТ",
+        font=title_font,
+        fill=(4, 5, 7, 255),
+        stroke_width=2,
+        stroke_fill=ORANGE,
+    )
 
     issue_text = spec.issue
     issue_width = _text_width(draw, issue_text, issue_font)
     badge_left = max(1265, width - issue_width - 84)
     badge = ((badge_left, 28), (width - 16, 8), (width - 42, 151), (badge_left - 31, 173))
-    draw.polygon(badge, fill=(*secondary, 245))
-    draw.text((badge_left + 18, 41), issue_text, font=issue_font, fill=(0, 8, 3, 255), stroke_width=1)
+    draw.polygon(badge, fill=(*RED, 250))
+    draw.text(
+        (badge_left + 18, 41),
+        issue_text,
+        font=issue_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+        stroke_fill=(105, 0, 8),
+    )
 
-    draw.rounded_rectangle((28, 238, 1006, 730), radius=20, fill=(2, 3, 6, 218), outline=(*accent, 95), width=2)
+    story_panel = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))
+    story_panel_draw = ImageDraw.Draw(story_panel, "RGBA")
+    story_panel_draw.rounded_rectangle(
+        (28, 238, 1006, 730),
+        radius=20,
+        fill=(2, 3, 6, 128),
+        outline=(*accent, 155),
+        width=2,
+    )
+    canvas.alpha_composite(story_panel)
+    draw = ImageDraw.Draw(canvas, "RGBA")
     y = 262
     for index, headline in enumerate(spec.headlines[:6], start=1):
         number_box = (48, y + 2, 91, y + 44)
@@ -404,10 +459,10 @@ def render_digest_cover(
     draw.rounded_rectangle((28, 749, 1006, 817), radius=14, fill=(0, 0, 0, 218), outline=(*secondary, 110), width=2)
     draw.text((55, 764), labels, font=label_font, fill=(*secondary, 255))
 
-    draw.polygon(((27, 839), (458, 825), (484, 891), (16, 897)), fill=(*accent, 245))
+    draw.polygon(((27, 839), (458, 825), (484, 891), (16, 897)), fill=(*RED, 250))
     draw.rectangle((54, 850, 87, 883), fill=(0, 9, 3, 255))
-    draw.rectangle((62, 858, 79, 875), fill=(*accent, 255))
-    draw.text((104, 836), "IT Vibe News", font=brand_font, fill=(0, 9, 3, 255))
+    draw.rectangle((62, 858, 79, 875), fill=(255, 255, 255, 255))
+    draw.text((104, 836), "IT Vibe News", font=brand_font, fill=(255, 255, 255, 255))
 
     output = io.BytesIO()
     canvas.convert("RGB").save(output, format="JPEG", quality=91, optimize=True, progressive=True)

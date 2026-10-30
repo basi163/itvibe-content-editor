@@ -55,8 +55,8 @@ def test_digest_palettes_use_matrix_green_accents() -> None:
 def test_mascot_is_scaled_to_dominate_the_right_side() -> None:
     mascot = _mascot("excited")
 
-    assert mascot.width >= 900
-    assert mascot.height >= 500
+    assert mascot.width >= 1_100
+    assert mascot.height >= 650
 
 
 def test_digest_cover_renders_publishable_jpeg() -> None:
