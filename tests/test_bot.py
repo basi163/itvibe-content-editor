@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.enums import ChatType
 from aiogram.types import InputMediaPhoto, InputMediaVideo
 
 from app.bot import (
@@ -126,7 +127,68 @@ def test_home_keyboard_opens_every_main_section() -> None:
         "schedule:0",
         "targetmenu:0",
         "sources:0",
+        "writerules:0",
     }
+
+
+@pytest.mark.asyncio
+async def test_editorial_rules_menu_shows_current_rules() -> None:
+    editor = object.__new__(EditorBot)
+    editor.repository = SimpleNamespace(
+        get_setting=AsyncMock(return_value="Больше конкретики, меньше вводных фраз.")
+    )
+    editor.bot = SimpleNamespace(edit_message_text=AsyncMock())
+
+    await editor._show_editorial_rules_menu(-1001, message_id=55)
+
+    call = editor.bot.edit_message_text.await_args
+    assert "Больше конкретики" in call.kwargs["text"]
+    callbacks = {
+        button.callback_data
+        for row in call.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    }
+    assert callbacks == {
+        "writerulesedit:0",
+        "writerulesreset:0",
+        "home:0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_editorial_rules_input_is_saved_instead_of_becoming_a_post() -> None:
+    editor = object.__new__(EditorBot)
+    editor.repository = SimpleNamespace(
+        set_setting=AsyncMock(),
+        clear_source_input_request=AsyncMock(),
+    )
+    editor.bot = SimpleNamespace(delete_message=AsyncMock())
+    editor._show_editorial_rules_menu = AsyncMock()
+    message = SimpleNamespace(
+        text="Не начинай абзацы с общих выводов.",
+        caption=None,
+        chat=SimpleNamespace(id=-1001, type=ChatType.CHANNEL),
+        message_id=77,
+        answer=AsyncMock(),
+    )
+    request = {
+        "kind": "editorial_rewrite_rules",
+        "user_id": 9,
+        "prompt_message_id": 55,
+    }
+
+    await editor._consume_source_input(message, request)
+
+    editor.repository.set_setting.assert_awaited_once_with(
+        "editorial_rewrite_rules",
+        "Не начинай абзацы с общих выводов.",
+    )
+    editor.repository.clear_source_input_request.assert_awaited_once_with(-1001)
+    editor.bot.delete_message.assert_awaited_once_with(-1001, 77)
+    editor._show_editorial_rules_menu.assert_awaited_once_with(
+        -1001,
+        message_id=55,
+    )
 
 
 @pytest.mark.asyncio
@@ -508,6 +570,29 @@ async def test_plain_editorial_channel_post_is_queued_without_relevance_filter()
         -1001234567890,
         124,
     )
+
+
+@pytest.mark.asyncio
+async def test_bot_draft_cannot_be_consumed_as_editorial_rules_input() -> None:
+    editor = object.__new__(EditorBot)
+    editor.repository = SimpleNamespace(
+        get_setting=AsyncMock(return_value="-1001234567890"),
+        get_source_input_request=AsyncMock(
+            return_value={"kind": "editorial_rewrite_rules"}
+        ),
+    )
+    editor._consume_source_input = AsyncMock()
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001234567890),
+        message_id=500,
+        reply_markup=SimpleNamespace(inline_keyboard=[]),
+        forward_origin=None,
+    )
+
+    await editor._editor_channel_post(message)
+
+    editor.repository.get_source_input_request.assert_not_awaited()
+    editor._consume_source_input.assert_not_awaited()
 
 
 @pytest.mark.asyncio

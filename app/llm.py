@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,6 +23,7 @@ from app.prompts import (
     IMAGE_SEARCH_PROMPT,
     REPAIR_SYSTEM_PROMPT,
     TRIAGE_SYSTEM_PROMPT,
+    append_editorial_rules,
     render_digest_writer_system_prompt,
     render_writer_system_prompt,
 )
@@ -126,11 +128,19 @@ class QwenClient:
         triage_model: str,
         writer_model: str,
         max_post_chars: int,
+        editorial_rules_provider: Callable[[], Awaitable[str | None]] | None = None,
     ) -> None:
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=90, max_retries=2)
         self.triage_model = triage_model
         self.writer_model = writer_model
         self.max_post_chars = max_post_chars
+        self.editorial_rules_provider = editorial_rules_provider
+
+    async def _editorial_rules(self) -> str:
+        if self.editorial_rules_provider is None:
+            return ""
+        value = await self.editorial_rules_provider()
+        return str(value or "").strip()[:3000]
 
     async def _completion(
         self,
@@ -290,7 +300,8 @@ class QwenClient:
         triage: TriageDecision,
     ) -> GeneratedPost:
         content_limit = self.max_post_chars - 2 - len(SIGNATURE_TEXT)
-        system = render_writer_system_prompt(content_limit)
+        editorial_rules = await self._editorial_rules()
+        system = render_writer_system_prompt(content_limit, editorial_rules)
         if candidate.force_editorial:
             linkable_indices = set(triage.linkable_source_indices)
             linkable_sources = []
@@ -339,7 +350,12 @@ class QwenClient:
             normalized_errors = validate_post(normalized, self.max_post_chars)
             if not normalized_errors:
                 return normalized
-            post = await self.repair(normalized, sources, normalized_errors)
+            post = await self.repair(
+                normalized,
+                sources,
+                normalized_errors,
+                editorial_rules=editorial_rules,
+            )
         return post
 
     async def generate_digest(
@@ -349,6 +365,7 @@ class QwenClient:
         triage: TriageDecision,
     ) -> GeneratedPost:
         content_limit = self.max_post_chars - 2 - len(SIGNATURE_TEXT)
+        editorial_rules = await self._editorial_rules()
         payload = {
             "candidate": candidate.to_dict(),
             "editorial_decision": triage.to_dict(),
@@ -356,7 +373,10 @@ class QwenClient:
         }
         data = await self._completion(
             model=self.writer_model,
-            system=render_digest_writer_system_prompt(content_limit),
+            system=render_digest_writer_system_prompt(
+                content_limit,
+                editorial_rules,
+            ),
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.45,
             max_tokens=3200,
@@ -380,7 +400,12 @@ class QwenClient:
             )
             if not normalized_errors:
                 return normalized
-            return await self.repair_digest(normalized, sources, normalized_errors)
+            return await self.repair_digest(
+                normalized,
+                sources,
+                normalized_errors,
+                editorial_rules=editorial_rules,
+            )
         return post
 
     async def search_images(
@@ -459,6 +484,7 @@ class QwenClient:
         if component not in {"title", "hashtags"}:
             raise ValueError(f"Unsupported post component: {component}")
 
+        editorial_rules = await self._editorial_rules()
         title_character_limit = _title_character_limit(post, self.max_post_chars)
         max_source_links = _source_link_limit(triage)
         remaining: list[str] = []
@@ -478,7 +504,10 @@ class QwenClient:
             }
             data = await self._completion(
                 model=self.writer_model,
-                system=COMPONENT_REWRITE_SYSTEM_PROMPT,
+                system=append_editorial_rules(
+                    COMPONENT_REWRITE_SYSTEM_PROMPT,
+                    editorial_rules,
+                ),
                 user=json.dumps(payload, ensure_ascii=False),
                 temperature=0.7,
                 max_tokens=500,
@@ -562,6 +591,8 @@ class QwenClient:
         post: GeneratedPost,
         sources: list[SourceDocument],
         errors: list[str],
+        *,
+        editorial_rules: str = "",
     ) -> GeneratedPost:
         current = post
         remaining = errors
@@ -576,7 +607,10 @@ class QwenClient:
             }
             data = await self._completion(
                 model=self.writer_model,
-                system=REPAIR_SYSTEM_PROMPT,
+                system=append_editorial_rules(
+                    REPAIR_SYSTEM_PROMPT,
+                    editorial_rules,
+                ),
                 user=json.dumps(payload, ensure_ascii=False),
                 temperature=0.15,
                 max_tokens=2600,
@@ -601,6 +635,8 @@ class QwenClient:
         post: GeneratedPost,
         sources: list[SourceDocument],
         errors: list[str],
+        *,
+        editorial_rules: str = "",
     ) -> GeneratedPost:
         current = post
         remaining = errors
@@ -615,7 +651,10 @@ class QwenClient:
             }
             data = await self._completion(
                 model=self.writer_model,
-                system=DIGEST_REPAIR_SYSTEM_PROMPT,
+                system=append_editorial_rules(
+                    DIGEST_REPAIR_SYSTEM_PROMPT,
+                    editorial_rules,
+                ),
                 user=json.dumps(payload, ensure_ascii=False),
                 temperature=0.15,
                 max_tokens=3000,

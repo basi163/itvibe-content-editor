@@ -251,15 +251,18 @@ async def test_fact_check_evidence_is_grounded_in_downloaded_pages() -> None:
     assert result.source_urls == ["https://company.example/news"]
 
 
-
 @pytest.mark.asyncio
 async def test_editorial_writer_only_receives_verified_material() -> None:
+    async def editorial_rules_provider() -> str:
+        return "Пиши короткими предложениями."
+
     client = QwenClient(
         api_key="test",
         base_url="https://example.com/v1",
         triage_model="triage",
         writer_model="writer",
         max_post_chars=2000,
+        editorial_rules_provider=editorial_rules_provider,
     )
     request: dict[str, Any] = {}
 
@@ -313,7 +316,7 @@ async def test_editorial_writer_only_receives_verified_material() -> None:
     assert payload["linkable_sources"][0]["index"] == 1
     assert "candidate" not in payload
     assert "Непроверенное утверждение" not in request["user"]
-
+    assert "Пиши короткими предложениями." in request["system"]
 
 
 @pytest.mark.asyncio

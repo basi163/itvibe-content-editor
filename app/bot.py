@@ -62,6 +62,9 @@ PUBLICATION_CHANNELS_SETTING = "publication_channels"
 SELECTED_PUBLICATION_CHANNELS_SETTING = "selected_publication_channels"
 PUBLICATION_SCHEDULES_SETTING = "publication_schedules"
 PUBLICATION_SCHEDULE_DAYS_SETTING = "publication_schedule_days"
+EDITORIAL_REWRITE_RULES_SETTING = "editorial_rewrite_rules"
+EDITORIAL_REWRITE_RULES_REQUEST = "editorial_rewrite_rules"
+MAX_EDITORIAL_REWRITE_RULES_CHARS = 3000
 WEEKDAY_NAMES = (
     "понедельник",
     "вторник",
@@ -553,6 +556,12 @@ class EditorBot:
                 ],
                 [
                     InlineKeyboardButton(
+                        text="✍️ Правила переписывания",
+                        callback_data="writerules:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
                         text="🔄 Обновить статус",
                         callback_data="home:0",
                     )
@@ -651,6 +660,72 @@ class EditorBot:
                 return
             except TelegramBadRequest:
                 logger.info("Could not open home menu in place; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_editorial_rules_menu(
+        self,
+        chat_id: int,
+        *,
+        message_id: int | None = None,
+    ) -> None:
+        rules = (
+            await self.repository.get_setting(EDITORIAL_REWRITE_RULES_SETTING)
+            or ""
+        ).strip()
+        if rules:
+            status = (
+                "<b>Дополнительные правила включены</b>\n\n"
+                f"{html.escape(rules)}"
+            )
+        else:
+            status = (
+                "<b>Дополнительные правила не заданы.</b>\n"
+                "Qwen использует базовые правила редакции."
+            )
+        text = (
+            "<b>✍️ Правила переписывания Qwen</b>\n\n"
+            f"{status}\n\n"
+            "Они применяются ко всем новым обычным постам и дайджестам. "
+            "Базовые ограничения по фактам, ссылкам, хэштегам и формату "
+            "остаются обязательными. Уже созданные черновики не изменятся."
+        )
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить правила",
+                    callback_data="writerulesedit:0",
+                )
+            ]
+        ]
+        if rules:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="↩️ Вернуть базовые",
+                        callback_data="writerulesreset:0",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Назад в главное меню",
+                    callback_data="home:0",
+                )
+            ]
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not update editorial rules menu in place")
         await self.bot.send_message(chat_id, text, reply_markup=keyboard)
 
     async def _editor_keyboard_for(
@@ -2717,13 +2792,13 @@ class EditorBot:
         editor_chat_id = await self.repository.get_setting("editor_chat_id")
         if not editor_chat_id or message.chat.id != int(editor_chat_id):
             return
+        if getattr(message, "reply_markup", None) and not message.forward_origin:
+            return
         request = await self.repository.get_source_input_request(message.chat.id)
         if request:
             if message.message_id == request.get("prompt_message_id"):
                 return
             await self._consume_source_input(message, request)
-            return
-        if getattr(message, "reply_markup", None) and not message.forward_origin:
             return
         if await self.repository.get_draft_by_editor_message(
             message.chat.id,
@@ -2857,6 +2932,39 @@ class EditorBot:
         request: dict[str, Any],
     ) -> None:
         kind = str(request.get("kind") or "telegram_web")
+        if kind == EDITORIAL_REWRITE_RULES_REQUEST:
+            value = (message.text or message.caption or "").strip()
+            if not value:
+                await message.answer(
+                    "Правила не могут быть пустыми. Отправь их одним "
+                    "текстовым сообщением."
+                )
+                return
+            if len(value) > MAX_EDITORIAL_REWRITE_RULES_CHARS:
+                await message.answer(
+                    "Правила слишком длинные. Сократи их до "
+                    f"{MAX_EDITORIAL_REWRITE_RULES_CHARS} знаков."
+                )
+                return
+            await self.repository.set_setting(
+                EDITORIAL_REWRITE_RULES_SETTING,
+                value,
+            )
+            await self.repository.clear_source_input_request(message.chat.id)
+            if message.chat.type == ChatType.CHANNEL:
+                try:
+                    await self.bot.delete_message(
+                        message.chat.id,
+                        message.message_id,
+                    )
+                except TelegramBadRequest:
+                    logger.info("Could not delete editorial rules input post")
+            await self._show_editorial_rules_menu(
+                message.chat.id,
+                message_id=request.get("prompt_message_id"),
+            )
+            return
+
         manager = self.rss_sources if kind == "rss" else self.telegram_sources
         if not manager:
             await message.answer("Этот тип источников сейчас недоступен.")
@@ -3462,6 +3570,71 @@ class EditorBot:
             valid = len(parts) == 2 and parts[1].isdigit()
         if not valid:
             await callback.answer("Некорректная команда", show_alert=True)
+            return
+
+        rules_actions = {
+            "writerules",
+            "writerulesedit",
+            "writerulesreset",
+            "writerulescancel",
+        }
+        if action in rules_actions:
+            if not callback.message:
+                await callback.answer("Сообщение меню не найдено", show_alert=True)
+                return
+            chat_id = callback.message.chat.id
+            message_id = callback.message.message_id
+            if action == "writerules":
+                await callback.answer("Открываю правила")
+                await self._show_editorial_rules_menu(
+                    chat_id,
+                    message_id=None if source_draft else message_id,
+                )
+                return
+            if action == "writerulesedit":
+                await callback.answer("Жду новые правила")
+                await self.bot.edit_message_text(
+                    text=(
+                        "<b>Изменение правил переписывания</b>\n\n"
+                        "Отправь следующим сообщением полный новый набор "
+                        "дополнительных правил. Прежний набор будет заменён целиком.\n\n"
+                        "Можно писать обычным текстом или списком. "
+                        f"Лимит — {MAX_EDITORIAL_REWRITE_RULES_CHARS} знаков. "
+                        "Не вставляй сюда пароли или API-ключи."
+                    ),
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="Отмена",
+                                    callback_data="writerulescancel:0",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+                await self.repository.set_source_input_request(
+                    chat_id,
+                    callback.from_user.id,
+                    message_id,
+                    EDITORIAL_REWRITE_RULES_REQUEST,
+                )
+                return
+            await self.repository.clear_source_input_request(chat_id)
+            if action == "writerulesreset":
+                await self.repository.set_setting(
+                    EDITORIAL_REWRITE_RULES_SETTING,
+                    "",
+                )
+                await callback.answer("Базовые правила восстановлены")
+            else:
+                await callback.answer("Изменение отменено")
+            await self._show_editorial_rules_menu(
+                chat_id,
+                message_id=message_id,
+            )
             return
 
         source_actions = {

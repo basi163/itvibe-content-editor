@@ -1,7 +1,10 @@
 import pytest
 
 from app.models import GeneratedPost, SourceDocument
-from app.prompts import render_writer_system_prompt
+from app.prompts import (
+    render_digest_writer_system_prompt,
+    render_writer_system_prompt,
+)
 from app.renderer import (
     SIGNATURE_TEXT,
     SIGNATURE_URL,
@@ -288,6 +291,18 @@ def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
 
     assert "{max_chars}" not in prompt
     assert '"title": ""' in prompt
+
+
+def test_writer_prompts_append_editorial_rules_after_required_rules() -> None:
+    rule = "Начинай второй абзац с практического следствия."
+
+    ordinary = render_writer_system_prompt(2000, rule)
+    digest = render_digest_writer_system_prompt(2000, rule)
+
+    for prompt in (ordinary, digest):
+        assert rule in prompt
+        assert "Дополнительные редакционные правила" in prompt
+        assert "приоритет имеют жесткие правила" in prompt
 
 
 def test_renderer_does_not_link_non_primary_source() -> None:

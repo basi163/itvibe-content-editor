@@ -121,8 +121,13 @@ be rotated after verification.
 - Ordinary unpublished drafts are retained in SQLite for 30 days from creation and then
   removed by a daily cleanup task. Scheduled drafts and drafts with any successful
   publication are preserved even if their aggregate status is inconsistent. Cleanup never
-  edits or deletes Telegram messages. Content-sanitizing feature commit `162558b`,
-  124 tests passing.
+  edits or deletes Telegram messages. Content-sanitizing feature commit `162558b`.
+- The editorial-channel home menu includes `✍️ Правила переписывания`.
+  An editor can view, replace or reset the global additional Qwen writing rules directly
+  in the channel. The next channel message is stored as configuration rather than processed
+  as a story. Rules apply to new ordinary posts, digests, repairs and generated title or
+  hashtag alternatives; existing drafts remain unchanged. Built-in factual, source-link,
+  language, hashtag and formatting constraints always take priority. 131 tests passing.
 
 ## Completion criteria
 

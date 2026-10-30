@@ -181,8 +181,25 @@ WRITER_SYSTEM_PROMPT = """
 """.strip()
 
 
-def render_writer_system_prompt(max_chars: int) -> str:
-    return WRITER_SYSTEM_PROMPT.replace("{max_chars}", str(max_chars))
+def append_editorial_rules(prompt: str, editorial_rules: str = "") -> str:
+    rules = editorial_rules.strip()
+    if not rules:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "Дополнительные редакционные правила\n"
+        "Соблюдай их для стиля и формулировок. Если они противоречат "
+        "жестким правилам выше, приоритет имеют жесткие правила.\n"
+        f"{rules}"
+    )
+
+
+def render_writer_system_prompt(
+    max_chars: int,
+    editorial_rules: str = "",
+) -> str:
+    prompt = WRITER_SYSTEM_PROMPT.replace("{max_chars}", str(max_chars))
+    return append_editorial_rules(prompt, editorial_rules)
 
 
 DIGEST_WRITER_SYSTEM_PROMPT = """
@@ -221,8 +238,12 @@ DIGEST_WRITER_SYSTEM_PROMPT = """
 """.strip()
 
 
-def render_digest_writer_system_prompt(max_chars: int) -> str:
-    return DIGEST_WRITER_SYSTEM_PROMPT.replace("{max_chars}", str(max_chars))
+def render_digest_writer_system_prompt(
+    max_chars: int,
+    editorial_rules: str = "",
+) -> str:
+    prompt = DIGEST_WRITER_SYSTEM_PROMPT.replace("{max_chars}", str(max_chars))
+    return append_editorial_rules(prompt, editorial_rules)
 
 
 REPAIR_SYSTEM_PROMPT = """

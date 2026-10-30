@@ -157,6 +157,9 @@ async def main() -> None:
         triage_model=settings.triage_model,
         writer_model=settings.writer_model,
         max_post_chars=settings.max_post_chars,
+        editorial_rules_provider=lambda: repository.get_setting(
+            "editorial_rewrite_rules"
+        ),
     )
     pipeline = ContentPipeline(
         settings=settings,
