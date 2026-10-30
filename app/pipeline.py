@@ -5,10 +5,16 @@ import hashlib
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from app.config import Settings
 from app.db import Repository
+from app.digest_cover import (
+    build_digest_cover_spec,
+    cover_filename,
+    render_digest_cover,
+)
 from app.extractor import (
     ArticleExtractor,
     is_known_secondary_url,
@@ -201,6 +207,14 @@ class ContentPipeline:
             max_source_links=_source_link_limit(triage),
         )
         media = self._media_candidates(candidate, sources, triage)
+        if is_digest:
+            cover = await self._create_digest_cover_media(
+                candidate,
+                post,
+                media,
+            )
+            if cover:
+                media = [cover, *media]
         if not media:
             media = await self._contextual_media(candidate, sources, triage, post)
         if not media:
@@ -449,6 +463,25 @@ class ContentPipeline:
         sources = [SourceDocument.from_dict(item) for item in draft["material"]["sources"]]
         triage = TriageDecision.from_dict(draft["triage"])
         post = GeneratedPost(draft["title"], draft["body"], draft["hashtags"])
+        if triage.category == "digest":
+            variation = sum(
+                1
+                for item in media
+                if item.get("provider") == "itvibe_digest_cover"
+            )
+            cover = await self._create_digest_cover_media(
+                candidate,
+                post,
+                media,
+                variation=variation,
+            )
+            if cover:
+                await self.repository.update_draft(
+                    draft_id,
+                    media_json=_json([cover, *media]),
+                    preview_index=0,
+                )
+                return True
         existing_urls = {
             normalize_url(str(item.get("image_url") or ""))
             for item in media
@@ -489,6 +522,62 @@ class ContentPipeline:
             return True
         return await self._select_existing_media_fallback(draft_id, draft)
 
+    async def _create_digest_cover_media(
+        self,
+        candidate: StoryCandidate,
+        post: GeneratedPost,
+        media: list[dict[str, Any]],
+        *,
+        variation: int = 0,
+    ) -> dict[str, Any] | None:
+        database_path = getattr(self.settings, "database_path", None)
+        if not database_path:
+            return None
+
+        backdrop_urls = list(
+            dict.fromkeys(
+                str(item.get("image_url") or "").strip()
+                for item in media
+                if str(item.get("image_url") or "").startswith(("http://", "https://"))
+            )
+        )
+        backdrops: list[bytes] = []
+        for image_url in backdrop_urls[:4]:
+            try:
+                downloaded = await self.extractor.download_image(image_url)
+            except Exception:  # noqa: BLE001 - an optional backdrop must not reject the digest
+                logger.info("Digest backdrop could not be downloaded: %s", image_url)
+                continue
+            if downloaded and len(downloaded[0]) >= 8_000:
+                backdrops.append(downloaded[0])
+
+        try:
+            spec = build_digest_cover_spec(
+                candidate.title,
+                post,
+                variation=variation,
+            )
+            content = await asyncio.to_thread(render_digest_cover, spec, backdrops)
+            cover_dir = Path(database_path).parent / "covers"
+            await asyncio.to_thread(cover_dir.mkdir, parents=True, exist_ok=True)
+            path = cover_dir / cover_filename(spec, post, variation)
+            await asyncio.to_thread(path.write_bytes, content)
+        except Exception:
+            logger.exception("Could not generate IT Vibe digest cover")
+            return None
+
+        return {
+            "type": "photo",
+            "telegram_file_id": None,
+            "page_url": candidate.origin_ref,
+            "image_url": None,
+            "local_path": str(path),
+            "provider": "itvibe_digest_cover",
+            "cover_topic": spec.topic,
+            "cover_pose": spec.pose,
+            "cover_issue": spec.issue,
+        }
+
     async def _select_existing_media_fallback(
         self,
         draft_id: int,
@@ -513,6 +602,10 @@ class ContentPipeline:
         )
         for index, item in choices:
             if item.get("telegram_file_id"):
+                await self.repository.update_draft(draft_id, preview_index=index)
+                return True
+            local_path = str(item.get("local_path") or "").strip()
+            if local_path and Path(local_path).is_file():
                 await self.repository.update_draft(draft_id, preview_index=index)
                 return True
             image_url = normalize_url(str(item.get("image_url") or ""))

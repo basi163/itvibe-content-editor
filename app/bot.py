@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -5538,6 +5539,14 @@ class EditorBot:
             return None
         if media.get("telegram_file_id"):
             return str(media["telegram_file_id"])
+        local_path = self._trusted_local_media_path(media)
+        if local_path:
+            try:
+                content = await asyncio.to_thread(local_path.read_bytes)
+            except OSError:
+                logger.warning("Local media file is unavailable: %s", local_path.name)
+            else:
+                return BufferedInputFile(content, filename=local_path.name)
         image_url = str(media.get("image_url") or "")
         if not image_url:
             return None
@@ -5546,6 +5555,17 @@ class EditorBot:
             return None
         content, filename = downloaded
         return BufferedInputFile(content, filename=filename)
+
+    def _trusted_local_media_path(self, media: dict[str, Any]) -> Path | None:
+        value = str(media.get("local_path") or "").strip()
+        if not value:
+            return None
+        path = Path(value).resolve()
+        data_root = self.settings.database_path.parent.resolve()
+        if path == data_root or data_root not in path.parents:
+            logger.warning("Ignoring local media path outside the data directory")
+            return None
+        return path
 
     async def _teletype_image(
         self,
@@ -5559,14 +5579,30 @@ class EditorBot:
             for item in [preferred_media, *draft.get("media", [])]
             if item and item.get("type") == "photo"
         ]
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for media in candidates:
             image_url = str(media.get("image_url") or "").strip()
             file_id = str(media.get("telegram_file_id") or "").strip()
-            key = (image_url, file_id)
+            local_path = self._trusted_local_media_path(media)
+            key = (image_url, file_id, str(local_path or ""))
             if key in seen:
                 continue
             seen.add(key)
+            if local_path:
+                try:
+                    content = await asyncio.to_thread(local_path.read_bytes)
+                except OSError:
+                    continue
+                content_type = (
+                    "image/png"
+                    if local_path.suffix.casefold() == ".png"
+                    else "image/jpeg"
+                )
+                return await self.teletype_publisher.upload_image(
+                    content,
+                    local_path.name,
+                    content_type,
+                )
             if image_url.startswith(("http://", "https://")):
                 downloaded = await self.pipeline.extractor.download_image(image_url)
                 if downloaded:

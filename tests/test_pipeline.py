@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,9 @@ def test_telegram_digest_detection_requires_multiple_links_and_digest_shape() ->
 
 
 @pytest.mark.asyncio
-async def test_telegram_digest_uses_direct_links_and_skips_regular_triage() -> None:
+async def test_telegram_digest_uses_direct_links_and_skips_regular_triage(
+    tmp_path: Path,
+) -> None:
     urls = [
         "https://media.example/one",
         "https://company.example/two",
@@ -52,6 +55,9 @@ async def test_telegram_digest_uses_direct_links_and_skips_regular_triage() -> N
             assert source_urls == urls
             assert limit == 10
             return [SourceDocument(url=url, title=f"Source {index}") for index, url in enumerate(urls)]
+
+        async def download_image(self, _: str) -> None:
+            return None
 
     class Llm:
         async def triage(self, *_: object) -> TriageDecision:
@@ -85,7 +91,11 @@ async def test_telegram_digest_uses_direct_links_and_skips_regular_triage() -> N
 
     repository = Repository()
     pipeline = ContentPipeline(
-        settings=SimpleNamespace(relevance_threshold=0.72, max_post_chars=2000),
+        settings=SimpleNamespace(
+            relevance_threshold=0.72,
+            max_post_chars=2000,
+            database_path=tmp_path / "editor.sqlite3",
+        ),
         repository=repository,
         extractor=Extractor(),
         llm=Llm(),
@@ -103,6 +113,10 @@ async def test_telegram_digest_uses_direct_links_and_skips_regular_triage() -> N
     assert repository.created is not None
     assert repository.created["triage"]["category"] == "digest"  # type: ignore[index]
     assert all(source["linkable"] for source in repository.created["sources"])  # type: ignore[union-attr]
+    media = repository.created["media"]
+    assert isinstance(media, list)
+    assert media[0]["provider"] == "itvibe_digest_cover"
+    assert Path(media[0]["local_path"]).is_file()
 
 
 def test_article_image_is_preferred_over_official_site_card() -> None:
