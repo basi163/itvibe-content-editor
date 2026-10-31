@@ -346,8 +346,8 @@ def render_digest_cover(
     # Place the mascot below all typography so its enlarged hands and
     # shoulders can enter the copy area without hurting readability.
     mascot = _mascot(spec.pose)
-    # Crop the mascot deliberately at the right edge. The face sits below the
-    # issue badge while only the near hand reaches into the story panel.
+    # Crop the mascot deliberately at the right edge. The face remains the
+    # visual anchor while only the near hand reaches into the story panel.
     mascot_x = width - mascot.width + 268
     mascot_y = height - mascot.height + 18
 
@@ -373,7 +373,6 @@ def render_digest_cover(
     title_font = _font(94, bold=True, condensed=True)
     headline_font = _font(31, bold=True, condensed=True)
     label_font = _font(27, bold=True, condensed=True)
-    issue_font = _font(76, bold=True, condensed=True)
     brand_font = _font(41, bold=True, condensed=True)
 
     title_polygon = ((38, 75), (1060, 49), (1094, 190), (16, 221))
@@ -402,20 +401,6 @@ def render_digest_cover(
         fill=(4, 5, 7, 255),
         stroke_width=1,
         stroke_fill=(4, 5, 7),
-    )
-
-    issue_text = spec.issue
-    issue_width = _text_width(draw, issue_text, issue_font)
-    badge_left = max(1265, width - issue_width - 84)
-    badge = ((badge_left, 28), (width - 16, 8), (width - 42, 151), (badge_left - 31, 173))
-    draw.polygon(badge, fill=(*RED, 250))
-    draw.text(
-        (badge_left + 18, 41),
-        issue_text,
-        font=issue_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-        stroke_fill=(105, 0, 8),
     )
 
     story_panel = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))

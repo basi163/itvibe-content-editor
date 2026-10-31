@@ -93,3 +93,7 @@ def test_digest_cover_renders_publishable_jpeg() -> None:
     assert image.format == "JPEG"
     assert image.size == COVER_SIZE
     assert len(content) > 50_000
+    # The issue number remains internal metadata but is intentionally omitted
+    # from the artwork so independently sourced digests cannot look misnumbered.
+    red, green, blue = image.getpixel((1500, 80))
+    assert not (red > 180 and red > green * 1.8 and red > blue * 1.4)
