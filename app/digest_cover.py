@@ -12,7 +12,7 @@ from app.models import GeneratedPost
 from app.renderer import SOURCE_MARKER_RE
 
 COVER_SIZE = (1600, 900)
-MASCOT_SHEET = Path(__file__).with_name("assets") / "itvibe_mascot_sheet.png"
+MASCOT_SHEET = Path(__file__).with_name("assets") / "itvibe_mascot_sheet_orange.png"
 ISSUE_RE = re.compile(r"(?:#|№)\s*(\d{1,4})")
 ITEM_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[0-9]\ufe0f?\u20e3)\s*")
 SPACE_RE = re.compile(r"\s+")
@@ -297,19 +297,10 @@ def _mascot(pose: str) -> Image.Image:
         Image.Resampling.LANCZOS,
     )
 
-    # The source portraits have green rim light baked into the clothing and
-    # head. Replace those reflected highlights with the poster's warm orange
-    # accent while preserving neutral blacks, whites and skin-independent
-    # mascot details.
-    recolored = bytearray(image.tobytes())
-    for offset in range(0, len(recolored), 4):
-        red, green, blue, _alpha = recolored[offset : offset + 4]
-        if green > red + 16 and green > blue + 10 and green > 34:
-            intensity = max(red, green, blue)
-            recolored[offset] = intensity
-            recolored[offset + 1] = round(intensity * ORANGE[1] / 255)
-            recolored[offset + 2] = round(intensity * ORANGE[2] / 255)
-    return Image.frombytes("RGBA", image.size, bytes(recolored))
+    # The production sprite already contains material-aware orange rim and
+    # bounce light. Keep it intact instead of flattening the highlights with
+    # a per-pixel colour replacement.
+    return image
 
 
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
