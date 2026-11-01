@@ -37,6 +37,7 @@ from aiogram.types import (
 )
 
 from app.config import Settings
+from app.crossposting import CrosspostingService
 from app.db import Repository
 from app.models import GeneratedPost, SourceDocument, StoryCandidate
 from app.pipeline import ContentPipeline
@@ -61,6 +62,7 @@ from app.teletype import (
     parse_teletype_blog_name,
     teletype_target_id,
 )
+from app.vk import VkApiError, parse_vk_group_name
 
 logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -75,6 +77,7 @@ PUBLICATION_SCHEDULE_DAYS_SETTING = "publication_schedule_days"
 EDITORIAL_REWRITE_RULES_SETTING = "editorial_rewrite_rules"
 EDITORIAL_REWRITE_RULES_REQUEST = "editorial_rewrite_rules"
 TELETYPE_PUBLICATION_REQUEST = "teletype_publication"
+VK_CROSSPOST_REQUEST = "vk_crosspost"
 MAX_EDITORIAL_REWRITE_RULES_CHARS = 3000
 WEEKDAY_NAMES = (
     "понедельник",
@@ -339,6 +342,7 @@ class EditorBot:
         telegram_sources: TelegramSourceManager | None = None,
         rss_sources: RssSourceManager | None = None,
         teletype_publisher: TeletypePublisher | None = None,
+        crossposting: CrosspostingService | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -346,6 +350,7 @@ class EditorBot:
         self.telegram_sources = telegram_sources
         self.rss_sources = rss_sources
         self.teletype_publisher = teletype_publisher
+        self.crossposting = crossposting
         self.bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -356,6 +361,10 @@ class EditorBot:
         self._publication_locks: dict[int, asyncio.Lock] = {}
         self.dispatcher.include_router(self.router)
         self._register_handlers()
+        if self.crossposting:
+            self.crossposting.set_failure_notifier(
+                self._notify_crosspost_failure
+            )
 
     async def initialize(self) -> None:
         await self.repository.clear_pending_actions()
@@ -400,6 +409,33 @@ class EditorBot:
 
     async def close(self) -> None:
         await self.bot.session.close()
+
+    async def _notify_crosspost_failure(
+        self,
+        item: dict[str, Any],
+        error: str,
+    ) -> None:
+        editor_chat_id = await self.repository.get_setting("editor_chat_id")
+        if not editor_chat_id:
+            return
+        await self.bot.send_message(
+            int(editor_chat_id),
+            "<b>Кросспостинг в VK не выполнен</b>\n\n"
+            f"Статья Teletype: "
+            f"<a href=\"{html.escape(str(item.get('source_url') or ''), quote=True)}\">"
+            "открыть</a>\n"
+            f"Ошибка: <code>{html.escape(error[:500])}</code>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⚙️ Кросспостинг",
+                            callback_data="crossposting:0",
+                        )
+                    ]
+                ]
+            ),
+        )
 
     def _register_handlers(self) -> None:
         self.router.message.register(self._start, Command("start"))
@@ -560,6 +596,12 @@ class EditorBot:
                     InlineKeyboardButton(
                         text="📣 Каналы публикации",
                         callback_data="targetmenu:0",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔁 Кросспостинг из Teletype",
+                        callback_data="crossposting:0",
                     )
                 ],
                 [
@@ -1809,6 +1851,167 @@ class EditorBot:
             except TelegramBadRequest:
                 logger.info("Could not edit channel selection; sending a new message")
         await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_crossposting_menu(
+        self,
+        chat_id: int,
+        *,
+        user_id: int,
+        message_id: int | None = None,
+    ) -> None:
+        service = self.crossposting
+        target = await service.vk_target() if service else None
+        enabled = await service.vk_enabled() if service else False
+        stats = await service.stats() if service else {
+            "pending": 0,
+            "processing": 0,
+            "published": 0,
+            "failed": 0,
+        }
+        authorized = bool(service and service.vk_publisher)
+        if target:
+            target_text = (
+                f"<a href=\"{html.escape(str(target.get('url') or ''), quote=True)}\">"
+                f"{html.escape(str(target.get('title') or target.get('screen_name')))}"
+                "</a>"
+            )
+        else:
+            target_text = "не подключено"
+        status = "🟢 включён" if enabled else "⚪️ выключен"
+        authorization = "настроена" if authorized else "не настроена"
+        text = (
+            "<b>🔁 Кросспостинг из Teletype</b>\n\n"
+            "Каждая статья, успешно опубликованная ботом в Teletype, "
+            "автоматически ставится в отдельную очередь VK.\n\n"
+            f"<b>VK:</b> {status}\n"
+            f"Авторизация: <b>{authorization}</b>\n"
+            f"Сообщество: {target_text}\n\n"
+            f"В очереди: <b>{stats['pending'] + stats['processing']}</b>\n"
+            f"Успешно: <b>{stats['published']}</b>\n"
+            f"Ошибки: <b>{stats['failed']}</b>"
+        )
+        rows: list[list[InlineKeyboardButton]] = []
+        if target and authorized:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=(
+                            "⚪️ Выключить VK"
+                            if enabled
+                            else "🟢 Включить VK"
+                        ),
+                        callback_data="crosspostvktoggle:0",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Подключить или сменить VK",
+                    callback_data="crosspostvksetup:0",
+                )
+            ]
+        )
+        if stats["failed"]:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Повторить ошибки VK",
+                        callback_data="crosspostvkretry:0",
+                    )
+                ]
+            )
+        keyboard = await self._with_navigation(
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            user_id,
+            chat_id,
+            back_callback="home:0",
+            back_label="« Назад в главное меню",
+        )
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramBadRequest:
+                logger.info("Could not edit crossposting menu; sending a new one")
+        await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _show_vk_crosspost_setup(
+        self,
+        chat_id: int,
+        *,
+        user_id: int,
+        message_id: int | None = None,
+    ) -> None:
+        if not self.crossposting or not self.crossposting.vk_publisher:
+            text = (
+                "<b>Подключение VK</b>\n\n"
+                "Ключ сообщества ещё не задан на сервере. Нужно добавить в "
+                "<code>.env</code> переменные "
+                "<code>VK_COMMUNITY_ACCESS_TOKEN</code> и "
+                "<code>VK_COMMUNITY_GROUP_ID</code>, затем перезапустить сервис.\n\n"
+                "Не отправляй ключ в Telegram."
+            )
+            keyboard = await self._with_navigation(
+                InlineKeyboardMarkup(inline_keyboard=[]),
+                user_id,
+                chat_id,
+                back_callback="crossposting:0",
+                back_label="« Назад",
+            )
+            if message_id is not None:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=keyboard,
+                )
+            else:
+                await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+            return
+
+        text = (
+            "<b>Подключение VK</b>\n\n"
+            "Отправь следующим сообщением ссылку на сообщество, например:\n"
+            "<code>https://vk.ru/it_vibe</code>\n\n"
+            "Бот проверит, что ссылка совпадает с ключом на сервере. "
+            "Сам ключ сюда отправлять не нужно."
+        )
+        prompt = message_id
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Отмена",
+                        callback_data="crosspostvkcancel:0",
+                    )
+                ]
+            ]
+        )
+        if message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=markup,
+                )
+            except TelegramBadRequest:
+                prompt = None
+        if prompt is None:
+            sent = await self.bot.send_message(chat_id, text, reply_markup=markup)
+            prompt = sent.message_id
+        await self.repository.set_source_input_request(
+            chat_id,
+            user_id,
+            prompt,
+            VK_CROSSPOST_REQUEST,
+        )
 
     async def _show_schedule_channel_picker(
         self,
@@ -3322,6 +3525,56 @@ class EditorBot:
             )
             return
 
+        if kind == VK_CROSSPOST_REQUEST:
+            value = (message.text or message.caption or "").strip()
+            try:
+                parse_vk_group_name(value)
+            except ValueError as error:
+                await message.answer(f"{html.escape(str(error))}. Попробуй ещё раз.")
+                return
+            if not self.crossposting or not self.crossposting.vk_publisher:
+                await message.answer(
+                    "Авторизация VK не настроена. Не отправляй сюда ключ — "
+                    "его нужно ввести в Terminal на сервере."
+                )
+                return
+            progress = await message.answer("Проверяю сообщество и права ключа VK…")
+            try:
+                group = await self.crossposting.vk_publisher.resolve_group(value)
+            except (ValueError, VkApiError, httpx.HTTPError) as error:
+                logger.warning(
+                    "Could not configure VK crossposting target: %s",
+                    type(error).__name__,
+                )
+                try:
+                    await self.bot.delete_message(progress.chat.id, progress.message_id)
+                except TelegramBadRequest:
+                    pass
+                await message.answer(
+                    "Не удалось подключить сообщество VK.\n\n"
+                    f"<code>{html.escape(str(error))}</code>\n\n"
+                    "Проверь ссылку, ID сообщества и право ключа «Стена»."
+                )
+                return
+            await self.crossposting.set_vk_target(group)
+            await self.crossposting.set_vk_enabled(True)
+            await self.repository.clear_source_input_request(message.chat.id)
+            if message.chat.type == ChatType.CHANNEL:
+                try:
+                    await self.bot.delete_message(message.chat.id, message.message_id)
+                except TelegramBadRequest:
+                    logger.info("Could not delete VK group URL from editor channel")
+            try:
+                await self.bot.delete_message(progress.chat.id, progress.message_id)
+            except TelegramBadRequest:
+                pass
+            await self._show_crossposting_menu(
+                message.chat.id,
+                user_id=int(request["user_id"]),
+                message_id=request.get("prompt_message_id"),
+            )
+            return
+
         manager = self.rss_sources if kind == "rss" else self.telegram_sources
         if not manager:
             await message.answer("Этот тип источников сейчас недоступен.")
@@ -4154,6 +4407,76 @@ class EditorBot:
                     message_id=(
                         None if source_draft else callback.message.message_id
                     ),
+                )
+            return
+
+        if action == "crossposting":
+            await callback.answer("Открываю кросспостинг")
+            if callback.message:
+                await self._show_crossposting_menu(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                    message_id=(
+                        None if source_draft else callback.message.message_id
+                    ),
+                )
+            return
+        if action == "crosspostvksetup":
+            await callback.answer("Подключение VK")
+            if callback.message:
+                await self._show_vk_crosspost_setup(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                    message_id=callback.message.message_id,
+                )
+            return
+        if action == "crosspostvkcancel":
+            if callback.message:
+                await self.repository.clear_source_input_request(
+                    callback.message.chat.id
+                )
+                await self._show_crossposting_menu(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                    message_id=callback.message.message_id,
+                )
+            await callback.answer("Подключение отменено")
+            return
+        if action == "crosspostvktoggle":
+            if not self.crossposting or not self.crossposting.vk_publisher:
+                await callback.answer(
+                    "Сначала настрой ключ VK на сервере",
+                    show_alert=True,
+                )
+                return
+            if not await self.crossposting.vk_target():
+                await callback.answer(
+                    "Сначала подключи сообщество VK",
+                    show_alert=True,
+                )
+                return
+            enabled = not await self.crossposting.vk_enabled()
+            await self.crossposting.set_vk_enabled(enabled)
+            await callback.answer("VK включён" if enabled else "VK выключен")
+            if callback.message:
+                await self._show_crossposting_menu(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                    message_id=callback.message.message_id,
+                )
+            return
+        if action == "crosspostvkretry":
+            count = (
+                await self.crossposting.retry_failed()
+                if self.crossposting
+                else 0
+            )
+            await callback.answer(f"Вернуто в очередь: {count}")
+            if callback.message:
+                await self._show_crossposting_menu(
+                    callback.message.chat.id,
+                    user_id=callback.from_user.id,
+                    message_id=callback.message.message_id,
                 )
             return
 
@@ -5179,6 +5502,18 @@ class EditorBot:
                             image=teletype_image,
                         )
                         target_message_id = article.article_id
+                        if self.crossposting:
+                            try:
+                                await self.crossposting.enqueue_teletype_article(
+                                    draft_id=draft_id,
+                                    article_id=article.article_id,
+                                    article_url=article.url,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Could not enqueue VK crosspost for Teletype article %s",
+                                    article.article_id,
+                                )
                     except (
                         TeletypeApiError,
                         httpx.HTTPError,

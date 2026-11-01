@@ -49,6 +49,11 @@ class TeletypeImage:
 class TeletypeArticle:
     article_id: int
     uri: str
+    blog_uri: str
+
+    @property
+    def url(self) -> str:
+        return f"https://teletype.in/@{self.blog_uri}/{self.uri}"
 
 
 def teletype_target_id(blog_id: int) -> int:
@@ -349,5 +354,6 @@ class TeletypePublisher:
             raise TeletypeApiError("Teletype did not return the published article ID")
         return TeletypeArticle(
             article_id=int(result["id"]),
-            uri=str(result.get("uri") or ""),
+            uri=str(result.get("uri") or article_uri),
+            blog_uri=blog_uri,
         )

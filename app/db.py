@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -136,7 +136,37 @@ class Repository:
                     kind TEXT NOT NULL DEFAULT 'telegram_web',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS crossposts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    draft_id INTEGER NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_external_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT NOT NULL,
+                    target_external_id TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(draft_id) REFERENCES drafts(id) ON DELETE CASCADE,
+                    UNIQUE(source_kind, source_external_id, target_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS crossposts_due_idx
+                ON crossposts(status, available_at);
                 """
+            )
+            await db.execute(
+                """
+                UPDATE crossposts
+                SET status = 'retry', available_at = ?, updated_at = ?
+                WHERE status = 'processing'
+                """,
+                (_now(), _now()),
             )
             cursor = await db.execute("PRAGMA table_info(drafts)")
             columns = {str(row[1]) for row in await cursor.fetchall()}
@@ -234,6 +264,169 @@ class Repository:
                 (key, value, now),
             )
             await db.commit()
+
+    async def enqueue_crosspost(
+        self,
+        *,
+        draft_id: int,
+        source_kind: str,
+        source_external_id: str,
+        source_url: str,
+        target_kind: str,
+        target_key: str,
+    ) -> int:
+        now = _now()
+        async with self.connect() as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO crossposts(
+                    draft_id, source_kind, source_external_id, source_url,
+                    target_kind, target_key, status, attempts, available_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    draft_id,
+                    source_kind,
+                    source_external_id,
+                    source_url,
+                    target_kind,
+                    target_key,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = await self._fetchone(
+                db,
+                """
+                SELECT id FROM crossposts
+                WHERE source_kind = ? AND source_external_id = ? AND target_key = ?
+                """,
+                (source_kind, source_external_id, target_key),
+            )
+            await db.commit()
+            if not row:
+                raise RuntimeError("Could not create crosspost queue item")
+            return int(row["id"])
+
+    async def claim_due_crossposts(
+        self,
+        limit: int = 10,
+        *,
+        target_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        now = _now()
+        kind_clause = " AND target_kind = ?" if target_kind else ""
+        parameters: tuple[Any, ...] = (now,)
+        if target_kind:
+            parameters = (*parameters, target_kind)
+        parameters = (*parameters, max(1, int(limit)))
+        async with self.connect() as db:
+            cursor = await db.execute(
+                f"""
+                SELECT * FROM crossposts
+                WHERE status IN ('pending', 'retry')
+                  AND available_at <= ?
+                  {kind_clause}
+                ORDER BY available_at, id
+                LIMIT ?
+                """,
+                parameters,
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+            if rows:
+                placeholders = ", ".join("?" for _ in rows)
+                await db.execute(
+                    f"""
+                    UPDATE crossposts
+                    SET status = 'processing', updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, *(int(row["id"]) for row in rows)),
+                )
+            await db.commit()
+            return rows
+
+    async def mark_crosspost_published(
+        self,
+        crosspost_id: int,
+        target_external_id: str,
+    ) -> None:
+        async with self.connect() as db:
+            await db.execute(
+                """
+                UPDATE crossposts
+                SET status = 'published', target_external_id = ?, error = NULL,
+                    attempts = attempts + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (target_external_id, _now(), crosspost_id),
+            )
+            await db.commit()
+
+    async def mark_crosspost_failed(
+        self,
+        crosspost_id: int,
+        error: str,
+        *,
+        retry_in: timedelta | None,
+    ) -> None:
+        now = datetime.now(UTC)
+        status = "retry" if retry_in is not None else "failed"
+        available_at = (now + (retry_in or timedelta())).isoformat()
+        async with self.connect() as db:
+            await db.execute(
+                """
+                UPDATE crossposts
+                SET status = ?, attempts = attempts + 1, available_at = ?,
+                    error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    available_at,
+                    error[:1000],
+                    now.isoformat(),
+                    crosspost_id,
+                ),
+            )
+            await db.commit()
+
+    async def retry_failed_crossposts(self, target_kind: str | None = None) -> int:
+        now = _now()
+        query = (
+            "UPDATE crossposts SET status = 'retry', attempts = 0, error = NULL, "
+            "available_at = ?, updated_at = ? WHERE status = 'failed'"
+        )
+        parameters: tuple[Any, ...] = (now, now)
+        if target_kind:
+            query += " AND target_kind = ?"
+            parameters = (*parameters, target_kind)
+        async with self.connect() as db:
+            cursor = await db.execute(query, parameters)
+            await db.commit()
+            return max(0, int(cursor.rowcount))
+
+    async def crosspost_stats(self, target_kind: str | None = None) -> dict[str, int]:
+        query = "SELECT status, COUNT(*) AS count FROM crossposts"
+        parameters: tuple[Any, ...] = ()
+        if target_kind:
+            query += " WHERE target_kind = ?"
+            parameters = (target_kind,)
+        query += " GROUP BY status"
+        async with self.connect() as db:
+            cursor = await db.execute(query, parameters)
+            values = {
+                str(row["status"]): int(row["count"])
+                for row in await cursor.fetchall()
+            }
+        return {
+            "pending": values.get("pending", 0) + values.get("retry", 0),
+            "processing": values.get("processing", 0),
+            "published": values.get("published", 0),
+            "failed": values.get("failed", 0),
+        }
 
     async def claim_owner(self, user_id: int) -> bool:
         async with self.connect() as db:

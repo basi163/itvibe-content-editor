@@ -39,6 +39,8 @@ the terminal. Never write them to Git or display them in logs.
   international DashScope endpoint
 - Optional Teletype account token. It is required only for Teletype publication
   and must be entered as `TELETYPE_ACCESS_TOKEN` directly in the server `.env`.
+- Optional VK community token and numeric group ID. They are required only for
+  Teletype-to-VK crossposting and must be entered with `scripts/set_vk_token.sh`.
 
 Credentials previously pasted into chat must be treated as temporary and should
 be rotated after verification.
@@ -138,6 +140,12 @@ be rotated after verification.
   Without `TELETYPE_ACCESS_TOKEN`, existing Telegram behavior is unchanged and the
   Teletype menu displays setup guidance. The token is never accepted through Telegram
   or stored in the database.
+- Teletype-to-VK crossposting is an independent durable queue inside the service.
+  A VK failure never rolls back a Teletype article. The editorial home menu can connect
+  the configured VK community, enable or disable delivery, show queue statistics and
+  retry terminal failures. Community tokens remain in `.env`; Telegram accepts only the
+  public group URL. New social networks should be added as crossposting adapters rather
+  than as additional Telegram polling bots.
 
 ## Completion criteria
 

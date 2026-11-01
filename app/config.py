@@ -78,6 +78,9 @@ class Settings:
     target_chat_id: int | None
     teletype_access_token: str
     teletype_client_version: str
+    vk_community_access_token: str
+    vk_community_group_id: int | None
+    vk_api_version: str
 
     @classmethod
     def load(cls) -> Settings:
@@ -126,6 +129,11 @@ class Settings:
             teletype_client_version=os.getenv(
                 "TELETYPE_CLIENT_VERSION", "4.41.26"
             ).strip(),
+            vk_community_access_token=os.getenv(
+                "VK_COMMUNITY_ACCESS_TOKEN", ""
+            ).strip(),
+            vk_community_group_id=_optional_int("VK_COMMUNITY_GROUP_ID"),
+            vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip(),
         )
         settings.validate()
         settings.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +157,12 @@ class Settings:
             raise RuntimeError(
                 "TELETYPE_CLIENT_VERSION is required with TELETYPE_ACCESS_TOKEN"
             )
+        if self.vk_community_access_token and not self.vk_community_group_id:
+            raise RuntimeError(
+                "VK_COMMUNITY_GROUP_ID is required with VK_COMMUNITY_ACCESS_TOKEN"
+            )
+        if self.vk_community_group_id is not None and self.vk_community_group_id <= 0:
+            raise RuntimeError("VK_COMMUNITY_GROUP_ID must be positive")
         if self.rss_poll_interval_seconds < 30:
             raise RuntimeError("RSS_POLL_INTERVAL_SECONDS must be at least 30")
         if self.rss_offpeak_poll_interval_seconds < self.rss_poll_interval_seconds:

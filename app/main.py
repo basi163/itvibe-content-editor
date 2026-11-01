@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 from app.bot import EditorBot
 from app.config import Settings
+from app.crossposting import CrosspostingService
 from app.db import Repository
 from app.extractor import ArticleExtractor
 from app.llm import QwenClient
@@ -14,6 +15,7 @@ from app.pipeline import ContentPipeline
 from app.rss_sources import RssSourceManager
 from app.telegram_sources import TelegramSourceManager
 from app.teletype import TeletypePublisher
+from app.vk import VkPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +191,17 @@ async def main() -> None:
         if settings.teletype_access_token
         else None
     )
+    vk_publisher = (
+        VkPublisher(
+            settings.vk_community_access_token,
+            settings.vk_community_group_id,
+            api_version=settings.vk_api_version,
+            timeout=settings.http_timeout_seconds,
+        )
+        if settings.vk_community_access_token and settings.vk_community_group_id
+        else None
+    )
+    crossposting = CrosspostingService(repository, vk_publisher)
     await rss_sources.ensure_builtin()
     editor_bot = EditorBot(
         settings,
@@ -197,6 +210,7 @@ async def main() -> None:
         telegram_sources,
         rss_sources,
         teletype_publisher,
+        crossposting,
     )
     pipeline.set_delivery(editor_bot.deliver_draft)
     await editor_bot.initialize()
@@ -217,6 +231,7 @@ async def main() -> None:
     cleanup_task = asyncio.create_task(
         draft_cleanup_worker(settings, repository, stop_event)
     )
+    crossposting_task = asyncio.create_task(crossposting.worker(stop_event))
     try:
         await editor_bot.start_polling()
     finally:
@@ -226,16 +241,19 @@ async def main() -> None:
         telegram_task.cancel()
         publish_task.cancel()
         cleanup_task.cancel()
+        crossposting_task.cancel()
         await asyncio.gather(
             feed_task,
             telegram_task,
             publish_task,
             cleanup_task,
+            crossposting_task,
             return_exceptions=True,
         )
         await extractor.close()
         if teletype_publisher:
             await teletype_publisher.close()
+        await crossposting.close()
         await editor_bot.close()
 
 

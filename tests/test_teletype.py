@@ -122,6 +122,7 @@ async def test_teletype_publisher_resolves_blog_uploads_and_publishes() -> None:
     assert blog.can_publish is True
     assert blog.url == "https://teletype.in/@itvibe"
     assert article.article_id == 4_831_645
+    assert article.url == "https://teletype.in/@itvibe/test-article"
     assert calls == [
         ("GET", "/api/blogs/uri/itvibe"),
         ("PUT", "/media/"),

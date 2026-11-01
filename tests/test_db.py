@@ -46,6 +46,55 @@ async def test_draft_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_crosspost_queue_is_idempotent_and_tracks_completion(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(tmp_path / "editor.sqlite3")
+    await repository.initialize()
+    draft_id = await repository.create_draft(
+        origin_type="test",
+        origin_ref="crosspost",
+        title="Заголовок",
+        body="Текст",
+        hashtags=["#ИИ", "#наука", "#технологии"],
+        sources=[],
+        media=[],
+        material={},
+        triage={},
+    )
+
+    first_id = await repository.enqueue_crosspost(
+        draft_id=draft_id,
+        source_kind="teletype",
+        source_external_id="99",
+        source_url="https://teletype.in/@itvibe/release",
+        target_kind="vk",
+        target_key="vk:42",
+    )
+    duplicate_id = await repository.enqueue_crosspost(
+        draft_id=draft_id,
+        source_kind="teletype",
+        source_external_id="99",
+        source_url="https://teletype.in/@itvibe/release",
+        target_kind="vk",
+        target_key="vk:42",
+    )
+
+    assert duplicate_id == first_id
+    due = await repository.claim_due_crossposts()
+    assert [item["id"] for item in due] == [first_id]
+
+    await repository.mark_crosspost_published(first_id, "101")
+    assert await repository.claim_due_crossposts() == []
+    assert await repository.crosspost_stats("vk") == {
+        "pending": 0,
+        "processing": 0,
+        "published": 1,
+        "failed": 0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_unpublished_queue_and_navigation_context(tmp_path: Path) -> None:
     repository = Repository(tmp_path / "editor.sqlite3")
     await repository.initialize()
