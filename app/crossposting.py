@@ -157,6 +157,7 @@ class CrosspostingService:
                         f"itvibe-teletype-{item['source_external_id']}-"
                         f"vk-{group_id}"
                     ),
+                    fallback_title=post.title,
                 )
             except (VkApiError, httpx.HTTPError, KeyError, TypeError, ValueError) as error:
                 attempts = int(item.get("attempts") or 0) + 1

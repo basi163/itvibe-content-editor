@@ -51,7 +51,7 @@ def render_vk_crosspost(post: GeneratedPost, article_url: str) -> str:
     body = SOURCE_MARKER_RE.sub(lambda match: match.group(2).strip(), post.body)
     body = normalize_body_spacing(body)
     hashtags = " ".join(tag.strip() for tag in post.hashtags[:3] if tag.strip())
-    blocks = [post.title.strip(), body]
+    blocks = [body]
     if hashtags:
         blocks.append(hashtags)
     blocks.extend(
@@ -158,6 +158,7 @@ class VkPublisher:
         message: str,
         article_url: str,
         guid: str,
+        fallback_title: str | None = None,
     ) -> int:
         if int(group_id) != self.community_group_id:
             raise ValueError("VK group does not match the configured community token")
@@ -182,11 +183,14 @@ class VkPublisher:
                 and "no photo given" not in detail
             ):
                 raise
+            fallback_message = message
+            if fallback_title and fallback_title.strip():
+                fallback_message = f"{fallback_title.strip()}\n\n{message.strip()}"
             published = await self._call(
                 "wall.post",
                 owner_id=-self.community_group_id,
                 from_group=1,
-                message=message,
+                message=fallback_message,
                 guid=guid,
             )
         post_id = int(published.get("post_id") or 0)

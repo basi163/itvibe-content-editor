@@ -117,6 +117,7 @@ async def test_worker_publishes_due_vk_crosspost_and_marks_it_complete() -> None
     assert call["group_id"] == 42
     assert call["article_url"] == "https://teletype.in/@itvibe/launch"
     assert call["guid"] == "itvibe-teletype-99-vk-42"
-    assert "Новый релиз" in call["message"]
+    assert "Новый релиз" not in call["message"]
+    assert call["fallback_title"] == "Новый релиз"
     repository.mark_crosspost_published.assert_awaited_once_with(5, "101")
     repository.mark_crosspost_failed.assert_not_awaited()

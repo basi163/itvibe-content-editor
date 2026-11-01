@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 
 import httpx
 import pytest
+from PIL import Image
 
 from app.models import GeneratedPost, SourceDocument
 from app.teletype import (
@@ -11,6 +13,7 @@ from app.teletype import (
     TeletypeImage,
     TeletypePublisher,
     build_teletype_payload,
+    build_teletype_sharing_image,
     parse_teletype_blog_name,
     teletype_blog_id_from_target,
     teletype_target_id,
@@ -45,7 +48,12 @@ def test_teletype_payload_contains_cover_links_and_three_hashtags() -> None:
                 linkable=True,
             )
         ],
-        TeletypeImage("https://example.com/cover.jpg", 1200, 630),
+        TeletypeImage("https://example.com/cover.jpg", 900, 1600),
+        sharing_image=TeletypeImage(
+            "https://example.com/sharing-cover.jpg",
+            1200,
+            630,
+        ),
         article_uri="itvibe-42",
     )
 
@@ -58,7 +66,23 @@ def test_teletype_payload_contains_cover_links_and_three_hashtags() -> None:
     assert "#IT #разработка #новости" in payload["text"]
     assert "#лишний" not in payload["text"]
     assert payload["cut_image"] == "https://example.com/cover.jpg"
+    assert payload["sharing_title"] == "Новый релиз"
+    assert payload["sharing_image"] == "https://example.com/sharing-cover.jpg"
     assert payload["sharing_type"] == "image"
+
+
+def test_build_teletype_sharing_image_makes_landscape_png() -> None:
+    source_buffer = BytesIO()
+    Image.new("RGB", (600, 1200), color=(220, 40, 40)).save(
+        source_buffer,
+        format="PNG",
+    )
+
+    result = build_teletype_sharing_image(source_buffer.getvalue())
+
+    with Image.open(BytesIO(result)) as rendered:
+        assert rendered.format == "PNG"
+        assert rendered.size == (1200, 630)
 
 
 @pytest.mark.asyncio
@@ -90,6 +114,11 @@ async def test_teletype_publisher_resolves_blog_uploads_and_publishes() -> None:
             assert body["author_id"] == 1_931_042
             assert body["uri"] == "itvibe-42"
             assert body["title"] == "Проверочная статья"
+            assert body["sharing_title"] == "Проверочная статья"
+            assert (
+                body["sharing_image"]
+                == "https://img1.teletype.in/files/sharing-cover.jpg"
+            )
             assert "https://img1.teletype.in/files/cover.jpg" in body["text"]
             payload = {"id": 4_831_645, "uri": "test-article"}
         else:  # pragma: no cover
@@ -115,6 +144,11 @@ async def test_teletype_publisher_resolves_blog_uploads_and_publishes() -> None:
             ),
             sources=[],
             image=image,
+            sharing_image=TeletypeImage(
+                "https://img1.teletype.in/files/sharing-cover.jpg",
+                1200,
+                630,
+            ),
         )
     finally:
         await client.aclose()

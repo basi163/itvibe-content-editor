@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import io
 import re
 import secrets
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from app.models import GeneratedPost, SourceDocument
 from app.renderer import SOURCE_MARKER_RE, normalize_body_spacing
@@ -18,6 +20,7 @@ TELETYPE_MEDIA_API_URL = "https://teletype.in/media"
 TELETYPE_TARGET_ID_BASE = 9_000_000_000_000_000
 TELETYPE_BLOG_RE = re.compile(r"^[A-Za-z0-9_.-]{2,64}$")
 TELETYPE_TELEGRAM_URL = "https://t.me/itvibenews"
+TELETYPE_SHARING_IMAGE_SIZE = (1200, 630)
 
 
 class TeletypeApiError(RuntimeError):
@@ -156,16 +159,42 @@ def _plain_excerpt(post: GeneratedPost, limit: int) -> str:
     return value[: max(0, limit - 1)].rstrip() + "…"
 
 
+def build_teletype_sharing_image(content: bytes) -> bytes:
+    """Build a VK-friendly landscape preview while preserving the full cover."""
+    with Image.open(io.BytesIO(content)) as opened:
+        source = ImageOps.exif_transpose(opened).convert("RGB")
+        background = ImageOps.fit(
+            source,
+            TELETYPE_SHARING_IMAGE_SIZE,
+            method=Image.Resampling.LANCZOS,
+        )
+        background = background.filter(ImageFilter.GaussianBlur(28))
+        background = ImageEnhance.Brightness(background).enhance(0.48)
+        foreground = ImageOps.contain(
+            source,
+            TELETYPE_SHARING_IMAGE_SIZE,
+            method=Image.Resampling.LANCZOS,
+        )
+        left = (TELETYPE_SHARING_IMAGE_SIZE[0] - foreground.width) // 2
+        top = (TELETYPE_SHARING_IMAGE_SIZE[1] - foreground.height) // 2
+        background.paste(foreground, (left, top))
+        output = io.BytesIO()
+        background.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+
 def build_teletype_payload(
     blog_id: int,
     post: GeneratedPost,
     sources: list[SourceDocument],
     image: TeletypeImage,
     *,
+    sharing_image: TeletypeImage | None = None,
     article_uri: str | None = None,
     article_id: int | None = None,
 ) -> dict[str, Any]:
     excerpt = _plain_excerpt(post, 500)
+    social_image = sharing_image or image
     payload: dict[str, Any] = {
         "author_id": blog_id,
         "creator_id": blog_id,
@@ -173,9 +202,9 @@ def build_teletype_payload(
         "text": render_teletype_document(post, sources, image),
         "cut_text": excerpt,
         "cut_image": image.url,
-        "sharing_title": None,
+        "sharing_title": post.title.strip(),
         "sharing_text": _plain_excerpt(post, 180),
-        "sharing_image": image.url,
+        "sharing_image": social_image.url,
         "sharing_type": "image",
         "heading_style": {},
         "visibility": "all",
@@ -321,6 +350,7 @@ class TeletypePublisher:
         post: GeneratedPost,
         sources: list[SourceDocument],
         image: TeletypeImage,
+        sharing_image: TeletypeImage | None = None,
         article_id: int | None = None,
     ) -> TeletypeArticle:
         payload = build_teletype_payload(
@@ -328,6 +358,7 @@ class TeletypePublisher:
             post,
             sources,
             image,
+            sharing_image=sharing_image,
             article_uri=article_uri,
             article_id=article_id,
         )

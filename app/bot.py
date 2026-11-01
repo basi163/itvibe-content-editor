@@ -59,6 +59,7 @@ from app.teletype import (
     TeletypeApiError,
     TeletypeImage,
     TeletypePublisher,
+    build_teletype_sharing_image,
     parse_teletype_blog_name,
     teletype_target_id,
 )
@@ -5493,6 +5494,9 @@ class EditorBot:
                             raise ValueError(
                                 "Не удалось подготовить изображение для Teletype"
                             )
+                        teletype_sharing_image = (
+                            await self._teletype_sharing_image(teletype_image)
+                        )
                         article = await self.teletype_publisher.publish_article(
                             blog_id=int(channel["blog_id"]),
                             blog_uri=str(channel["username"]),
@@ -5500,6 +5504,7 @@ class EditorBot:
                             post=post,
                             sources=sources,
                             image=teletype_image,
+                            sharing_image=teletype_sharing_image,
                         )
                         target_message_id = article.article_id
                         if self.crossposting:
@@ -5988,6 +5993,30 @@ class EditorBot:
                 content_type,
             )
         return None
+
+    async def _teletype_sharing_image(
+        self,
+        image: TeletypeImage,
+    ) -> TeletypeImage:
+        if not self.teletype_publisher:
+            return image
+        try:
+            response = await self.teletype_publisher.client.get(image.url)
+            response.raise_for_status()
+            content = await asyncio.to_thread(
+                build_teletype_sharing_image,
+                response.content,
+            )
+            return await self.teletype_publisher.upload_image(
+                content,
+                "sharing-cover.png",
+                "image/png",
+            )
+        except (OSError, ValueError, TeletypeApiError, httpx.HTTPError):
+            logger.warning(
+                "Could not create Teletype social preview; using original cover"
+            )
+            return image
 
     @staticmethod
     def _rich_message(

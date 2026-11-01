@@ -26,7 +26,8 @@ def test_vk_crosspost_renderer_points_to_teletype_article() -> None:
         article_url,
     )
 
-    assert text.startswith("Новый релиз\n\n")
+    assert not text.startswith("Новый релиз\n\n")
+    assert text.startswith("Компания опубликовала")
     assert "[[source:" not in text
     assert "опубликовала отчёт" in text
     assert "#IT #разработка #новости" in text
@@ -77,6 +78,7 @@ async def test_vk_publisher_verifies_group_and_posts_teletype_link() -> None:
             message="Проверочный пост",
             article_url="https://teletype.in/@itvibe/release",
             guid="itvibe-test",
+            fallback_title="Новый релиз",
         )
     finally:
         await client.aclose()
@@ -100,9 +102,9 @@ async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
         nonlocal wall_calls
         body = parse_qs(request.content.decode())
         wall_calls += 1
-        assert body["message"] == ["Проверочный пост"]
         assert body["guid"] == ["itvibe-preview-fallback"]
         if wall_calls == 1:
+            assert body["message"] == ["Проверочный пост"]
             assert body["attachments"] == ["https://teletype.in/@itvibe/release"]
             payload = {
                 "error": {
@@ -114,6 +116,7 @@ async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
                 }
             }
         else:
+            assert body["message"] == ["Новый релиз\n\nПроверочный пост"]
             assert "attachments" not in body
             payload = {"response": {"post_id": 100}}
         return httpx.Response(200, json=payload, request=request)
@@ -126,6 +129,7 @@ async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
             message="Проверочный пост",
             article_url="https://teletype.in/@itvibe/release",
             guid="itvibe-preview-fallback",
+            fallback_title="Новый релиз",
         )
     finally:
         await client.aclose()
