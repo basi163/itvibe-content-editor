@@ -1,10 +1,12 @@
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from app.digest_cover import (
     COVER_SIZE,
     PALETTES,
+    _ellipsize,
+    _font,
     _mascot,
     build_digest_cover_spec,
     digest_headlines,
@@ -97,3 +99,19 @@ def test_digest_cover_renders_publishable_jpeg() -> None:
     # from the artwork so independently sourced digests cannot look misnumbered.
     red, green, blue = image.getpixel((1500, 80))
     assert not (red > 180 and red > green * 1.8 and red > blue * 1.4)
+
+
+def test_ellipsize_keeps_long_headline_inside_pixel_width() -> None:
+    image = Image.new("RGB", (500, 100), "black")
+    draw = ImageDraw.Draw(image)
+    font = _font(28)
+
+    fitted = _ellipsize(
+        draw,
+        "Смартфон iQOO Neo12 получил очень длинное описание процессора",
+        font,
+        260,
+    )
+
+    assert fitted.endswith("…")
+    assert draw.textbbox((0, 0), fitted, font=font)[2] <= 260

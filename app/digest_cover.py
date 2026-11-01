@@ -323,6 +323,37 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, wi
     return lines
 
 
+def _ellipsize(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    width: int,
+) -> str:
+    """Fit text on one line without ever crossing the supplied pixel width."""
+    text = SPACE_RE.sub(" ", text).strip()
+    if not text or width <= 0:
+        return ""
+    if _text_width(draw, text, font) <= width:
+        return text
+
+    ellipsis = "…"
+    available = width - _text_width(draw, ellipsis, font)
+    if available <= 0:
+        return ellipsis if _text_width(draw, ellipsis, font) <= width else ""
+
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _text_width(draw, text[:middle].rstrip(), font) <= available:
+            low = middle
+        else:
+            high = middle - 1
+    fitted = text[:low].rstrip(" ,;:—-")
+    if " " in fitted and low < len(text) and text[low : low + 1] not in {"", " "}:
+        fitted = fitted.rsplit(" ", 1)[0].rstrip(" ,;:—-")
+    return f"{fitted}{ellipsis}" if fitted else ellipsis
+
+
 def _headline_parts(text: str, labels: tuple[str, ...]) -> tuple[str, str]:
     for label in labels:
         if text.casefold().startswith(label.casefold()):
@@ -413,38 +444,117 @@ def render_digest_cover(
         width=2,
     )
     canvas.alpha_composite(story_panel)
-    draw = ImageDraw.Draw(canvas, "RGBA")
+    # Draw all story copy on its own clipped layer. The dynamic line budget
+    # allows a second line only when it still leaves room for every remaining
+    # item; otherwise the item is safely shortened with an ellipsis.
+    story_copy = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))
+    story_draw = ImageDraw.Draw(story_copy, "RGBA")
+    headlines = spec.headlines[:6]
     y = 262
-    for index, headline in enumerate(spec.headlines[:6], start=1):
+    row_stride = 71
+    second_line_offset = 37
+    text_height = 38
+    story_text_bottom = 704
+    for position, headline in enumerate(headlines):
+        index = position + 1
+        remaining = len(headlines) - position
+        can_use_second_line = (
+            y
+            + (remaining - 1) * row_stride
+            + text_height
+            + second_line_offset
+            <= story_text_bottom
+        )
         number_box = (48, y + 2, 91, y + 44)
-        draw.rounded_rectangle(number_box, radius=6, fill=(*accent, 255))
+        story_draw.rounded_rectangle(number_box, radius=6, fill=(*accent, 255))
         number = str(index)
-        number_width = _text_width(draw, number, headline_font)
-        draw.text((70 - number_width / 2, y + 2), number, font=headline_font, fill=(0, 0, 0, 255))
+        number_width = _text_width(story_draw, number, headline_font)
+        story_draw.text(
+            (70 - number_width / 2, y + 2),
+            number,
+            font=headline_font,
+            fill=(0, 0, 0, 255),
+        )
 
         prefix, suffix = _headline_parts(headline, spec.labels)
         line_x = 111
         if prefix:
-            draw.text((line_x, y), prefix, font=headline_font, fill=(*accent, 255))
-            line_x += _text_width(draw, prefix, headline_font) + 11
+            prefix = _ellipsize(story_draw, prefix, headline_font, 250)
+            story_draw.text(
+                (line_x, y),
+                prefix,
+                font=headline_font,
+                fill=(*accent, 255),
+            )
+            line_x += _text_width(story_draw, prefix, headline_font) + 11
         available = 970 - line_x
-        suffix_lines = _wrap(draw, suffix, headline_font, max(240, available))
+        suffix_lines = _wrap(story_draw, suffix, headline_font, max(240, available))
+        used_second_line = False
         if prefix and suffix_lines:
-            first = suffix_lines[0]
-            draw.text((line_x, y), first, font=headline_font, fill=(220, 255, 224, 255))
-            remainder = " ".join(suffix_lines[1:])
-            if remainder:
-                draw.text((111, y + 37), remainder, font=headline_font, fill=(220, 255, 224, 255))
-                y += 34
+            first = (
+                suffix_lines[0]
+                if can_use_second_line and len(suffix_lines) > 1
+                else _ellipsize(story_draw, suffix, headline_font, available)
+            )
+            story_draw.text(
+                (line_x, y),
+                first,
+                font=headline_font,
+                fill=(220, 255, 224, 255),
+            )
+            if can_use_second_line and len(suffix_lines) > 1:
+                remainder = _ellipsize(
+                    story_draw,
+                    " ".join(suffix_lines[1:]),
+                    headline_font,
+                    859,
+                )
+                story_draw.text(
+                    (111, y + second_line_offset),
+                    remainder,
+                    font=headline_font,
+                    fill=(220, 255, 224, 255),
+                )
+                used_second_line = True
         else:
-            lines = _wrap(draw, suffix, headline_font, 846)
-            draw.text((111, y), lines[0] if lines else suffix, font=headline_font, fill=(220, 255, 224, 255))
-            if len(lines) > 1:
-                draw.text((111, y + 37), lines[1], font=headline_font, fill=(220, 255, 224, 255))
-                y += 34
-        y += 71
-        if y > 685:
-            break
+            lines = _wrap(story_draw, suffix, headline_font, 846)
+            first = (
+                lines[0]
+                if can_use_second_line and len(lines) > 1
+                else _ellipsize(story_draw, suffix, headline_font, 846)
+            )
+            story_draw.text(
+                (111, y),
+                first,
+                font=headline_font,
+                fill=(220, 255, 224, 255),
+            )
+            if can_use_second_line and len(lines) > 1:
+                second = _ellipsize(
+                    story_draw,
+                    " ".join(lines[1:]),
+                    headline_font,
+                    846,
+                )
+                story_draw.text(
+                    (111, y + second_line_offset),
+                    second,
+                    font=headline_font,
+                    fill=(220, 255, 224, 255),
+                )
+                used_second_line = True
+        y += row_stride + (second_line_offset if used_second_line else 0)
+
+    story_clip = Image.new("L", COVER_SIZE, 0)
+    ImageDraw.Draw(story_clip).rectangle((28, 238, 1006, 730), fill=255)
+    story_copy.putalpha(
+        Image.composite(
+            story_copy.getchannel("A"),
+            Image.new("L", COVER_SIZE, 0),
+            story_clip,
+        )
+    )
+    canvas.alpha_composite(story_copy)
 
     labels = "  •  ".join(spec.labels)
     labels_panel = Image.new("RGBA", COVER_SIZE, (0, 0, 0, 0))
