@@ -90,3 +90,45 @@ async def test_vk_publisher_verifies_group_and_posts_teletype_link() -> None:
         "/method/groups.getById",
         "/method/wall.post",
     ]
+
+
+@pytest.mark.asyncio
+async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
+    wall_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal wall_calls
+        body = parse_qs(request.content.decode())
+        wall_calls += 1
+        assert body["message"] == ["Проверочный пост"]
+        assert body["guid"] == ["itvibe-preview-fallback"]
+        if wall_calls == 1:
+            assert body["attachments"] == ["https://teletype.in/@itvibe/release"]
+            payload = {
+                "error": {
+                    "error_code": 100,
+                    "error_msg": (
+                        "One of the parameters specified was missing or invalid: "
+                        "Violated: link_photo_sizing_rule. No photo given"
+                    ),
+                }
+            }
+        else:
+            assert "attachments" not in body
+            payload = {"response": {"post_id": 100}}
+        return httpx.Response(200, json=payload, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    publisher = VkPublisher("community-token", 42, client=client)
+    try:
+        post_id = await publisher.publish_article(
+            group_id=42,
+            message="Проверочный пост",
+            article_url="https://teletype.in/@itvibe/release",
+            guid="itvibe-preview-fallback",
+        )
+    finally:
+        await client.aclose()
+
+    assert post_id == 100
+    assert wall_calls == 2

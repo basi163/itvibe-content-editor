@@ -163,14 +163,32 @@ class VkPublisher:
             raise ValueError("VK group does not match the configured community token")
         if not article_url.startswith(("http://", "https://")):
             raise ValueError("Teletype article URL is invalid")
-        published = await self._call(
-            "wall.post",
-            owner_id=-self.community_group_id,
-            from_group=1,
-            message=message,
-            attachments=article_url,
-            guid=guid,
-        )
+        try:
+            published = await self._call(
+                "wall.post",
+                owner_id=-self.community_group_id,
+                from_group=1,
+                message=message,
+                attachments=article_url,
+                guid=guid,
+            )
+        except VkApiError as error:
+            # VK occasionally rejects Teletype link previews when the source
+            # image does not satisfy its sizing rules. The URL is already in
+            # the message, so publish without an attachment card in that case.
+            detail = str(error).casefold()
+            if (
+                "link_photo_sizing_rule" not in detail
+                and "no photo given" not in detail
+            ):
+                raise
+            published = await self._call(
+                "wall.post",
+                owner_id=-self.community_group_id,
+                from_group=1,
+                message=message,
+                guid=guid,
+            )
         post_id = int(published.get("post_id") or 0)
         if post_id <= 0:
             raise VkApiError("VK did not return the published post ID")
