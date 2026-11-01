@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
 
 from app.models import GeneratedPost
 from app.renderer import SOURCE_MARKER_RE, normalize_body_spacing
+
+if TYPE_CHECKING:
+    from app.vk_browser import VkBrowserPublisher
 
 VK_API_URL = "https://api.vk.com/method"
 VK_SCREEN_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{2,64}$")
@@ -72,6 +76,7 @@ class VkPublisher:
         api_version: str = "5.199",
         timeout: float = 25.0,
         client: httpx.AsyncClient | None = None,
+        browser_publisher: VkBrowserPublisher | None = None,
     ) -> None:
         self.access_token = community_access_token.strip()
         self.community_group_id = int(community_group_id)
@@ -85,10 +90,22 @@ class VkPublisher:
             timeout=timeout,
             follow_redirects=True,
         )
+        self.browser_publisher = browser_publisher
 
     async def close(self) -> None:
+        if self.browser_publisher:
+            await self.browser_publisher.close()
         if self._owns_client:
             await self.client.aclose()
+
+    @property
+    def uses_browser(self) -> bool:
+        return self.browser_publisher is not None
+
+    async def open_browser_group(self) -> None:
+        if not self.browser_publisher:
+            return
+        await self.browser_publisher.open_group(self.community_group_id)
 
     async def _call(self, method: str, **parameters: Any) -> Any:
         response = await self.client.post(
@@ -164,6 +181,33 @@ class VkPublisher:
             raise ValueError("VK group does not match the configured community token")
         if not article_url.startswith(("http://", "https://")):
             raise ValueError("Teletype article URL is invalid")
+        if self.browser_publisher:
+            existing = await self._find_media_post(article_url)
+            if existing:
+                return existing
+            before_id = await self._latest_post_id()
+            browser_message = message.strip()
+            if fallback_title and fallback_title.strip():
+                browser_message = f"{fallback_title.strip()}\n\n{browser_message}"
+            try:
+                await self.browser_publisher.publish_article(
+                    group_id=self.community_group_id,
+                    message=browser_message,
+                    article_url=article_url,
+                )
+            except RuntimeError as error:
+                raise VkApiError(str(error)) from error
+            for _ in range(15):
+                post_id = await self._find_media_post(
+                    article_url,
+                    newer_than=before_id,
+                )
+                if post_id:
+                    return post_id
+                await asyncio.sleep(2)
+            raise VkApiError(
+                "VK browser submitted the post, but it did not appear on the wall"
+            )
         try:
             published = await self._call(
                 "wall.post",
@@ -197,6 +241,39 @@ class VkPublisher:
         if post_id <= 0:
             raise VkApiError("VK did not return the published post ID")
         return post_id
+
+    async def _wall_items(self, *, count: int = 20) -> list[dict[str, Any]]:
+        response = await self._call(
+            "wall.get",
+            owner_id=-self.community_group_id,
+            filter="owner",
+            count=max(1, min(int(count), 100)),
+        )
+        items = response.get("items", []) if isinstance(response, dict) else []
+        return [item for item in items if isinstance(item, dict)]
+
+    async def _latest_post_id(self) -> int:
+        items = await self._wall_items(count=5)
+        return max((int(item.get("id") or 0) for item in items), default=0)
+
+    async def _find_media_post(
+        self,
+        article_url: str,
+        *,
+        newer_than: int = 0,
+    ) -> int | None:
+        for item in await self._wall_items(count=30):
+            post_id = int(item.get("id") or 0)
+            if post_id <= newer_than or article_url not in str(item.get("text") or ""):
+                continue
+            attachments = item.get("attachments") or []
+            if any(
+                isinstance(attachment, dict)
+                and attachment.get("type") in {"photo", "doc", "link"}
+                for attachment in attachments
+            ):
+                return post_id
+        return None
 
     def post_url(self, post_id: int) -> str:
         return f"https://vk.ru/wall-{self.community_group_id}_{int(post_id)}"

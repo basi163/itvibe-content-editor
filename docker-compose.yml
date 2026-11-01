@@ -7,6 +7,25 @@ services:
       - .env
     volumes:
       - editor_data:/app/data
+    depends_on:
+      - vk-browser
+
+  vk-browser:
+    image: selenium/standalone-chromium:4.27.0-20241204
+    container_name: itvibe-vk-browser
+    restart: unless-stopped
+    shm_size: 2gb
+    environment:
+      SE_NODE_MAX_SESSIONS: "1"
+      SE_NODE_OVERRIDE_MAX_SESSIONS: "true"
+      SE_NODE_SESSION_TIMEOUT: "31536000"
+      SE_SESSION_REQUEST_TIMEOUT: "300"
+      SE_VNC_NO_PASSWORD: "1"
+    ports:
+      - "127.0.0.1:7900:7900"
+    volumes:
+      - vk_browser_home:/home/seluser
 
 volumes:
   editor_data:
+  vk_browser_home:

@@ -211,7 +211,20 @@ TELETYPE_CLIENT_VERSION=4.41.26
 VK_COMMUNITY_ACCESS_TOKEN=replace_me
 VK_COMMUNITY_GROUP_ID=123456789
 VK_API_VERSION=5.199
+# Публикация обложки через обычный веб-редактор VK.
+VK_BROWSER_WEBDRIVER_URL=http://vk-browser:4444/wd/hub
+VK_BROWSER_TIMEOUT_SECONDS=45
 ```
+
+Для первичного входа в VK открыть защищённый SSH-туннель:
+
+```bash
+ssh -L 7900:127.0.0.1:7900 root@SERVER_IP
+```
+
+Затем открыть `http://localhost:7900`, войти в VK как
+администратор сообщества и закрыть вкладку. Профиль Chromium
+хранится в Docker volume и не публикуется в сеть.
 
 Скопировать `LLM_BASE_URL` из рабочего пространства Model Studio. Ключи и адреса
 Singapore, US Virginia и China Beijing не взаимозаменяемы.

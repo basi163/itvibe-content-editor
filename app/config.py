@@ -81,6 +81,8 @@ class Settings:
     vk_community_access_token: str
     vk_community_group_id: int | None
     vk_api_version: str
+    vk_browser_webdriver_url: str
+    vk_browser_timeout_seconds: float
 
     @classmethod
     def load(cls) -> Settings:
@@ -134,6 +136,12 @@ class Settings:
             ).strip(),
             vk_community_group_id=_optional_int("VK_COMMUNITY_GROUP_ID"),
             vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip(),
+            vk_browser_webdriver_url=os.getenv(
+                "VK_BROWSER_WEBDRIVER_URL", ""
+            ).strip(),
+            vk_browser_timeout_seconds=float(
+                os.getenv("VK_BROWSER_TIMEOUT_SECONDS", "45")
+            ),
         )
         settings.validate()
         settings.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +171,12 @@ class Settings:
             )
         if self.vk_community_group_id is not None and self.vk_community_group_id <= 0:
             raise RuntimeError("VK_COMMUNITY_GROUP_ID must be positive")
+        if self.vk_browser_webdriver_url and not self.vk_browser_webdriver_url.startswith(
+            ("http://", "https://")
+        ):
+            raise RuntimeError("VK_BROWSER_WEBDRIVER_URL must be an HTTP(S) URL")
+        if self.vk_browser_timeout_seconds < 15:
+            raise RuntimeError("VK_BROWSER_TIMEOUT_SECONDS must be at least 15")
         if self.rss_poll_interval_seconds < 30:
             raise RuntimeError("RSS_POLL_INTERVAL_SECONDS must be at least 30")
         if self.rss_offpeak_poll_interval_seconds < self.rss_poll_interval_seconds:
