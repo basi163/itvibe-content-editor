@@ -474,6 +474,26 @@ def test_native_telegram_edit_is_parsed_and_keeps_source_marker() -> None:
     assert "[[source:0|Официальный отчёт]]" in post.body
 
 
+def test_native_telegram_edit_restores_repeated_anchors_without_nesting() -> None:
+    post = parse_editor_post_text(
+        "Технологии за день\n\n"
+        "1. Первая новость. Подробнее\n\n"
+        "2. Вторая новость. Подробнее\n\n"
+        "3. Третья новость. Подробнее\n\n"
+        "#технологии #IT #новости\n\n"
+        "🔳 IT Vibe News",
+        "1. Первая новость. [[source:0|Подробнее]]\n\n"
+        "2. Вторая новость. [[source:1|Подробнее]]\n\n"
+        "3. Третья новость. [[source:2|Подробнее]]",
+    )
+
+    assert post.body.count("[[source:") == 3
+    assert "[[source:0|Подробнее]]" in post.body
+    assert "[[source:1|Подробнее]]" in post.body
+    assert "[[source:2|Подробнее]]" in post.body
+    assert "[[source:0|[[source:" not in post.body
+
+
 def test_native_telegram_edit_collapses_duplicate_hashtag_paragraphs() -> None:
     post = parse_editor_post_text(
         "Заголовок\n\n"

@@ -65,6 +65,8 @@ class TriageDecision:
     linkable_source_indices: list[int] = field(default_factory=list)
     facts: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
+    reader_interest_score: int = 0
+    reader_interest_breakdown: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

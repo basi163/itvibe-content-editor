@@ -1,42 +1,26 @@
 from __future__ import annotations
 
-import io
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
-from PIL import Image
 
 from app.models import GeneratedPost
 from app.vk import VkPublisher, parse_vk_group_name, render_vk_crosspost
-from app.vk_browser import VkBrowserPublisher
 
 
-class FakeBrowserPublisher:
+class FakeCoverService:
     def __init__(self) -> None:
-        self.published: list[dict[str, object]] = []
-        self.closed = False
+        self.prepared: list[str] = []
 
-    async def publish_article(
-        self,
-        *,
-        group_id: int,
-        message: str,
-        article_url: str,
-    ) -> None:
-        self.published.append(
-            {
-                "group_id": group_id,
-                "message": message,
-                "article_url": article_url,
-            }
-        )
+    async def prepare(self, article_url: str) -> bytes:
+        self.prepared.append(article_url)
+        return b"jpeg-cover"
 
-    async def open_group(self, group_id: int) -> None:
-        return None
 
-    async def close(self) -> None:
-        self.closed = True
+class FailingCoverService:
+    async def prepare(self, article_url: str) -> bytes:
+        raise RuntimeError(f"Could not download {article_url}")
 
 
 def test_parse_vk_group_name_accepts_public_vk_urls() -> None:
@@ -56,8 +40,7 @@ def test_vk_crosspost_renderer_points_to_teletype_article() -> None:
         article_url,
     )
 
-    assert not text.startswith("Новый релиз\n\n")
-    assert text.startswith("Компания опубликовала")
+    assert text.startswith("Новый релиз\n\nКомпания опубликовала")
     assert "[[source:" not in text
     assert "опубликовала отчёт" in text
     assert "#IT #разработка #новости" in text
@@ -66,7 +49,7 @@ def test_vk_crosspost_renderer_points_to_teletype_article() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vk_publisher_verifies_group_and_posts_teletype_link() -> None:
+async def test_vk_publisher_verifies_group_and_posts_without_cover_service() -> None:
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -92,7 +75,7 @@ async def test_vk_publisher_verifies_group_and_posts_teletype_link() -> None:
         elif request.url.path.endswith("/wall.post"):
             assert body["owner_id"] == ["-42"]
             assert body["from_group"] == ["1"]
-            assert body["attachments"] == ["https://teletype.in/@itvibe/release"]
+            assert "attachments" not in body
             assert body["guid"] == ["itvibe-test"]
             payload = {"response": {"post_id": 99}}
         else:  # pragma: no cover
@@ -125,7 +108,7 @@ async def test_vk_publisher_verifies_group_and_posts_teletype_link() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
+async def test_vk_publisher_posts_without_photo_when_cover_download_fails() -> None:
     wall_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -133,26 +116,18 @@ async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
         body = parse_qs(request.content.decode())
         wall_calls += 1
         assert body["guid"] == ["itvibe-preview-fallback"]
-        if wall_calls == 1:
-            assert body["message"] == ["Проверочный пост"]
-            assert body["attachments"] == ["https://teletype.in/@itvibe/release"]
-            payload = {
-                "error": {
-                    "error_code": 100,
-                    "error_msg": (
-                        "One of the parameters specified was missing or invalid: "
-                        "Violated: link_photo_sizing_rule. No photo given"
-                    ),
-                }
-            }
-        else:
-            assert body["message"] == ["Новый релиз\n\nПроверочный пост"]
-            assert "attachments" not in body
-            payload = {"response": {"post_id": 100}}
+        assert body["message"] == ["Проверочный пост"]
+        assert "attachments" not in body
+        payload = {"response": {"post_id": 100}}
         return httpx.Response(200, json=payload, request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    publisher = VkPublisher("community-token", 42, client=client)
+    publisher = VkPublisher(
+        "community-token",
+        42,
+        client=client,
+        cover_service=FailingCoverService(),  # type: ignore[arg-type]
+    )
     try:
         post_id = await publisher.publish_article(
             group_id=42,
@@ -165,154 +140,71 @@ async def test_vk_publisher_retries_without_rejected_link_preview() -> None:
         await client.aclose()
 
     assert post_id == 100
-    assert wall_calls == 2
+    assert wall_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_vk_browser_publisher_creates_photo_post_and_verifies_it() -> None:
-    wall_calls = 0
-    browser = FakeBrowserPublisher()
+async def test_vk_publisher_uploads_message_photo_and_attaches_it_to_wall() -> None:
+    cover = FakeCoverService()
+    calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal wall_calls
-        assert request.url.path.endswith("/wall.get")
-        wall_calls += 1
-        old_post = {
-            "id": 4,
-            "text": "https://teletype.in/@itvibe/release",
-            "attachments": [],
-        }
-        items = [old_post]
-        if wall_calls >= 3:
-            items.insert(
-                0,
-                {
-                    "id": 5,
-                    "text": "https://teletype.in/@itvibe/release",
-                    "attachments": [{"type": "photo", "photo": {"id": 10}}],
-                },
-            )
-        return httpx.Response(
-            200,
-            json={"response": {"count": len(items), "items": items}},
-            request=request,
-        )
+        calls.append(f"{request.url.host}{request.url.path}")
+        if request.url.host == "upload.vk.test":
+            assert b'filename="cover.jpg"' in request.content
+            assert b"jpeg-cover" in request.content
+            payload = {"server": 123, "photo": "photo-payload", "hash": "hash-value"}
+        else:
+            body = parse_qs(request.content.decode())
+            if request.url.path.endswith("/groups.setSettings"):
+                assert body["group_id"] == ["42"]
+                assert body["messages"] == ["1"]
+                payload = {"response": 1}
+            elif request.url.path.endswith("/photos.getMessagesUploadServer"):
+                assert "peer_id" not in body
+                payload = {
+                    "response": {"upload_url": "https://upload.vk.test/photo"}
+                }
+            elif request.url.path.endswith("/photos.saveMessagesPhoto"):
+                assert body["server"] == ["123"]
+                assert body["photo"] == ["photo-payload"]
+                assert body["hash"] == ["hash-value"]
+                payload = {
+                    "response": [
+                        {"owner_id": -42, "id": 777, "access_key": "photo-key"}
+                    ]
+                }
+            elif request.url.path.endswith("/wall.post"):
+                assert body["attachments"] == ["photo-42_777_photo-key"]
+                payload = {"response": {"post_id": 101}}
+            else:  # pragma: no cover
+                raise AssertionError(f"Unexpected VK request: {request.url}")
+        return httpx.Response(200, json=payload, request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     publisher = VkPublisher(
         "community-token",
         42,
         client=client,
-        browser_publisher=browser,  # type: ignore[arg-type]
+        cover_service=cover,  # type: ignore[arg-type]
     )
     try:
         post_id = await publisher.publish_article(
             group_id=42,
             message="Проверочный пост",
             article_url="https://teletype.in/@itvibe/release",
-            guid="itvibe-browser-test",
+            guid="itvibe-preview-test",
             fallback_title="Новый релиз",
         )
-        await publisher.close()
     finally:
         await client.aclose()
 
-    assert post_id == 5
-    assert browser.published == [
-        {
-            "group_id": 42,
-            "message": "Новый релиз\n\nПроверочный пост",
-            "article_url": "https://teletype.in/@itvibe/release",
-        }
+    assert post_id == 101
+    assert cover.prepared == ["https://teletype.in/@itvibe/release"]
+    assert calls == [
+        "api.vk.com/method/groups.setSettings",
+        "api.vk.com/method/photos.getMessagesUploadServer",
+        "upload.vk.test/photo",
+        "api.vk.com/method/photos.saveMessagesPhoto",
+        "api.vk.com/method/wall.post",
     ]
-    assert browser.closed is True
-    assert wall_calls == 3
-
-
-@pytest.mark.asyncio
-async def test_vk_browser_publisher_does_not_duplicate_existing_photo_post() -> None:
-    browser = FakeBrowserPublisher()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "response": {
-                    "count": 1,
-                    "items": [
-                        {
-                            "id": 7,
-                            "text": "https://teletype.in/@itvibe/release",
-                            "attachments": [{"type": "photo", "photo": {"id": 11}}],
-                        }
-                    ],
-                }
-            },
-            request=request,
-        )
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    publisher = VkPublisher(
-        "community-token",
-        42,
-        client=client,
-        browser_publisher=browser,  # type: ignore[arg-type]
-    )
-    try:
-        post_id = await publisher.publish_article(
-            group_id=42,
-            message="Проверочный пост",
-            article_url="https://teletype.in/@itvibe/release",
-            guid="itvibe-browser-test",
-        )
-    finally:
-        await publisher.close()
-        await client.aclose()
-
-    assert post_id == 7
-    assert browser.published == []
-
-
-@pytest.mark.asyncio
-async def test_browser_downloads_teletype_preview_and_converts_it_to_jpeg() -> None:
-    source = io.BytesIO()
-    Image.new("RGBA", (1200, 630), (20, 110, 220, 160)).save(source, format="PNG")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/@itvibe/release":
-            return httpx.Response(
-                200,
-                text=(
-                    "<html><head>"
-                    "<meta property='og:image' content='/cover.png'>"
-                    "</head></html>"
-                ),
-                request=request,
-            )
-        assert request.url.path == "/cover.png"
-        assert request.headers["referer"] == "https://teletype.in/@itvibe/release"
-        return httpx.Response(
-            200,
-            content=source.getvalue(),
-            headers={"content-type": "image/png"},
-            request=request,
-        )
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    browser = VkBrowserPublisher(
-        "http://webdriver.invalid/wd/hub",
-        client=client,
-        driver_factory=lambda: None,  # type: ignore[arg-type,return-value]
-    )
-    image_path = await browser._download_article_preview(
-        "https://teletype.in/@itvibe/release"
-    )
-    try:
-        with Image.open(image_path) as prepared:
-            assert prepared.format == "JPEG"
-            assert prepared.mode == "RGB"
-            assert prepared.size == (1200, 630)
-    finally:
-        image_path.unlink(missing_ok=True)
-        await browser.close()
-        await client.aclose()

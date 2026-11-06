@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -38,6 +40,26 @@ from app.renderer import (
 
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 DIGEST_MAX_LINKS = 10
+GENERIC_DIGEST_LINK_ANCHORS = {
+    "здесь",
+    "источник",
+    "оригинал",
+    "подробнее",
+    "по ссылке",
+    "ссылка",
+    "читать",
+    "читать далее",
+    "узнать больше",
+}
+DIGEST_SOURCE_ATTRIBUTION_RE = re.compile(
+    r"\b(?:"
+    r"по\s+данным|пишет|написал(?:а|и)?|сообщает|сообщил(?:а|и)?|"
+    r"отмечает|отметил(?:а|и)?|уточняет|уточнил(?:а|и)?|"
+    r"рассказывает|рассказал(?:а|и)?|считает|считают"
+    r")\b",
+    re.IGNORECASE,
+)
+logger = logging.getLogger(__name__)
 
 
 def _source_link_limit(triage: TriageDecision) -> int:
@@ -59,6 +81,39 @@ def _digest_validation_errors(
     if indices != expected:
         errors.append(
             "Ссылки дайджеста должны идти по одной в порядке источников"
+        )
+    generic_anchors = [
+        match.group(2).strip().casefold().strip(" .,!—-–")
+        for match in SOURCE_MARKER_RE.finditer(post.body)
+    ]
+    if any(
+        anchor in GENERIC_DIGEST_LINK_ANCHORS
+        or DIGEST_SOURCE_ATTRIBUTION_RE.search(anchor)
+        for anchor in generic_anchors
+    ):
+        errors.append(
+            "Ссылка должна быть встроена в сам факт новости, без «Подробнее» "
+            "и упоминания СМИ"
+        )
+    detached_markers = []
+    late_markers = []
+    for match in SOURCE_MARKER_RE.finditer(post.body):
+        paragraph_start = post.body.rfind("\n", 0, match.start()) + 1
+        prefix = post.body[paragraph_start:match.start()]
+        prefix = re.sub(r"^\s*\d+\.\s*", "", prefix)
+        if re.search(r"[.!?](?:\s|$)", prefix):
+            detached_markers.append(match.group(0))
+        if len(prefix.strip()) > 70:
+            late_markers.append(match.group(0))
+    if detached_markers:
+        errors.append(
+            "Ссылка должна стоять внутри основного предложения новости, "
+            "а не отдельной фразой после точки"
+        )
+    if late_markers:
+        errors.append(
+            "Ссылка должна быть встроена в ключевые слова в начале новости "
+            "(в первых 70 знаках), а не приписана в конце"
         )
     return errors
 
@@ -136,6 +191,9 @@ class QwenClient:
         self.max_post_chars = max_post_chars
         self.editorial_rules_provider = editorial_rules_provider
 
+    async def close(self) -> None:
+        await self.client.close()
+
     async def _editorial_rules(self) -> str:
         if self.editorial_rules_provider is None:
             return ""
@@ -182,6 +240,31 @@ class QwenClient:
             temperature=0.1,
             max_tokens=1400,
         )
+        interest_keys = (
+            "personal_significance",
+            "practical_value",
+            "surprise",
+            "evidence",
+            "technology_story",
+            "business_significance",
+        )
+        raw_breakdown = data.get("reader_interest_breakdown", {})
+        if not isinstance(raw_breakdown, dict):
+            raw_breakdown = {}
+        interest_breakdown: dict[str, int] = {}
+        for key in interest_keys:
+            try:
+                value = int(raw_breakdown.get(key, 0))
+            except (TypeError, ValueError):
+                value = 0
+            interest_breakdown[key] = max(0, min(2, value))
+        interest_score = sum(interest_breakdown.values())
+        if not any(interest_breakdown.values()):
+            try:
+                interest_score = int(data.get("reader_interest_score", 0))
+            except (TypeError, ValueError):
+                interest_score = 0
+            interest_score = max(0, min(12, interest_score))
         return TriageDecision(
             relevant=bool(data.get("relevant", False)),
             score=max(0.0, min(1.0, float(data.get("score", 0)))),
@@ -198,6 +281,8 @@ class QwenClient:
             uncertainties=[
                 str(item).strip() for item in data.get("uncertainties", []) if str(item).strip()
             ],
+            reader_interest_score=interest_score,
+            reader_interest_breakdown=interest_breakdown,
         )
 
     async def fact_check(
@@ -685,3 +770,284 @@ class QwenClient:
                 return normalized
             current = normalized
         raise ValueError("Digest failed validation after repair: " + "; ".join(remaining))
+
+
+class DeepSeekClient(QwenClient):
+    """DeepSeek implementation for text tasks used by the editorial pipeline."""
+
+    async def _completion(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            # DeepSeek enables high-effort thinking by default. These pipeline
+            # calls need deterministic structured output instead, otherwise the
+            # hidden reasoning can consume the whole output budget before JSON
+            # is emitted. Keep a generous visible-output budget for digests.
+            token_budget = max(8192, max_tokens * 2) * (attempt + 1)
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=temperature,
+                max_tokens=token_budget,
+                response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            choice = response.choices[0]
+            content = choice.message.content
+            finish_reason = str(getattr(choice, "finish_reason", "stop") or "")
+            if content and content.strip() and finish_reason != "length":
+                try:
+                    return _parse_json(content)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    last_error = exc
+            else:
+                last_error = RuntimeError(
+                    "DeepSeek returned empty or truncated JSON"
+                )
+            if attempt == 0:
+                logger.warning(
+                    "DeepSeek JSON response was unusable (%s); retrying",
+                    finish_reason or "unknown",
+                )
+        raise RuntimeError("DeepSeek failed to return valid JSON") from last_error
+
+    async def fact_check(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> FactCheckResult:
+        del sources
+        context = {
+            "current_date": datetime.now(UTC).date().isoformat(),
+            "candidate": candidate.to_dict(),
+        }
+        last_error: Exception | None = None
+        data: dict[str, Any] | None = None
+        for attempt in range(2):
+            response = await self.client.responses.create(
+                model=self.writer_model,
+                input=(
+                    f"{FACT_CHECK_PROMPT}\n\n"
+                    f"Return only JSON.\n{json.dumps(context, ensure_ascii=False)}"
+                ),
+                tools=[{"type": "web_search"}],
+                text={"format": {"type": "json_object"}},
+                reasoning={"effort": "none"},
+                max_output_tokens=8192 * (attempt + 1),
+            )
+            content = str(response.output_text or "").strip()
+            status = str(getattr(response, "status", "completed") or "")
+            if content and status != "incomplete":
+                try:
+                    data = _parse_json(content)
+                    break
+                except (json.JSONDecodeError, TypeError) as exc:
+                    last_error = exc
+            else:
+                last_error = RuntimeError(
+                    "DeepSeek fact-check returned empty or truncated JSON"
+                )
+            if attempt == 0:
+                logger.warning(
+                    "DeepSeek fact-check JSON was unusable (%s); retrying",
+                    status or "unknown",
+                )
+        if data is None:
+            raise RuntimeError(
+                "DeepSeek fact-check failed to return valid JSON"
+            ) from last_error
+
+        source_urls: list[str] = []
+        source_evidence: dict[str, str] = {}
+        for item in data.get("sources", []):
+            value = item.get("url", "") if isinstance(item, dict) else item
+            url = str(value or "").strip()
+            if url.startswith(("http://", "https://")) and url not in source_urls:
+                source_urls.append(url)
+            if isinstance(item, dict) and url:
+                evidence = str(item.get("evidence", "") or "").strip()
+                if evidence:
+                    source_evidence[url] = evidence[:3000]
+
+        return FactCheckResult(
+            facts=[str(item).strip() for item in data.get("facts", []) if str(item).strip()],
+            uncertainties=[
+                str(item).strip()
+                for item in data.get("uncertainties", [])
+                if str(item).strip()
+            ],
+            source_urls=source_urls[:6],
+            source_evidence={
+                url: source_evidence[url]
+                for url in source_urls[:6]
+                if url in source_evidence
+            },
+        )
+
+    async def search_images(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+        excluded_urls: list[str] | None = None,
+    ) -> list[dict[str, str | int]]:
+        del candidate, sources, triage, post, excluded_urls
+        # DeepSeek has text web search, but no equivalent of Qwen's
+        # web_search_image tool. Source and Open Graph media remain available.
+        return []
+
+
+class FallbackLLMClient:
+    """Use the secondary provider while the primary provider is unavailable."""
+
+    def __init__(
+        self,
+        primary: QwenClient,
+        fallback: DeepSeekClient,
+        *,
+        cooldown_seconds: int = 300,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.cooldown_seconds = cooldown_seconds
+        self._primary_unavailable_until = 0.0
+
+    async def close(self) -> None:
+        await self.primary.close()
+        await self.fallback.close()
+
+    async def _call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        now = time.monotonic()
+        if now >= self._primary_unavailable_until:
+            try:
+                result = await getattr(self.primary, method_name)(*args, **kwargs)
+            except Exception as error:  # noqa: BLE001 - provider failover boundary
+                self._primary_unavailable_until = (
+                    time.monotonic() + self.cooldown_seconds
+                )
+                logger.warning(
+                    "Primary LLM failed in %s (%s); using fallback for %s seconds",
+                    method_name,
+                    type(error).__name__,
+                    self.cooldown_seconds,
+                )
+            else:
+                if self._primary_unavailable_until:
+                    logger.info("Primary LLM provider recovered")
+                self._primary_unavailable_until = 0.0
+                return result
+        return await getattr(self.fallback, method_name)(*args, **kwargs)
+
+    async def triage(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> TriageDecision:
+        return await self._call("triage", candidate, sources)
+
+    async def fact_check(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> FactCheckResult:
+        return await self._call("fact_check", candidate, sources)
+
+    async def verify_fact_check(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+    ) -> FactCheckResult:
+        return await self._call("verify_fact_check", candidate, sources)
+
+    async def generate(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+    ) -> GeneratedPost:
+        return await self._call("generate", candidate, sources, triage)
+
+    async def generate_digest(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+    ) -> GeneratedPost:
+        return await self._call("generate_digest", candidate, sources, triage)
+
+    async def search_images(
+        self,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+        excluded_urls: list[str] | None = None,
+    ) -> list[dict[str, str | int]]:
+        return await self._call(
+            "search_images",
+            candidate,
+            sources,
+            triage,
+            post,
+            excluded_urls,
+        )
+
+    async def regenerate_component(
+        self,
+        component: str,
+        candidate: StoryCandidate,
+        sources: list[SourceDocument],
+        triage: TriageDecision,
+        post: GeneratedPost,
+    ) -> GeneratedPost:
+        return await self._call(
+            "regenerate_component",
+            component,
+            candidate,
+            sources,
+            triage,
+            post,
+        )
+
+    async def repair(
+        self,
+        post: GeneratedPost,
+        sources: list[SourceDocument],
+        errors: list[str],
+        *,
+        editorial_rules: str = "",
+    ) -> GeneratedPost:
+        return await self._call(
+            "repair",
+            post,
+            sources,
+            errors,
+            editorial_rules=editorial_rules,
+        )
+
+    async def repair_digest(
+        self,
+        post: GeneratedPost,
+        sources: list[SourceDocument],
+        errors: list[str],
+        *,
+        editorial_rules: str = "",
+    ) -> GeneratedPost:
+        return await self._call(
+            "repair_digest",
+            post,
+            sources,
+            errors,
+            editorial_rules=editorial_rules,
+        )

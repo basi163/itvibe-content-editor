@@ -293,6 +293,24 @@ def test_writer_prompt_renders_limit_without_consuming_json_braces() -> None:
     assert '"title": ""' in prompt
 
 
+def test_triage_prompt_adds_reader_interest_without_new_rejection_gate() -> None:
+    from app.prompts import TRIAGE_SYSTEM_PROMPT
+
+    assert "reader_interest_score" in TRIAGE_SYSTEM_PROMPT
+    assert "personal_significance" in TRIAGE_SYSTEM_PROMPT
+    assert "не отклоняй подходящую" in TRIAGE_SYSTEM_PROMPT
+
+
+def test_writer_prompts_include_reader_value_editorial_logic() -> None:
+    ordinary = render_writer_system_prompt(2000)
+    digest = render_digest_writer_system_prompt(2000)
+
+    assert "Факт → Последствие" in ordinary
+    assert "не делай каждую новость сенсацией" in ordinary
+    assert "Редакционная подача дайджеста" in digest
+    assert "не раздувай пункты до мини-статей" in digest.casefold()
+
+
 def test_writer_prompts_append_editorial_rules_after_required_rules() -> None:
     rule = "Начинай второй абзац с практического следствия."
 
@@ -303,6 +321,17 @@ def test_writer_prompts_append_editorial_rules_after_required_rules() -> None:
         assert rule in prompt
         assert "Дополнительные редакционные правила" in prompt
         assert "приоритет имеют жесткие правила" in prompt
+
+
+def test_digest_prompt_requires_contextual_links_instead_of_more_label() -> None:
+    prompt = render_digest_writer_system_prompt(2000)
+
+    assert "смысловой части самой новости" in prompt
+    assert "Никогда не используй для ссылки" in prompt
+    assert "Подробнее" in prompt
+    assert "До маркера" in prompt
+    assert "не должно быть точки" in prompt
+    assert "первых 70" in prompt
 
 
 def test_renderer_does_not_link_non_primary_source() -> None:

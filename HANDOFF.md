@@ -41,6 +41,9 @@ the terminal. Never write them to Git or display them in logs.
   and must be entered as `TELETYPE_ACCESS_TOKEN` directly in the server `.env`.
 - Optional VK community token and numeric group ID. They are required only for
   Teletype-to-VK crossposting and must be entered with `scripts/set_vk_token.sh`.
+  Community messages must remain enabled: the crossposter uses VK's
+  group-authorized message-photo upload endpoint and attaches the saved native
+  photo object to the wall post. No private message is sent.
 
 Credentials previously pasted into chat must be treated as temporary and should
 be rotated after verification.
@@ -144,8 +147,10 @@ be rotated after verification.
   A VK failure never rolls back a Teletype article. The editorial home menu can connect
   the configured VK community, enable or disable delivery, show queue statistics and
   retry terminal failures. Community tokens remain in `.env`; Telegram accepts only the
-  public group URL. New social networks should be added as crossposting adapters rather
-  than as additional Telegram polling bots.
+  public group URL. A small public Open Graph endpoint rehosts each Teletype cover as a
+  VK-friendly JPEG link card, avoiding user tokens and browser automation. New social
+  networks should be added as crossposting adapters rather than as additional Telegram
+  polling bots.
 
 ## Completion criteria
 

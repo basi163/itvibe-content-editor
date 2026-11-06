@@ -223,11 +223,34 @@ def parse_editor_post_text(value: str, original_body: str) -> GeneratedPost:
         for index, paragraph in enumerate(paragraphs[1:], start=1)
         if index not in hashtag_indices
     ).strip()
+    markers_by_anchor: dict[str, list[str]] = {}
     for match in SOURCE_MARKER_RE.finditer(original_body):
-        marker = match.group(0)
         anchor = match.group(2).strip()
-        if anchor and marker not in body and anchor in body:
-            body = body.replace(anchor, marker, 1)
+        if anchor:
+            markers_by_anchor.setdefault(anchor, []).append(match.group(0))
+    if markers_by_anchor:
+        # Telegram exposes only the visible anchor text after a native edit. Restore
+        # the internal markers in one pass over that plain text. Replacing anchors
+        # one after another would search inside markers inserted earlier and corrupt
+        # repeated labels such as "Подробнее" by nesting their markers.
+        anchor_pattern = re.compile(
+            "|".join(
+                re.escape(anchor)
+                for anchor in sorted(markers_by_anchor, key=len, reverse=True)
+            )
+        )
+        anchor_positions = {anchor: 0 for anchor in markers_by_anchor}
+
+        def restore_marker(match: re.Match[str]) -> str:
+            anchor = match.group(0)
+            position = anchor_positions[anchor]
+            markers = markers_by_anchor[anchor]
+            if position >= len(markers):
+                return anchor
+            anchor_positions[anchor] = position + 1
+            return markers[position]
+
+        body = anchor_pattern.sub(restore_marker, body)
     return GeneratedPost(title=title, body=body, hashtags=hashtags)
 
 

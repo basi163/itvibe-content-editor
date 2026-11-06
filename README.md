@@ -204,6 +204,12 @@ chmod 600 .env
 ```dotenv
 TELEGRAM_BOT_TOKEN=replace_me
 QWEN_API_KEY=replace_me
+# Необязательно: резервная модель при недоступности Qwen.
+DEEPSEEK_API_KEY=replace_me
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_TRIAGE_MODEL=deepseek-flash
+DEEPSEEK_WRITER_MODEL=deepseek-v4-pro
+LLM_FAILOVER_COOLDOWN_SECONDS=300
 # Необязательно: только если нужна публикация в Teletype.
 TELETYPE_ACCESS_TOKEN=replace_me
 TELETYPE_CLIENT_VERSION=4.41.26
@@ -211,20 +217,12 @@ TELETYPE_CLIENT_VERSION=4.41.26
 VK_COMMUNITY_ACCESS_TOKEN=replace_me
 VK_COMMUNITY_GROUP_ID=123456789
 VK_API_VERSION=5.199
-# Публикация обложки через обычный веб-редактор VK.
-VK_BROWSER_WEBDRIVER_URL=http://vk-browser:4444/wd/hub
-VK_BROWSER_TIMEOUT_SECONDS=45
 ```
 
-Для первичного входа в VK открыть защищённый SSH-туннель:
-
-```bash
-ssh -L 7900:127.0.0.1:7900 root@SERVER_IP
-```
-
-Затем открыть `http://localhost:7900`, войти в VK как
-администратор сообщества и закрыть вкладку. Профиль Chromium
-хранится в Docker volume и не публикуется в сеть.
+Для обложки сервис скачивает Open Graph-изображение Teletype, преобразует его в
+JPEG 1200×630 и загружает как нативную фотографию сообщества VK. Для этого в
+сообществе должны оставаться включены сообщения. Пользовательский токен и вход
+через браузер не нужны.
 
 Скопировать `LLM_BASE_URL` из рабочего пространства Model Studio. Ключи и адреса
 Singapore, US Virginia и China Beijing не взаимозаменяемы.

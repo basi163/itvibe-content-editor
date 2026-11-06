@@ -59,6 +59,11 @@ class Settings:
     llm_base_url: str
     triage_model: str
     writer_model: str
+    deepseek_api_key: str
+    deepseek_base_url: str
+    deepseek_triage_model: str
+    deepseek_writer_model: str
+    llm_failover_cooldown_seconds: int
     database_path: Path
     solidot_rss_url: str
     rss_poll_interval_seconds: int
@@ -81,8 +86,6 @@ class Settings:
     vk_community_access_token: str
     vk_community_group_id: int | None
     vk_api_version: str
-    vk_browser_webdriver_url: str
-    vk_browser_timeout_seconds: float
 
     @classmethod
     def load(cls) -> Settings:
@@ -93,6 +96,19 @@ class Settings:
             llm_base_url=os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
             triage_model=os.getenv("TRIAGE_MODEL", "qwen3.8-flash").strip(),
             writer_model=os.getenv("WRITER_MODEL", "qwen3.7-plus").strip(),
+            deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
+            deepseek_base_url=os.getenv(
+                "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
+            ).strip().rstrip("/"),
+            deepseek_triage_model=os.getenv(
+                "DEEPSEEK_TRIAGE_MODEL", "deepseek-flash"
+            ).strip(),
+            deepseek_writer_model=os.getenv(
+                "DEEPSEEK_WRITER_MODEL", "deepseek-v4-pro"
+            ).strip(),
+            llm_failover_cooldown_seconds=int(
+                os.getenv("LLM_FAILOVER_COOLDOWN_SECONDS", "300")
+            ),
             database_path=Path(os.getenv("DATABASE_PATH", "data/editor.sqlite3")),
             solidot_rss_url=os.getenv(
                 "SOLIDOT_RSS_URL", "https://www.solidot.org/index.rss"
@@ -136,12 +152,6 @@ class Settings:
             ).strip(),
             vk_community_group_id=_optional_int("VK_COMMUNITY_GROUP_ID"),
             vk_api_version=os.getenv("VK_API_VERSION", "5.199").strip(),
-            vk_browser_webdriver_url=os.getenv(
-                "VK_BROWSER_WEBDRIVER_URL", ""
-            ).strip(),
-            vk_browser_timeout_seconds=float(
-                os.getenv("VK_BROWSER_TIMEOUT_SECONDS", "45")
-            ),
         )
         settings.validate()
         settings.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +167,16 @@ class Settings:
             missing.append("LLM_BASE_URL")
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+        if self.deepseek_api_key and not self.deepseek_base_url.startswith(
+            ("http://", "https://")
+        ):
+            raise RuntimeError("DEEPSEEK_BASE_URL must be an HTTP(S) URL")
+        if self.deepseek_api_key and (
+            not self.deepseek_triage_model or not self.deepseek_writer_model
+        ):
+            raise RuntimeError("DeepSeek model names are required with DEEPSEEK_API_KEY")
+        if self.llm_failover_cooldown_seconds < 30:
+            raise RuntimeError("LLM_FAILOVER_COOLDOWN_SECONDS must be at least 30")
         if not 512 <= self.max_post_chars <= 4096:
             raise RuntimeError("MAX_POST_CHARS must be between 512 and 4096")
         if not 0 <= self.relevance_threshold <= 1:
@@ -171,12 +191,6 @@ class Settings:
             )
         if self.vk_community_group_id is not None and self.vk_community_group_id <= 0:
             raise RuntimeError("VK_COMMUNITY_GROUP_ID must be positive")
-        if self.vk_browser_webdriver_url and not self.vk_browser_webdriver_url.startswith(
-            ("http://", "https://")
-        ):
-            raise RuntimeError("VK_BROWSER_WEBDRIVER_URL must be an HTTP(S) URL")
-        if self.vk_browser_timeout_seconds < 15:
-            raise RuntimeError("VK_BROWSER_TIMEOUT_SECONDS must be at least 15")
         if self.rss_poll_interval_seconds < 30:
             raise RuntimeError("RSS_POLL_INTERVAL_SECONDS must be at least 30")
         if self.rss_offpeak_poll_interval_seconds < self.rss_poll_interval_seconds:

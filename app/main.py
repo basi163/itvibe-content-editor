@@ -10,32 +10,15 @@ from app.config import Settings
 from app.crossposting import CrosspostingService
 from app.db import Repository
 from app.extractor import ArticleExtractor
-from app.llm import QwenClient
+from app.llm import DeepSeekClient, FallbackLLMClient, QwenClient
 from app.pipeline import ContentPipeline
 from app.rss_sources import RssSourceManager
 from app.telegram_sources import TelegramSourceManager
 from app.teletype import TeletypePublisher
 from app.vk import VkPublisher
-from app.vk_browser import VkBrowserAuthRequired, VkBrowserError, VkBrowserPublisher
+from app.vk_media import TeletypeCoverService
 
 logger = logging.getLogger(__name__)
-
-
-async def warm_vk_browser(publisher: VkPublisher) -> None:
-    for attempt in range(1, 31):
-        try:
-            await publisher.open_browser_group()
-            logger.info("VK browser session is ready")
-            return
-        except VkBrowserAuthRequired:
-            logger.info("VK browser is ready and waiting for administrator login")
-            return
-        except VkBrowserError:
-            if attempt == 30:
-                logger.exception("VK browser warm-up failed")
-                return
-            logger.info("VK browser is starting; warm-up attempt %s/30", attempt)
-            await asyncio.sleep(4)
 
 
 def rss_poll_delay_seconds(settings: Settings, now: datetime | None = None) -> int:
@@ -172,7 +155,7 @@ async def main() -> None:
     repository = Repository(settings.database_path)
     await repository.initialize()
     extractor = ArticleExtractor(settings.http_timeout_seconds, settings.max_source_links)
-    llm = QwenClient(
+    primary_llm = QwenClient(
         api_key=settings.qwen_api_key,
         base_url=settings.llm_base_url,
         triage_model=settings.triage_model,
@@ -182,6 +165,24 @@ async def main() -> None:
             "editorial_rewrite_rules"
         ),
     )
+    if settings.deepseek_api_key:
+        fallback_llm = DeepSeekClient(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            triage_model=settings.deepseek_triage_model,
+            writer_model=settings.deepseek_writer_model,
+            max_post_chars=settings.max_post_chars,
+            editorial_rules_provider=lambda: repository.get_setting(
+                "editorial_rewrite_rules"
+            ),
+        )
+        llm = FallbackLLMClient(
+            primary_llm,
+            fallback_llm,
+            cooldown_seconds=settings.llm_failover_cooldown_seconds,
+        )
+    else:
+        llm = primary_llm
     pipeline = ContentPipeline(
         settings=settings,
         repository=repository,
@@ -209,12 +210,9 @@ async def main() -> None:
         if settings.teletype_access_token
         else None
     )
-    vk_browser_publisher = (
-        VkBrowserPublisher(
-            settings.vk_browser_webdriver_url,
-            timeout=settings.vk_browser_timeout_seconds,
-        )
-        if settings.vk_browser_webdriver_url
+    vk_cover_service = (
+        TeletypeCoverService(timeout=settings.http_timeout_seconds)
+        if settings.vk_community_access_token and settings.vk_community_group_id
         else None
     )
     vk_publisher = (
@@ -223,7 +221,7 @@ async def main() -> None:
             settings.vk_community_group_id,
             api_version=settings.vk_api_version,
             timeout=settings.http_timeout_seconds,
-            browser_publisher=vk_browser_publisher,
+            cover_service=vk_cover_service,
         )
         if settings.vk_community_access_token and settings.vk_community_group_id
         else None
@@ -259,11 +257,6 @@ async def main() -> None:
         draft_cleanup_worker(settings, repository, stop_event)
     )
     crossposting_task = asyncio.create_task(crossposting.worker(stop_event))
-    vk_browser_task = (
-        asyncio.create_task(warm_vk_browser(vk_publisher))
-        if vk_publisher and vk_publisher.uses_browser
-        else None
-    )
     try:
         await editor_bot.start_polling()
     finally:
@@ -274,21 +267,21 @@ async def main() -> None:
         publish_task.cancel()
         cleanup_task.cancel()
         crossposting_task.cancel()
-        if vk_browser_task:
-            vk_browser_task.cancel()
         await asyncio.gather(
             feed_task,
             telegram_task,
             publish_task,
             cleanup_task,
             crossposting_task,
-            *([vk_browser_task] if vk_browser_task else []),
             return_exceptions=True,
         )
         await extractor.close()
+        await llm.close()
         if teletype_publisher:
             await teletype_publisher.close()
         await crossposting.close()
+        if vk_cover_service:
+            await vk_cover_service.close()
         await editor_bot.close()
 
 

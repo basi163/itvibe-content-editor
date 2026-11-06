@@ -22,7 +22,7 @@ from app.extractor import (
     is_telegram_url,
     normalize_url,
 )
-from app.llm import QwenClient
+from app.llm import FallbackLLMClient, QwenClient
 from app.models import (
     FactCheckResult,
     GeneratedPost,
@@ -77,7 +77,7 @@ class ContentPipeline:
         settings: Settings,
         repository: Repository,
         extractor: ArticleExtractor,
-        llm: QwenClient,
+        llm: QwenClient | FallbackLLMClient,
     ) -> None:
         self.settings = settings
         self.repository = repository
