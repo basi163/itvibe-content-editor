@@ -90,6 +90,20 @@ WEEKDAY_NAMES = (
     "воскресенье",
 )
 WEEKDAY_SHORT_NAMES = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+MONTH_NAMES_GENITIVE = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
 UNPUBLISHED_PAGE_SIZE = 8
 
 
@@ -1711,36 +1725,7 @@ class EditorBot:
     ) -> None:
         drafts = await self.repository.scheduled_drafts()
         target_label = await self._target_channel_label()
-        lines = [
-            "<b>Контент-план</b>",
-            f"Каналы публикации  <b>{html.escape(target_label)}</b>",
-            "",
-        ]
-        if drafts:
-            for draft in drafts:
-                for publication in draft.get("publications", []):
-                    if publication.get("status") != "scheduled":
-                        continue
-                    scheduled_at = self._publication_scheduled_at(publication)
-                    draft_target_label = await self._channel_label(
-                        publication.get("target_chat_id")
-                    )
-                    when = (
-                        format_publish_time(
-                            scheduled_at,
-                            self.settings.publish_schedule_utc_offset_hours,
-                        )
-                        if scheduled_at
-                        else "время не указано"
-                    )
-                    lines.append(
-                        f"<b>#{draft['id']}</b>  {when}\n"
-                        f"{html.escape(str(draft['title']))}\n"
-                        f"Канал  <b>{html.escape(draft_target_label)}</b>"
-                    )
-        else:
-            lines.append("Запланированных постов пока нет.")
-        text = "\n\n".join(lines)
+        text = await self._content_plan_text(drafts)
         keyboard = await self._with_navigation(
             self._content_plan_keyboard(drafts, target_label),
             user_id,
@@ -1760,6 +1745,115 @@ class EditorBot:
             except TelegramBadRequest:
                 logger.info("Could not refresh content plan message; sending a new one")
         await self.bot.send_message(chat_id, text, reply_markup=keyboard)
+
+    async def _content_plan_text(self, drafts: list[dict[str, Any]]) -> str:
+        offset = self.settings.publish_schedule_utc_offset_hours
+        local_tz = _publish_timezone(offset)
+        entries: list[dict[str, Any]] = []
+        channel_keys: set[str] = set()
+        publication_count = 0
+
+        for draft in drafts:
+            publications: list[tuple[datetime | None, str]] = []
+            for publication in draft.get("publications", []):
+                if publication.get("status") != "scheduled":
+                    continue
+                target_id = publication.get("target_chat_id")
+                channel_keys.add(str(target_id))
+                publication_count += 1
+                publications.append(
+                    (
+                        self._publication_scheduled_at(publication),
+                        await self._channel_label(target_id),
+                    )
+                )
+            if not publications:
+                continue
+            scheduled_times = [value for value, _ in publications if value]
+            entries.append(
+                {
+                    "id": int(draft["id"]),
+                    "title": str(draft["title"]),
+                    "publications": publications,
+                    "anchor": min(scheduled_times) if scheduled_times else None,
+                }
+            )
+
+        sign = "+" if offset >= 0 else ""
+        lines = [
+            "🗓 <b>Контент-план</b>",
+            (
+                f"Постов: <b>{len(entries)}</b> · "
+                f"публикаций: <b>{publication_count}</b> · "
+                f"каналов: <b>{len(channel_keys)}</b> · UTC{sign}{offset}"
+            ),
+        ]
+        if not entries:
+            lines.extend(("", "Запланированных постов пока нет."))
+            return "\n".join(lines)
+
+        entries.sort(
+            key=lambda entry: (
+                entry["anchor"] is None,
+                entry["anchor"] or datetime.max.replace(tzinfo=UTC),
+                entry["id"],
+            )
+        )
+        grouped: dict[Any, list[dict[str, Any]]] = {}
+        for entry in entries:
+            anchor = entry["anchor"]
+            day = anchor.astimezone(local_tz).date() if anchor else None
+            grouped.setdefault(day, []).append(entry)
+
+        for day, day_entries in grouped.items():
+            lines.append("")
+            if day is None:
+                lines.append("📅 <b>Без указанного времени</b>")
+            else:
+                weekday = WEEKDAY_NAMES[day.weekday()]
+                month = MONTH_NAMES_GENITIVE[day.month - 1]
+                lines.append(
+                    f"📅 <b>{day.day} {month} {day.year}, {weekday}</b> · "
+                    f"постов: {len(day_entries)}"
+                )
+
+            for entry in day_entries:
+                anchor = entry["anchor"]
+                title = html.escape(entry["title"])
+                if anchor:
+                    anchor_local = anchor.astimezone(local_tz)
+                    lines.append(
+                        f"<b>{anchor_local:%H:%M} · #{entry['id']}</b> — {title}"
+                    )
+                else:
+                    anchor_local = None
+                    lines.append(f"<b>#{entry['id']}</b> — {title}")
+
+                timed_groups: dict[datetime, list[str]] = {}
+                untimed_labels: list[str] = []
+                for scheduled_at, channel_label in entry["publications"]:
+                    escaped_label = html.escape(channel_label)
+                    if scheduled_at is None:
+                        untimed_labels.append(escaped_label)
+                        continue
+                    local_value = scheduled_at.astimezone(local_tz)
+                    timed_groups.setdefault(local_value, []).append(escaped_label)
+
+                segments: list[str] = []
+                for local_value, labels in sorted(timed_groups.items()):
+                    label = " + ".join(dict.fromkeys(labels))
+                    if anchor_local and local_value == anchor_local:
+                        segments.append(label)
+                    elif anchor_local and local_value.date() == anchor_local.date():
+                        segments.append(f"{local_value:%H:%M} — {label}")
+                    else:
+                        segments.append(f"{local_value:%d.%m %H:%M} — {label}")
+                if untimed_labels:
+                    labels = " + ".join(dict.fromkeys(untimed_labels))
+                    segments.append(f"без времени — {labels}")
+                lines.append("↳ " + "; ".join(segments))
+
+        return "\n".join(lines)
 
     async def _show_plan_item(
         self,

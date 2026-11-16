@@ -376,6 +376,56 @@ def test_content_plan_keyboard_opens_posts_and_channel_settings() -> None:
     assert "schedule:0" in callbacks
 
 
+@pytest.mark.asyncio
+async def test_content_plan_groups_posts_by_day_without_duplicate_titles() -> None:
+    editor = object.__new__(EditorBot)
+    editor.settings = SimpleNamespace(publish_schedule_utc_offset_hours=4)
+    editor._channel_label = AsyncMock(
+        side_effect=lambda channel_id: {
+            9_000_000_000_001_234: "Teletype · IT Vibe",
+            -1001: "IT Vibe",
+        }[channel_id]
+    )
+    drafts = [
+        {
+            "id": 517,
+            "title": "⚡️ Срочное обновление Tor",
+            "publications": [
+                {
+                    "status": "scheduled",
+                    "target_chat_id": 9_000_000_000_001_234,
+                    "scheduled_at": "2026-11-17T05:00:00+00:00",
+                },
+                {
+                    "status": "scheduled",
+                    "target_chat_id": -1001,
+                    "scheduled_at": "2026-11-18T16:10:00+00:00",
+                },
+            ],
+        },
+        {
+            "id": 518,
+            "title": "Microsoft меняет цены на облака",
+            "publications": [
+                {
+                    "status": "scheduled",
+                    "target_chat_id": -1001,
+                    "scheduled_at": "2026-11-17T06:00:00+00:00",
+                }
+            ],
+        },
+    ]
+
+    text = await editor._content_plan_text(drafts)
+
+    assert "Постов: <b>2</b> · публикаций: <b>3</b> · каналов: <b>2</b>" in text
+    assert "📅 <b>17 ноября 2026, вторник</b> · постов: 2" in text
+    assert text.count("⚡️ Срочное обновление Tor") == 1
+    assert text.count("<b>09:00 · #517</b>") == 1
+    assert "↳ Teletype · IT Vibe; 18.11 20:10 — IT Vibe" in text
+    assert "<b>10:00 · #518</b> — Microsoft меняет цены на облака" in text
+
+
 def test_schedule_keyboard_has_weekdays_times_and_management_actions() -> None:
     keyboard = EditorBot._schedule_keyboard(
         -1001234567890,
