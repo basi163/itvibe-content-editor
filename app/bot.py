@@ -1749,109 +1749,88 @@ class EditorBot:
     async def _content_plan_text(self, drafts: list[dict[str, Any]]) -> str:
         offset = self.settings.publish_schedule_utc_offset_hours
         local_tz = _publish_timezone(offset)
-        entries: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        draft_ids: set[int] = set()
         channel_keys: set[str] = set()
-        publication_count = 0
 
         for draft in drafts:
-            publications: list[tuple[datetime | None, str]] = []
             for publication in draft.get("publications", []):
                 if publication.get("status") != "scheduled":
                     continue
                 target_id = publication.get("target_chat_id")
+                scheduled_at = self._publication_scheduled_at(publication)
+                draft_id = int(draft["id"])
+                draft_ids.add(draft_id)
                 channel_keys.add(str(target_id))
-                publication_count += 1
-                publications.append(
-                    (
-                        self._publication_scheduled_at(publication),
-                        await self._channel_label(target_id),
-                    )
+                events.append(
+                    {
+                        "id": draft_id,
+                        "title": str(draft["title"]),
+                        "scheduled_at": scheduled_at,
+                        "channel": await self._channel_label(target_id),
+                    }
                 )
-            if not publications:
-                continue
-            scheduled_times = [value for value, _ in publications if value]
-            entries.append(
-                {
-                    "id": int(draft["id"]),
-                    "title": str(draft["title"]),
-                    "publications": publications,
-                    "anchor": min(scheduled_times) if scheduled_times else None,
-                }
-            )
 
         sign = "+" if offset >= 0 else ""
         lines = [
             "🗓 <b>Контент-план</b>",
             (
-                f"Постов: <b>{len(entries)}</b> · "
-                f"публикаций: <b>{publication_count}</b> · "
+                f"Постов: <b>{len(draft_ids)}</b> · "
+                f"публикаций: <b>{len(events)}</b> · "
                 f"каналов: <b>{len(channel_keys)}</b> · UTC{sign}{offset}"
             ),
         ]
-        if not entries:
+        if not events:
             lines.extend(("", "Запланированных постов пока нет."))
             return "\n".join(lines)
 
-        entries.sort(
-            key=lambda entry: (
-                entry["anchor"] is None,
-                entry["anchor"] or datetime.max.replace(tzinfo=UTC),
-                entry["id"],
+        events.sort(
+            key=lambda event: (
+                event["scheduled_at"] is None,
+                event["scheduled_at"] or datetime.max.replace(tzinfo=UTC),
+                event["id"],
+                event["channel"].casefold(),
             )
         )
-        grouped: dict[Any, list[dict[str, Any]]] = {}
-        for entry in entries:
-            anchor = entry["anchor"]
-            day = anchor.astimezone(local_tz).date() if anchor else None
-            grouped.setdefault(day, []).append(entry)
+        grouped: dict[Any, dict[str, list[dict[str, Any]]]] = {}
+        for event in events:
+            scheduled_at = event["scheduled_at"]
+            day = scheduled_at.astimezone(local_tz).date() if scheduled_at else None
+            day_channels = grouped.setdefault(day, {})
+            day_channels.setdefault(event["channel"], []).append(event)
 
-        for day, day_entries in grouped.items():
+        for day, day_channels in grouped.items():
+            day_publication_count = sum(len(values) for values in day_channels.values())
             lines.append("")
             if day is None:
-                lines.append("📅 <b>Без указанного времени</b>")
+                lines.append(
+                    "📅 <b>Без указанного времени</b> · "
+                    f"публикаций: {day_publication_count}"
+                )
             else:
                 weekday = WEEKDAY_NAMES[day.weekday()]
                 month = MONTH_NAMES_GENITIVE[day.month - 1]
                 lines.append(
                     f"📅 <b>{day.day} {month} {day.year}, {weekday}</b> · "
-                    f"постов: {len(day_entries)}"
+                    f"публикаций: {day_publication_count}"
                 )
 
-            for entry in day_entries:
-                anchor = entry["anchor"]
-                title = html.escape(entry["title"])
-                if anchor:
-                    anchor_local = anchor.astimezone(local_tz)
-                    lines.append(
-                        f"<b>{anchor_local:%H:%M} · #{entry['id']}</b> — {title}"
-                    )
-                else:
-                    anchor_local = None
-                    lines.append(f"<b>#{entry['id']}</b> — {title}")
-
-                timed_groups: dict[datetime, list[str]] = {}
-                untimed_labels: list[str] = []
-                for scheduled_at, channel_label in entry["publications"]:
-                    escaped_label = html.escape(channel_label)
-                    if scheduled_at is None:
-                        untimed_labels.append(escaped_label)
-                        continue
-                    local_value = scheduled_at.astimezone(local_tz)
-                    timed_groups.setdefault(local_value, []).append(escaped_label)
-
-                segments: list[str] = []
-                for local_value, labels in sorted(timed_groups.items()):
-                    label = " + ".join(dict.fromkeys(labels))
-                    if anchor_local and local_value == anchor_local:
-                        segments.append(label)
-                    elif anchor_local and local_value.date() == anchor_local.date():
-                        segments.append(f"{local_value:%H:%M} — {label}")
+            for channel_label, channel_events in day_channels.items():
+                lines.append("")
+                lines.append(
+                    f"📡 <b>{html.escape(channel_label)}</b> · "
+                    f"{len(channel_events)}"
+                )
+                for event in channel_events:
+                    title = html.escape(event["title"])
+                    scheduled_at = event["scheduled_at"]
+                    if scheduled_at:
+                        local_value = scheduled_at.astimezone(local_tz)
+                        lines.append(
+                            f"<b>{local_value:%H:%M} · #{event['id']}</b> — {title}"
+                        )
                     else:
-                        segments.append(f"{local_value:%d.%m %H:%M} — {label}")
-                if untimed_labels:
-                    labels = " + ".join(dict.fromkeys(untimed_labels))
-                    segments.append(f"без времени — {labels}")
-                lines.append("↳ " + "; ".join(segments))
+                        lines.append(f"<b>#{event['id']}</b> — {title}")
 
         return "\n".join(lines)
 

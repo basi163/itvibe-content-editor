@@ -377,7 +377,7 @@ def test_content_plan_keyboard_opens_posts_and_channel_settings() -> None:
 
 
 @pytest.mark.asyncio
-async def test_content_plan_groups_posts_by_day_without_duplicate_titles() -> None:
+async def test_content_plan_groups_publications_by_day_and_channel() -> None:
     editor = object.__new__(EditorBot)
     editor.settings = SimpleNamespace(publish_schedule_utc_offset_hours=4)
     editor._channel_label = AsyncMock(
@@ -419,11 +419,13 @@ async def test_content_plan_groups_posts_by_day_without_duplicate_titles() -> No
     text = await editor._content_plan_text(drafts)
 
     assert "Постов: <b>2</b> · публикаций: <b>3</b> · каналов: <b>2</b>" in text
-    assert "📅 <b>17 ноября 2026, вторник</b> · постов: 2" in text
-    assert text.count("⚡️ Срочное обновление Tor") == 1
-    assert text.count("<b>09:00 · #517</b>") == 1
-    assert "↳ Teletype · IT Vibe; 18.11 20:10 — IT Vibe" in text
+    assert "📅 <b>17 ноября 2026, вторник</b> · публикаций: 2" in text
+    assert "📡 <b>Teletype · IT Vibe</b> · 1" in text
+    assert "📡 <b>IT Vibe</b> · 1" in text
+    assert "<b>09:00 · #517</b> — ⚡️ Срочное обновление Tor" in text
     assert "<b>10:00 · #518</b> — Microsoft меняет цены на облака" in text
+    assert "📅 <b>18 ноября 2026, среда</b> · публикаций: 1" in text
+    assert "<b>20:10 · #517</b> — ⚡️ Срочное обновление Tor" in text
 
 
 def test_schedule_keyboard_has_weekdays_times_and_management_actions() -> None:
