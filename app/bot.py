@@ -5,7 +5,6 @@ import html
 import io
 import json
 import logging
-import mimetypes
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -6038,7 +6037,11 @@ class EditorBot:
                     content = await asyncio.to_thread(local_path.read_bytes)
                 except OSError:
                     continue
-                content_type = mimetypes.guess_type(local_path.name)[0] or "image/jpeg"
+                content_type = {
+                    ".png": "image/png",
+                    ".webp": "image/webp",
+                    ".gif": "image/gif",
+                }.get(local_path.suffix.casefold(), "image/jpeg")
                 return await self.teletype_publisher.upload_image(
                     content,
                     local_path.name,
