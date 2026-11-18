@@ -5,6 +5,7 @@ import html
 import io
 import json
 import logging
+import mimetypes
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ from aiogram.types import (
 from app.config import Settings
 from app.crossposting import CrosspostingService
 from app.db import Repository
+from app.media_cache import cache_media
 from app.models import GeneratedPost, SourceDocument, StoryCandidate
 from app.pipeline import ContentPipeline
 from app.renderer import (
@@ -5975,6 +5977,13 @@ class EditorBot:
             return None
         if media.get("telegram_file_id"):
             return str(media["telegram_file_id"])
+        media = await cache_media(
+            media,
+            self.settings.database_path.parent,
+            self.pipeline.extractor.download_image,
+        )
+        if media is None:
+            return None
         local_path = self._trusted_local_media_path(media)
         if local_path:
             try:
@@ -6029,11 +6038,7 @@ class EditorBot:
                     content = await asyncio.to_thread(local_path.read_bytes)
                 except OSError:
                     continue
-                content_type = (
-                    "image/png"
-                    if local_path.suffix.casefold() == ".png"
-                    else "image/jpeg"
-                )
+                content_type = mimetypes.guess_type(local_path.name)[0] or "image/jpeg"
                 return await self.teletype_publisher.upload_image(
                     content,
                     local_path.name,

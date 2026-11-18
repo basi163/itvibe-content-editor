@@ -23,6 +23,7 @@ from app.extractor import (
     normalize_url,
 )
 from app.llm import FallbackLLMClient, QwenClient
+from app.media_cache import cache_media
 from app.models import (
     FactCheckResult,
     GeneratedPost,
@@ -215,8 +216,10 @@ class ContentPipeline:
             )
             if cover:
                 media = [cover, *media]
+        media = await self._persist_media(media)
         if not media:
             media = await self._contextual_media(candidate, sources, triage, post)
+            media = await self._persist_media(media)
         if not media:
             logger.info("Story skipped because no usable image was discovered: %s", candidate.title)
             return None
@@ -239,6 +242,30 @@ class ContentPipeline:
         if self.deliver:
             await self.deliver(draft_id)
         return draft_id
+
+    async def _cache_media(
+        self,
+        item: dict[str, Any],
+        *,
+        downloaded: tuple[bytes, str] | None = None,
+    ) -> dict[str, Any] | None:
+        database_path = getattr(self.settings, "database_path", None)
+        if database_path is None:
+            return item
+        return await cache_media(
+            item,
+            Path(database_path).parent,
+            self.extractor.download_image,
+            downloaded=downloaded,
+        )
+
+    async def _persist_media(self, media: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        saved = []
+        for item in media:
+            cached = await self._cache_media(item)
+            if cached:
+                saved.append(cached)
+        return saved
 
     async def _fact_check_editorial_submission(
         self,
@@ -339,7 +366,7 @@ class ContentPipeline:
             if not downloaded or len(downloaded[0]) < 15_000:
                 continue
             logger.info("Contextual illustration selected for: %s", candidate.title)
-            return [
+            cached = await self._cache_media(
                 {
                     "type": "photo",
                     "telegram_file_id": None,
@@ -347,8 +374,11 @@ class ContentPipeline:
                     "image_url": image_url,
                     "provider": "qwen_web_search_image",
                     "search_title": str(result.get("title") or ""),
-                }
-            ]
+                },
+                downloaded=downloaded,
+            )
+            if cached:
+                return [cached]
         return []
 
     async def _search_images_with_retry(
@@ -514,6 +544,9 @@ class ContentPipeline:
                 "provider": "qwen_web_search_image",
                 "search_title": str(result.get("title") or ""),
             }
+            alternative = await self._cache_media(alternative, downloaded=downloaded)
+            if alternative is None:
+                continue
             await self.repository.update_draft(
                 draft_id,
                 media_json=_json([alternative, *media]),
@@ -614,8 +647,14 @@ class ContentPipeline:
             downloaded = await self.extractor.download_image(image_url)
             if not downloaded or len(downloaded[0]) < 15_000:
                 continue
+            cached = await self._cache_media(item, downloaded=downloaded)
+            if cached is None:
+                continue
+            media[index] = cached
             logger.info("Using verified source image fallback for draft %s", draft_id)
-            await self.repository.update_draft(draft_id, preview_index=index)
+            await self.repository.update_draft(
+                draft_id, media_json=_json(media), preview_index=index
+            )
             return True
         return False
 

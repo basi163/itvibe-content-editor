@@ -589,6 +589,7 @@ async def test_regenerate_media_finds_a_different_contextual_image() -> None:
 @pytest.mark.asyncio
 async def test_regenerate_media_falls_back_to_verified_source_image(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr("app.pipeline.IMAGE_SEARCH_RETRY_DELAYS", (0.0,))
     source_url = "https://official.example/cover.jpg"
@@ -637,11 +638,15 @@ async def test_regenerate_media_falls_back_to_verified_source_image(
 
     repository = Repository()
     pipeline = ContentPipeline(
-        settings=SimpleNamespace(max_post_chars=2000),
+        settings=SimpleNamespace(max_post_chars=2000, database_path=tmp_path / "editor.sqlite3"),
         repository=repository,
         extractor=Extractor(),
         llm=Llm(),
     )
 
     assert await pipeline.regenerate_media(10)
-    assert repository.updated == {"preview_index": 1}
+    assert repository.updated["preview_index"] == 1
+    saved_media = json.loads(repository.updated["media_json"])
+    assert saved_media[0] == draft["media"][0]
+    assert saved_media[1]["source_index"] == 0
+    assert Path(saved_media[1]["local_path"]).read_bytes() == b"x" * 20_000
