@@ -20,6 +20,8 @@ from app.models import (
 from app.prompts import (
     COMPONENT_REWRITE_SYSTEM_PROMPT,
     DIGEST_REPAIR_SYSTEM_PROMPT,
+    DIGEST_SOURCE_REVIEW_PROMPT,
+    DIGEST_SOURCE_SEARCH_PROMPT,
     FACT_CHECK_EVIDENCE_PROMPT,
     FACT_CHECK_PROMPT,
     IMAGE_SEARCH_PROMPT,
@@ -70,6 +72,7 @@ def _digest_validation_errors(
     post: GeneratedPost,
     max_post_chars: int,
     source_count: int,
+    allowed_source_indices: list[int] | None = None,
 ) -> list[str]:
     errors = validate_post(
         post,
@@ -77,11 +80,25 @@ def _digest_validation_errors(
         max_source_links=DIGEST_MAX_LINKS,
     )
     indices = [int(match.group(1)) for match in SOURCE_MARKER_RE.finditer(post.body)]
-    expected = list(range(min(source_count, DIGEST_MAX_LINKS)))
+    expected = (
+        list(range(min(source_count, DIGEST_MAX_LINKS)))
+        if allowed_source_indices is None else allowed_source_indices
+    )
     if indices != expected:
         errors.append(
-            "Ссылки дайджеста должны идти по одной в порядке источников"
+            f"Ссылки дайджеста должны идти по одной только для разрешённых источников {expected}"
         )
+    if allowed_source_indices is not None:
+        numbers = [int(number) for number in re.findall(r"^\s*(\d+)\.\s+", post.body, re.MULTILINE)]
+        if numbers != list(range(1, min(source_count, DIGEST_MAX_LINKS) + 1)):
+            errors.append("Сохрани все пункты дайджеста с исходной нумерацией, включая пункты без ссылки")
+    for number, paragraph in re.findall(
+        r"^\s*(\d+)\.\s+(.+?)(?=\n\s*\d+\.\s|\Z)",
+        post.body, re.MULTILINE | re.DOTALL,
+    ):
+        if any(int(match.group(1)) != int(number) - 1
+               for match in SOURCE_MARKER_RE.finditer(paragraph)):
+            errors.append("Индекс источника должен соответствовать номеру новости минус один")
     generic_anchors = [
         match.group(2).strip().casefold().strip(" .,!—-–")
         for match in SOURCE_MARKER_RE.finditer(post.body)
@@ -443,6 +460,43 @@ class QwenClient:
             )
         return post
 
+    async def _digest_source_search(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self.client.chat.completions.create(
+            model=self.writer_model,
+            messages=[
+                {"role": "system", "content": DIGEST_SOURCE_SEARCH_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            max_tokens=4000,
+            extra_body={"enable_search": True, "enable_thinking": False},
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise RuntimeError("Digest source search returned an empty response")
+        return _parse_json(content)
+
+    async def discover_digest_sources(
+        self, candidate: StoryCandidate, sources: list[SourceDocument],
+    ) -> dict[str, Any]:
+        return await self._digest_source_search({
+            "current_date": datetime.now(UTC).date().isoformat(),
+            "candidate": candidate.to_dict(),
+            "sources": _source_payload(sources, per_source_chars=3000),
+            "outgoing_links": [source.links[:30] for source in sources],
+        })
+
+    async def review_digest_sources(
+        self, candidate: StoryCandidate, items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return await self._completion(
+            model=self.writer_model,
+            system=DIGEST_SOURCE_REVIEW_PROMPT,
+            user=json.dumps({"candidate": candidate.to_dict(), "items": items}, ensure_ascii=False),
+            temperature=0.1,
+            max_tokens=6000,
+        )
+
     async def generate_digest(
         self,
         candidate: StoryCandidate,
@@ -471,7 +525,8 @@ class QwenClient:
             body=str(data.get("body", "")).strip(),
             hashtags=[str(tag).strip() for tag in data.get("hashtags", [])],
         )
-        errors = _digest_validation_errors(post, self.max_post_chars, len(sources))
+        allowed = [i for i, source in enumerate(sources) if source.linkable]
+        errors = _digest_validation_errors(post, self.max_post_chars, len(sources), allowed)
         if errors:
             normalized = normalize_generated_post(
                 post,
@@ -482,6 +537,7 @@ class QwenClient:
                 normalized,
                 self.max_post_chars,
                 len(sources),
+                allowed,
             )
             if not normalized_errors:
                 return normalized
@@ -723,6 +779,7 @@ class QwenClient:
         *,
         editorial_rules: str = "",
     ) -> GeneratedPost:
+        allowed = [i for i, source in enumerate(sources) if source.linkable]
         current = post
         remaining = errors
         for _ in range(3):
@@ -753,6 +810,7 @@ class QwenClient:
                 current,
                 self.max_post_chars,
                 len(sources),
+                allowed,
             )
             if not remaining:
                 return current
@@ -765,6 +823,7 @@ class QwenClient:
                 normalized,
                 self.max_post_chars,
                 len(sources),
+                allowed,
             )
             if not remaining:
                 return normalized
@@ -773,6 +832,20 @@ class QwenClient:
 
 
 class DeepSeekClient(QwenClient):
+    async def _digest_source_search(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self.client.responses.create(
+            model=self.writer_model,
+            input=(f"{DIGEST_SOURCE_SEARCH_PROMPT}\n\nReturn only JSON.\n"
+                   f"{json.dumps(payload, ensure_ascii=False)}"),
+            tools=[{"type": "web_search"}],
+            text={"format": {"type": "json_object"}},
+            reasoning={"effort": "none"},
+            max_output_tokens=8192,
+        )
+        if not response.output_text or getattr(response, "status", "") == "incomplete":
+            raise RuntimeError("Digest source search returned incomplete JSON")
+        return _parse_json(response.output_text)
+
     """DeepSeek implementation for text tasks used by the editorial pipeline."""
 
     async def _completion(
@@ -969,6 +1042,16 @@ class FallbackLLMClient:
         sources: list[SourceDocument],
     ) -> FactCheckResult:
         return await self._call("verify_fact_check", candidate, sources)
+
+    async def discover_digest_sources(
+        self, candidate: StoryCandidate, sources: list[SourceDocument],
+    ) -> dict[str, Any]:
+        return await self._call("discover_digest_sources", candidate, sources)
+
+    async def review_digest_sources(
+        self, candidate: StoryCandidate, items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return await self._call("review_digest_sources", candidate, items)
 
     async def generate(
         self,

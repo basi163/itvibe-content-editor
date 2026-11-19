@@ -5736,7 +5736,11 @@ class EditorBot:
             else:
                 lines.append(f"{marker}  {title}")
         if not linkable_sources:
-            lines.append("Официальные первоисточники не найдены.")
+            lines.append("Подтверждённые первоисточники не найдены.")
+        unresolved = draft.get("material", {}).get("digest_source_review", {}).get("unresolved", [])
+        if unresolved:
+            numbers = ", ".join(str(index + 1) for index in unresolved)
+            lines.append(f"\nНе найден первоисточник для пунктов {numbers}. Эти новости оставлены без ссылок.")
         text = "\n".join(lines)
         await self.bot.send_message(user_id, text[:4000], link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -5748,8 +5752,16 @@ class EditorBot:
     ) -> InlineKeyboardMarkup:
         draft_id = int(draft["id"])
         if draft.get("status") == "scheduled":
-            return cls._scheduled_keyboard(draft_id, unpublished_count)
-        return cls._draft_keyboard(draft_id, unpublished_count)
+            keyboard = cls._scheduled_keyboard(draft_id, unpublished_count)
+        else:
+            keyboard = cls._draft_keyboard(draft_id, unpublished_count)
+        unresolved = draft.get("material", {}).get("digest_source_review", {}).get("unresolved", [])
+        if unresolved:
+            keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(
+                text=f"⚠️ Без первоисточника — {len(unresolved)}",
+                callback_data=f"sources:{draft_id}",
+            )])
+        return keyboard
 
     @staticmethod
     def _publish_options_keyboard(

@@ -54,12 +54,25 @@ async def test_telegram_digest_uses_direct_links_and_skips_regular_triage(
         ) -> list[SourceDocument]:
             assert source_urls == urls
             assert limit == 10
-            return [SourceDocument(url=url, title=f"Source {index}") for index, url in enumerate(urls)]
+            return [SourceDocument(url=url, title=f"Source {index}",
+                                   text="We announced a new technology today.")
+                    for index, url in enumerate(urls)]
 
         async def download_image(self, _: str) -> None:
             return None
 
     class Llm:
+        async def discover_digest_sources(self, *_: object) -> dict:
+            return {"items": []}
+
+        async def review_digest_sources(self, *_: object) -> dict:
+            return {"selections": [
+                {"index": index, "page_index": 0, "kind": "company", "language": "en",
+                 "is_primary": True, "supports_item": True,
+                 "evidence": "We announced a new technology today."}
+                for index in range(3)
+            ]}
+
         async def triage(self, *_: object) -> TriageDecision:
             raise AssertionError("A recognized digest must bypass article triage")
 

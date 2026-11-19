@@ -15,6 +15,7 @@ from app.digest_cover import (
     cover_filename,
     render_digest_cover,
 )
+from app.digest_sources import DIGEST_SOURCE_POLICY_VERSION, resolve_digest_sources
 from app.extractor import (
     ArticleExtractor,
     is_known_secondary_url,
@@ -115,6 +116,8 @@ class ContentPipeline:
 
     async def _process(self, candidate: StoryCandidate) -> int | None:
         fact_check = FactCheckResult()
+        digest_source_review = None
+        digest_seed_sources = []
         is_digest = is_digest_candidate(candidate)
         if is_digest:
             sources = await self.extractor.collect_direct_sources(
@@ -125,7 +128,7 @@ class ContentPipeline:
             sources = await self.extractor.collect_sources(candidate.urls)
         if candidate.origin_type == "solidot_rss":
             sources = [source for source in sources if not is_solidot_url(source.url)]
-        elif candidate.origin_type == "telegram_web":
+        elif candidate.origin_type == "telegram_web" and not is_digest:
             sources = [source for source in sources if not is_telegram_url(source.url)]
         if not sources:
             sources = [
@@ -144,19 +147,23 @@ class ContentPipeline:
             ]
         elif candidate.text and not sources[0].text:
             sources[0].text = candidate.text
-        if candidate.force_editorial:
+        if candidate.force_editorial and not is_digest:
             fact_check, sources = await self._fact_check_editorial_submission(
                 candidate,
                 sources,
             )
         if is_digest:
+            digest_seed_sources = [source.to_dict() for source in sources]
+            sources, digest_source_review = await resolve_digest_sources(
+                candidate, sources, self.extractor, self.llm,
+            )
             triage = TriageDecision(
                 relevant=True,
                 score=1.0,
                 category="digest",
                 reason="Telegram technology digest",
                 primary_source_index=0,
-                linkable_source_indices=list(range(len(sources))),
+                linkable_source_indices=[i for i, source in enumerate(sources) if source.linkable],
             )
         else:
             triage = await self.llm.triage(candidate, sources)
@@ -228,6 +235,9 @@ class ContentPipeline:
             "sources": [source.to_dict() for source in sources],
             "fact_check": fact_check.to_dict(),
         }
+        if digest_source_review is not None:
+            material["digest_source_review"] = digest_source_review
+            material["digest_seed_sources"] = digest_seed_sources
         draft_id = await self.repository.create_draft(
             origin_type=candidate.origin_type,
             origin_ref=candidate.origin_ref,
@@ -427,7 +437,27 @@ class ContentPipeline:
         candidate = StoryCandidate.from_dict(draft["material"]["candidate"])
         sources = [SourceDocument.from_dict(item) for item in draft["material"]["sources"]]
         triage = TriageDecision.from_dict(draft["triage"])
+        source_updates = {}
         if triage.category == "digest":
+            material = dict(draft["material"])
+            review = material.get("digest_source_review", {})
+            if review.get("policy_version") != DIGEST_SOURCE_POLICY_VERSION or review.get("unresolved"):
+                seeds = material.get("digest_seed_sources") or material["sources"]
+                sources, review = await resolve_digest_sources(
+                    candidate, [SourceDocument.from_dict(item) for item in seeds],
+                    self.extractor, self.llm,
+                )
+                material["digest_seed_sources"] = seeds
+                material["digest_source_review"] = review
+                material["sources"] = [source.to_dict() for source in sources]
+                triage.linkable_source_indices = [
+                    i for i, source in enumerate(sources) if source.linkable
+                ]
+                source_updates = {
+                    "sources_json": _json(material["sources"]),
+                    "material_json": _json(material),
+                    "triage_json": _json(triage.to_dict()),
+                }
             post = await self.llm.generate_digest(candidate, sources, triage)
         else:
             post = await self.llm.generate(candidate, sources, triage)
@@ -445,6 +475,7 @@ class ContentPipeline:
             title=post.title,
             body=post.body,
             hashtags_json=_json(post.hashtags),
+            **source_updates,
         )
         return True
 
