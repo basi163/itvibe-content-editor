@@ -26,6 +26,7 @@ from app.prompts import (
     FACT_CHECK_PROMPT,
     IMAGE_SEARCH_PROMPT,
     REPAIR_SYSTEM_PROMPT,
+    STYLE_EDITOR_SYSTEM_PROMPT,
     TRIAGE_SYSTEM_PROMPT,
     append_editorial_rules,
     render_digest_writer_system_prompt,
@@ -451,14 +452,61 @@ class QwenClient:
             normalized = normalize_generated_post(post, self.max_post_chars)
             normalized_errors = validate_post(normalized, self.max_post_chars)
             if not normalized_errors:
-                return normalized
-            post = await self.repair(
-                normalized,
-                sources,
-                normalized_errors,
-                editorial_rules=editorial_rules,
+                post = normalized
+            else:
+                post = await self.repair(
+                    normalized,
+                    sources,
+                    normalized_errors,
+                    editorial_rules=editorial_rules,
+                )
+        return await self._edit_style(post, payload, sources, editorial_rules=editorial_rules)
+
+    async def _edit_style(
+        self,
+        post: GeneratedPost,
+        reference_material: dict[str, Any],
+        sources: list[SourceDocument],
+        *,
+        editorial_rules: str,
+        is_digest: bool = False,
+    ) -> GeneratedPost:
+        if "redaktor-ru" not in editorial_rules.casefold():
+            return post
+        expected_links = [match.group(1) for match in SOURCE_MARKER_RE.finditer(post.body)]
+        errors: list[str] = []
+        for _ in range(2):
+            data = await self._completion(
+                model=self.writer_model,
+                system=append_editorial_rules(STYLE_EDITOR_SYSTEM_PROMPT, editorial_rules),
+                user=json.dumps({
+                    "current_post": post.to_dict(),
+                    "reference_material": reference_material,
+                    "is_digest": is_digest,
+                    "maximum_visible_characters": self.max_post_chars - 2 - len(SIGNATURE_TEXT),
+                    "validation_errors": errors,
+                }, ensure_ascii=False),
+                temperature=0.15,
+                max_tokens=3000,
             )
-        return post
+            edited = GeneratedPost(
+                str(data.get("title") or "").strip(),
+                str(data.get("body") or "").strip(),
+                list(post.hashtags),
+            )
+            if is_digest:
+                errors = _digest_validation_errors(
+                    edited, self.max_post_chars, len(sources),
+                    [i for i, source in enumerate(sources) if source.linkable],
+                )
+            else:
+                errors = validate_post(edited, self.max_post_chars)
+            actual_links = [match.group(1) for match in SOURCE_MARKER_RE.finditer(edited.body)]
+            if actual_links != expected_links:
+                errors.append("Сохрани ссылки исходного поста в том же порядке и с теми же индексами")
+            if not errors:
+                return edited
+        raise ValueError("Style edit failed validation: " + "; ".join(errors))
 
     async def _digest_source_search(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = await self.client.chat.completions.create(
@@ -540,14 +588,17 @@ class QwenClient:
                 allowed,
             )
             if not normalized_errors:
-                return normalized
-            return await self.repair_digest(
-                normalized,
-                sources,
-                normalized_errors,
-                editorial_rules=editorial_rules,
-            )
-        return post
+                post = normalized
+            else:
+                post = await self.repair_digest(
+                    normalized,
+                    sources,
+                    normalized_errors,
+                    editorial_rules=editorial_rules,
+                )
+        return await self._edit_style(
+            post, payload, sources, editorial_rules=editorial_rules, is_digest=True,
+        )
 
     async def search_images(
         self,
